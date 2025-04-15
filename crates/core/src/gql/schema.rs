@@ -1,85 +1,43 @@
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::Display;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::dbs::Session;
-use crate::iam::{signin::signin, signup::signup};
+use crate::gql::functions::process_fns;
+use crate::gql::tables::process_tbs;
+use crate::gql::utils::GqlValueUtils;
 use crate::kvs::Datastore;
+use crate::sql;
 use crate::sql::kind::Literal;
-use crate::sql::statements::define::config::graphql::TablesConfig;
-use crate::sql::statements::{DefineFieldStatement, SelectStatement};
-use crate::sql::{self, Table};
-use crate::sql::{Cond, Fields};
-use crate::sql::{Expression, Geometry};
-use crate::sql::{Idiom, Kind};
-use crate::sql::{Statement, Thing};
-use async_graphql::dynamic::{Enum, FieldValue, ResolverContext, Type, Union};
+use crate::sql::statements::define::config::graphql::{FunctionsConfig, TablesConfig};
+use crate::sql::Geometry;
+use crate::sql::Kind;
+use async_graphql::dynamic::indexmap::IndexMap;
+use async_graphql::dynamic::{Enum, InputValue, Type, Union};
 use async_graphql::dynamic::{Field, Interface};
-use async_graphql::dynamic::{FieldFuture, InterfaceField};
-use async_graphql::dynamic::{InputObject, Object};
-use async_graphql::dynamic::{InputValue, Schema};
+use async_graphql::dynamic::{FieldFuture, Object};
+use async_graphql::dynamic::{InputObject, Schema};
+use async_graphql::dynamic::{InterfaceField, ResolverContext};
 use async_graphql::dynamic::{Scalar, TypeRef};
-use async_graphql::indexmap::IndexMap;
-use async_graphql::{Name, Error as AsyncGraphQLError};
+use async_graphql::Name;
 use async_graphql::Value as GqlValue;
+use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Number;
-use std::clone::Clone;
+
 use super::error::{resolver_error, GqlError};
-use super::ext::IntoExt;
+#[cfg(debug_assertions)]
+use super::ext::ValidatorExt;
+use super::ext::{TryFromExt, TryIntoExt};
 use crate::gql::error::{internal_error, schema_error, type_error};
-use crate::gql::ext::{NamedContainer, TryAsExt};
-use crate::gql::utils::{GQLTx, GqlValueUtils};
+use crate::gql::ext::NamedContainer;
 use crate::kvs::LockType;
 use crate::kvs::TransactionType;
 use crate::sql::Value as SqlValue;
 
-type ErasedRecord = (GQLTx, Thing);
-
-fn field_val_erase_owned(val: ErasedRecord) -> FieldValue<'static> {
-	FieldValue::owned_any(val)
-}
-
-macro_rules! limit_input {
-	() => {
-		InputValue::new("limit", TypeRef::named(TypeRef::INT))
-	};
-}
-
-macro_rules! start_input {
-	() => {
-		InputValue::new("start", TypeRef::named(TypeRef::INT))
-	};
-}
-
-macro_rules! id_input {
-	() => {
-		InputValue::new("id", TypeRef::named_nn(TypeRef::ID))
-	};
-}
-
-macro_rules! order {
-	(asc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.order = $field.into();
-		tmp.direction = true;
-		tmp
-	}};
-	(desc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.order = $field.into();
-		tmp
-	}};
-}
-
-fn filter_name_from_table(tb_name: impl Display) -> String {
-	format!("_filter_{tb_name}")
-}
-
-pub async fn generate_schema<'request>(
-	datastore: &'request Arc<Datastore>,
-	session: &'request Session,
+pub async fn generate_schema(
+	datastore: &Arc<Datastore>,
+	session: &Session,
 ) -> Result<Schema, GqlError> {
 	let kvs = datastore;
 	let tx = kvs.transaction(TransactionType::Read, LockType::Optimistic).await?;
@@ -95,479 +53,68 @@ pub async fn generate_schema<'request>(
 	let config = cg.inner.clone().try_into_graphql()?;
 
 	let tbs = tx.all_tb(ns, db, None).await?;
-	let _scopes = tx.all_db_accesses(ns, db).await?;
 
 	let tbs = match config.tables {
-		TablesConfig::None => return Err(GqlError::NotConfigured),
-		TablesConfig::Auto => tbs,
+		TablesConfig::None => None,
+		TablesConfig::Auto => Some(tbs),
 		TablesConfig::Include(inc) => {
-			tbs.iter().filter(|t| inc.contains_name(&t.name)).cloned().collect()
+			Some(tbs.iter().filter(|t| inc.contains_name(&t.name)).cloned().collect())
 		}
 		TablesConfig::Exclude(exc) => {
-			tbs.iter().filter(|t| !exc.contains_name(&t.name)).cloned().collect()
+			Some(tbs.iter().filter(|t| !exc.contains_name(&t.name)).cloned().collect())
 		}
 	};
 
+	let fns = tx.all_db_functions(ns, db).await?;
+
+	let fns = match config.functions {
+		FunctionsConfig::None => None,
+		FunctionsConfig::Auto => Some(fns),
+		FunctionsConfig::Include(inc) => {
+			Some(fns.iter().filter(|f| inc.contains(&f.name)).cloned().collect())
+		}
+		FunctionsConfig::Exclude(exc) => {
+			Some(fns.iter().filter(|f| !exc.contains(&f.name)).cloned().collect())
+		}
+	};
+
+	match (&tbs, &fns) {
+		(None, None) => return Err(GqlError::NotConfigured),
+		(None, Some(fs)) if fs.len() == 0 => {
+			return Err(schema_error("no functions found in database"))
+		}
+		(Some(ts), None) if ts.len() == 0 => {
+			return Err(schema_error("no tables found in database"))
+		}
+		(Some(ts), Some(fs)) if ts.len() == 0 && fs.len() == 0 => {
+			return Err(schema_error("no items found in database"));
+		}
+		_ => {}
+	}
+
 	let mut query = Object::new("Query");
-	let mut mutation = Object::new("Mutation");
 	let mut types: Vec<Type> = Vec::new();
 
-	trace!(ns, db, ?tbs, "generating schema");
+	trace!(ns, db, ?tbs, ?fns, "generating schema");
 
-	let datastore_clone_1 = datastore.clone();
-	let session_clone_1 = session.clone();
-
-	mutation = mutation.field(
-		Field::new("signIn", TypeRef::named_nn(TypeRef::STRING), move | ctx: ResolverContext | {
-			let auth_kvs = datastore_clone_1.clone();
-			let auth_session = session_clone_1.clone();
-			let args = ctx.args.as_index_map();
-
-			let access = args.get("access").expect("Access unspecified").to_string();
-			let arguments = args.get("arguments").cloned();
-
-			FieldFuture::new(async move {
-				let mut vals: HashMap<String, SqlValue> = HashMap::new();
-
-				if let Some(GqlValue::Object(args_idx_map)) = arguments {
-					for (key, value) in args_idx_map {
-						vals.insert(key.to_string(), SqlValue::from(value.to_string().trim_matches('"')));
-					}
-				}
-
-				let auth_db = format!("{}", auth_session.db.clone().expect("Databases unspecified"));
-				let auth_ns = format!("{}", auth_session.ns.clone().expect("Namespace unspecified"));
-				let auth_ac = access.clone().trim_matches('"').to_string();
-
-				vals.insert("DB".to_string(), auth_db.clone().into());
-				vals.insert("NS".to_string(), auth_ns.clone().into());
-				vals.insert("AC".to_string(), auth_ac.clone().into());
-
-				let mut auth_sess = auth_session.clone();
-
-				// The session already has Access
-				if auth_sess.ac.is_some() {
-					AsyncGraphQLError::new("authentication is already present");
-				}
-
-				signin(&auth_kvs, &mut auth_sess, vals.into())
-					.await
-					.map(| val | Some(FieldValue::value(GqlValue::from(val))))
-					.map_err(| err | { AsyncGraphQLError::new(
-						format!("signIn unsuccessful - {}", err))
-					})
-			})
-		})
-		.description("Sign in with scoped user access")
-		.argument(
-			InputValue::new("access", TypeRef::named_nn(TypeRef::STRING))
-				.description("Name of the access for authentication"),
-		)
-		.argument(
-			InputValue::new("arguments", TypeRef::named_nn("Object"))
-				.description("Arguments to send to the Access"),
-		),
-	);
-
-	let datastore_clone_2 = datastore.clone();
-	let session_clone_2 = session.clone();
-
-	mutation = mutation.field(
-		Field::new("signUp", TypeRef::named(TypeRef::STRING),move | ctx: ResolverContext | {
-			let auth_kvs = datastore_clone_2.clone();
-			let auth_session = session_clone_2.clone();
-			let args = ctx.args.as_index_map();
-
-			let access = args.get("access").expect("Access unspecified").to_string();
-			let arguments = args.get("arguments").cloned();
-
-			FieldFuture::new(async move {
-				let mut vals: HashMap<String, SqlValue> = HashMap::new();
-
-				if let Some(GqlValue::Object(args_idx_map)) = arguments {
-					for (key, value) in args_idx_map {
-						vals.insert(key.to_string(), SqlValue::from(value.to_string().trim_matches('"')));
-					}
-				}
-
-				let auth_db = format!("{}", auth_session.db.clone().expect("Databases unspecified"));
-				let auth_ns = format!("{}", auth_session.ns.clone().expect("Namespace unspecified"));
-				let auth_ac = access.clone().trim_matches('"').to_string();
-
-				vals.insert("DB".to_string(), auth_db.clone().into());
-				vals.insert("NS".to_string(), auth_ns.clone().into());
-				vals.insert("AC".to_string(), auth_ac.clone().into());
-
-				let mut auth_sess = auth_session.clone();
-
-				// The session already has Access
-				if auth_sess.ac.is_some() {
-					AsyncGraphQLError::new("authentication is already present");
-				}
-
-				signup(&auth_kvs, &mut auth_sess, vals.into())
-					.await
-					.map(|val| Some(
-						FieldValue::value(
-							GqlValue::from(val.unwrap_or(String::from("INVALID_TOKEN")))
-						)
-					))
-					.map_err(| err | { AsyncGraphQLError::new(
-						format!("signUp unsuccessful - {}", err))
-					})
-			})
-		})
-		.description("Sign up for scoped user access")
-		.argument(
-			InputValue::new(
-				"access",
-				TypeRef::named_nn(TypeRef::STRING)
-			)
-			.description("Name of the access for authentication")
-		)
-		.argument(
-			InputValue::new(
-				"arguments",
-				TypeRef::named_nn("Object")
-			).description("Arguments to send to the Access")
-		)
-	);
-
-	if tbs.len() == 0 {
-		return Err(schema_error("no tables found in database"));
-	}
-
-	for tb in tbs.iter() {
-		trace!("Adding table: {}", tb.name);
-		let tb_name = tb.name.to_string();
-		let first_tb_name = tb_name.clone();
-		let second_tb_name = tb_name.clone();
-
-		let table_orderable_name = format!("_orderable_{tb_name}");
-		let mut table_orderable = Enum::new(&table_orderable_name).item("id");
-		table_orderable = table_orderable.description(format!(
-			"Generated from `{}` the fields which a query can be ordered by",
-			tb.name
-		));
-		let table_order_name = format!("_order_{tb_name}");
-		let table_order = InputObject::new(&table_order_name)
-			.description(format!(
-				"Generated from `{}` an object representing a query ordering",
-				tb.name
-			))
-			.field(InputValue::new("asc", TypeRef::named(&table_orderable_name)))
-			.field(InputValue::new("desc", TypeRef::named(&table_orderable_name)))
-			.field(InputValue::new("then", TypeRef::named(&table_order_name)));
-
-		let table_filter_name = filter_name_from_table(tb_name);
-		let mut table_filter = InputObject::new(&table_filter_name);
-		table_filter = table_filter
-			.field(InputValue::new("id", TypeRef::named("_filter_id")))
-			.field(InputValue::new("and", TypeRef::named_nn_list(&table_filter_name)))
-			.field(InputValue::new("or", TypeRef::named_nn_list(&table_filter_name)))
-			.field(InputValue::new("not", TypeRef::named(&table_filter_name)));
-		types.push(Type::InputObject(filter_id()));
-
-		let sess1 = session.to_owned();
-		let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
-		let fds1 = fds.clone();
-		let kvs1 = datastore.clone();
-
-		query = query.field(
-			Field::new(
-				tb.name.to_string(),
-				TypeRef::named_nn_list_nn(tb.name.to_string()),
-				move |ctx| {
-					let tb_name = first_tb_name.clone();
-					let sess1 = sess1.clone();
-					let fds1 = fds1.clone();
-					let kvs1 = kvs1.clone();
-					FieldFuture::new(async move {
-						let gtx = GQLTx::new(&kvs1, &sess1).await?;
-
-						let args = ctx.args.as_index_map();
-						trace!("received request with args: {args:?}");
-
-						let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
-
-						let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
-
-						let order = args.get("order");
-
-						let filter = args.get("filter");
-
-						let orders = match order {
-							Some(GqlValue::Object(o)) => {
-								let mut orders = vec![];
-								let mut current = o;
-								loop {
-									let asc = current.get("asc");
-									let desc = current.get("desc");
-									match (asc, desc) {
-										(Some(_), Some(_)) => {
-											return Err("Found both ASC and DESC in order".into());
-										}
-										(Some(GqlValue::Enum(a)), None) => {
-											orders.push(order!(asc, a.as_str()))
-										}
-										(None, Some(GqlValue::Enum(d))) => {
-											orders.push(order!(desc, d.as_str()))
-										}
-										(_, _) => {
-											break;
-										}
-									}
-									if let Some(GqlValue::Object(next)) = current.get("then") {
-										current = next;
-									} else {
-										break;
-									}
-								}
-								Some(orders)
-							}
-							_ => None,
-						};
-						trace!("parsed orders: {orders:?}");
-
-						let cond = match filter {
-							Some(f) => {
-								let o = match f {
-									GqlValue::Object(o) => o,
-									f => {
-										error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
-										return Err("Value in cond doesn't fit schema".into());
-									}
-								};
-
-								let cond = cond_from_filter(o, &fds1)?;
-
-								Some(cond)
-							}
-							None => None,
-						};
-
-						trace!("parsed filter: {cond:?}");
-
-						// SELECT VALUE id FROM ...
-						let ast = Statement::Select({
-							SelectStatement {
-								what: vec![SqlValue::Table(tb_name.intox())].into(),
-								expr: Fields(
-									vec![sql::Field::Single {
-										expr: SqlValue::Idiom(Idiom::from("id")),
-										alias: None,
-									}],
-									// this means the `value` keyword
-									true,
-								),
-								order: orders.map(IntoExt::intox),
-								cond,
-								limit,
-								start,
-								..Default::default()
-							}
-						});
-
-						trace!("generated query ast: {ast:?}");
-
-						let res = gtx.process_stmt(ast).await?;
-
-						let res_vec =
-							match res {
-								SqlValue::Array(a) => a,
-								v => {
-									error!("Found top level value, in result which should be array: {v:?}");
-									return Err("Internal Error".into());
-								}
-							};
-
-						let out: Result<Vec<FieldValue>, SqlValue> = res_vec
-							.0
-							.into_iter()
-							.map(|v| {
-								v.try_as_thing().map(|t| {
-									let erased: ErasedRecord = (gtx.clone(), t);
-									field_val_erase_owned(erased)
-								})
-							})
-							.collect();
-
-						match out {
-							Ok(l) => Ok(Some(FieldValue::list(l))),
-							Err(v) => {
-								Err(internal_error(format!("expected thing, found: {v:?}")).into())
-							}
-						}
-					})
-				},
-			)
-			.description(format!("{}", if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) }))
-			.argument(limit_input!())
-			.argument(start_input!())
-			.argument(InputValue::new("order", TypeRef::named(&table_order_name)))
-			.argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
-		);
-
-		let sess2 = session.to_owned();
-		let kvs2 = datastore.to_owned();
-		query = query.field(
-			Field::new(
-				format!("_get_{}", tb.name),
-				TypeRef::named(tb.name.to_string()),
-				move |ctx| {
-					let tb_name = second_tb_name.clone();
-					let kvs2 = kvs2.clone();
-					FieldFuture::new({
-						let sess2 = sess2.clone();
-						async move {
-							let gtx = GQLTx::new(&kvs2, &sess2).await?;
-
-							let args = ctx.args.as_index_map();
-							let id = match args.get("id").and_then(GqlValueUtils::as_string) {
-								Some(i) => i,
-								None => {
-									return Err(internal_error(
-										"Schema validation failed: No id found in _get_",
-									)
-									.into());
-								}
-							};
-							let thing = match id.clone().try_into() {
-								Ok(t) => t,
-								Err(_) => Thing::from((tb_name, id)),
-							};
-
-							match gtx.get_record_field(thing, "id").await? {
-								SqlValue::Thing(t) => {
-									let erased: ErasedRecord = (gtx, t);
-									Ok(Some(field_val_erase_owned(erased)))
-								}
-								_ => Ok(None),
-							}
-						}
-					})
-				},
-			)
-			.description(format!(
-				"{}",
-				if let Some(ref c) = &tb.comment {
-					format!("{c}")
-				} else {
-					format!("Generated from table `{}`\nallows querying a single record in a table by ID", tb.name)
-				}
-			))
-			.argument(id_input!()),
-		);
-
-		let mut table_ty_obj = Object::new(tb.name.to_string())
-			.field(Field::new(
-				"id",
-				TypeRef::named_nn(TypeRef::ID),
-				make_table_field_resolver(
-					"id",
-					Some(Kind::Record(vec![Table::from(tb.name.to_string())])),
-				),
-			))
-			.implement("Record");
-
-		for fd in fds.iter() {
-			let Some(ref kind) = fd.kind else {
-				continue;
-			};
-			let fd_name = Name::new(fd.name.to_string());
-			let fd_type = kind_to_type(kind.clone(), &mut types)?;
-			table_orderable = table_orderable.item(fd_name.to_string());
-			let type_filter_name = format!("_filter_{}", unwrap_type(fd_type.clone()));
-
-			let type_filter = Type::InputObject(filter_from_type(
-				kind.clone(),
-				type_filter_name.clone(),
-				&mut types,
-			)?);
-			trace!("\n{type_filter:?}\n");
-			types.push(type_filter);
-
-			table_filter = table_filter
-				.field(InputValue::new(fd.name.to_string(), TypeRef::named(type_filter_name)));
-
-			table_ty_obj = table_ty_obj
-				.field(Field::new(
-					fd.name.to_string(),
-					fd_type,
-					make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
-				))
-				.description(format!(
-					"{}",
-					if let Some(ref c) = fd.comment {
-						format!("{c}")
-					} else {
-						"".to_string()
-					}
-				));
+	match tbs {
+		Some(tbs) if tbs.len() > 0 => {
+			query = process_tbs(tbs, query, &mut types, &tx, ns, db, session, datastore).await?;
 		}
-
-		types.push(Type::Object(table_ty_obj));
-		types.push(table_order.into());
-		types.push(Type::Enum(table_orderable));
-		types.push(Type::InputObject(table_filter));
+		_ => {}
 	}
 
-	let sess3 = session.to_owned();
-	let kvs3 = datastore.to_owned();
-	query = query.field(
-		Field::new("_get", TypeRef::named("Record"), move |ctx| {
-			FieldFuture::new({
-				let sess3 = sess3.clone();
-				let kvs3 = kvs3.clone();
-				async move {
-					let gtx = GQLTx::new(&kvs3, &sess3).await?;
-
-					let args = ctx.args.as_index_map();
-					let id = match args.get("id").and_then(GqlValueUtils::as_string) {
-						Some(i) => i,
-						None => {
-							return Err(internal_error(
-								"Schema validation failed: No id found in _get",
-							)
-							.into());
-						}
-					};
-
-					let thing: Thing = match id.clone().try_into() {
-						Ok(t) => t,
-						Err(_) => return Err(resolver_error(format!("invalid id: {id}")).into()),
-					};
-
-					match gtx.get_record_field(thing, "id").await? {
-						SqlValue::Thing(t) => {
-							let ty = t.tb.to_string();
-							let out = field_val_erase_owned((gtx, t)).with_type(ty);
-							Ok(Some(out))
-						}
-						_ => Ok(None),
-					}
-				}
-			})
-		})
-		.description("Allows fetching arbitrary records".to_string())
-		.argument(id_input!()),
-	);
+	if let Some(fns) = fns {
+		query = process_fns(fns, query, &mut types, session, datastore).await?;
+	}
 
 	trace!("current Query object for schema: {:?}", query);
 
-	let mut schema =
-		Schema::build("Query", Some("Mutation"), None).register(query).register(mutation);
-
+	let mut schema = Schema::build("Query", None, None).register(query);
 	for ty in types {
 		trace!("adding type: {ty:?}");
 		schema = schema.register(ty);
 	}
-
-	let obj_scalar = Scalar::new("Object")
-		.description("An arbitrary JSON Object")
-		.validator(| v | true);
-
-	schema = schema.register(obj_scalar);
 
 	macro_rules! scalar_debug_validated {
 		($schema:ident, $name:expr, $kind:expr) => {
@@ -592,93 +139,161 @@ pub async fn generate_schema<'request>(
 			)
 		};
 		($schema:ident, $name:expr, $kind:expr, $desc:expr, $url:expr) => {{
-			let scalar = Scalar::new($name)
-				.description(format!("{}", if let Some(desc) = $desc { desc } else { "" }))
-				.specified_by_url(format!("{}", if let Some(url) = $url { url } else { "" }))
-				.validator(|v| gql_to_sql_kind(v, $kind).is_ok());
-
-			$schema = $schema.register(scalar);
+			let new_type = Type::Scalar({
+				let mut tmp = Scalar::new($name);
+				if let Some(desc) = $desc {
+					tmp = tmp.description(desc);
+				}
+				if let Some(url) = $url {
+					tmp = tmp.specified_by_url(url);
+				}
+				#[cfg(debug_assertions)]
+				tmp.add_validator(|v| gql_to_sql_kind(v, $kind).is_ok());
+				tmp
+			});
+			$schema = $schema.register(new_type);
 		}};
+	}
+
+	macro_rules! geometry_type {
+		($schema:ident, $name:expr, $type:expr) => {
+			$schema = $schema.register(
+				Object::new($name)
+					.field(Field::new(
+						"type",
+						TypeRef::named("GeometryType"),
+						|_: ResolverContext| {
+							async_graphql::dynamic::FieldFuture::Value(Some(
+								GqlValue::String($name.to_string()).into(),
+							))
+						},
+					))
+					.field(Field::new("coordinates", $type.clone(), |ctx: ResolverContext| {
+						FieldFuture::new({
+							async move {
+								let val = ctx
+									.parent_value
+									.try_to_value()?
+									.as_object()
+									.ok_or_else(|| internal_error("Expected object"))?
+									.get("coordinates");
+								Ok(val.cloned())
+							}
+						})
+					})),
+			);
+			$schema = $schema.register(
+				InputObject::new(format!("{}_input", $name))
+					.field(InputValue::new("type", TypeRef::named("GeometryType")))
+					// .field(InputValue::new("geotype", TypeRef::named(TypeRef::STRING)))
+					.field(InputValue::new("coordinates", $type.clone())),
+			);
+		};
 	}
 
 	scalar_debug_validated!(
 		schema,
-		"UUID",
+		"uuid",
 		Kind::Uuid,
 		"String encoded UUID",
 		"https://datatracker.ietf.org/doc/html/rfc4122"
 	);
 
-	scalar_debug_validated!(schema, "Decimal", Kind::Decimal);
-	scalar_debug_validated!(schema, "Number", Kind::Number);
+	schema = schema.register(Enum::new("GeometryType").items([
+		"GeometryPoint",
+		"GeometryLineString",
+		"GeometryPolygon",
+		"GeometryMultiPoint",
+		"GeometryMultiLineString",
+		"GeometryMultiPolygon",
+		"GeometryCollection",
+	]));
+
+	let coordinate_type = TypeRef::named_nn_list_nn(TypeRef::FLOAT);
+	let coordinate_list_type = TypeRef::NonNull(Box::new(TypeRef::List(Box::new(
+		TypeRef::NonNull(Box::new(coordinate_type.clone())),
+	))));
+	let coordinate_list_list_type = TypeRef::NonNull(Box::new(TypeRef::List(Box::new(
+		TypeRef::NonNull(Box::new(coordinate_list_type.clone())),
+	))));
+	let coordinate_list_list_list_type = TypeRef::NonNull(Box::new(TypeRef::List(Box::new(
+		TypeRef::NonNull(Box::new(coordinate_list_type.clone())),
+	))));
+
+	geometry_type!(schema, "GeometryPoint", coordinate_type);
+	geometry_type!(schema, "GeometryLineString", coordinate_list_type);
+	geometry_type!(schema, "GeometryPolygon", coordinate_list_list_type);
+	geometry_type!(schema, "GeometryMultiPoint", coordinate_list_type);
+	geometry_type!(schema, "GeometryMultiLineString", coordinate_list_list_type);
+	geometry_type!(schema, "GeometryMultiPolygon", coordinate_list_list_list_type);
+
+	schema = schema.register(
+		Object::new("GeometryCollection")
+			.field(Field::new("type", TypeRef::named("GeometryType"), |_: ResolverContext| {
+				async_graphql::dynamic::FieldFuture::Value(Some(
+					GqlValue::String("GeometryCollection".to_string()).into(),
+				))
+			}))
+			.field(Field::new(
+				"geometries",
+				TypeRef::named_nn_list_nn("Geometry"),
+				|ctx: ResolverContext| {
+					FieldFuture::new({
+						async move {
+							let val = ctx
+								.parent_value
+								.try_to_value()?
+								.as_object()
+								.ok_or_else(|| internal_error("Expected Object"))?
+								.get("geometries");
+							Ok(val.cloned())
+						}
+					})
+				},
+			)),
+	);
+	schema = schema.register(
+		InputObject::new("GeometryCollection_input")
+			.field(InputValue::new("type", TypeRef::named("GeometryType")))
+			.field(InputValue::new("geometries", TypeRef::named_nn_list_nn("Geometry_input"))),
+	);
+
+	let mut geometry_union = Union::new("Geometry");
+	geometry_union = geometry_union.possible_type("GeometryPoint");
+	geometry_union = geometry_union.possible_type("GeometryLineString");
+	geometry_union = geometry_union.possible_type("GeometryPolygon");
+	geometry_union = geometry_union.possible_type("GeometryMultiPoint");
+	geometry_union = geometry_union.possible_type("GeometryMultiLineString");
+	geometry_union = geometry_union.possible_type("GeometryMultiPolygon");
+	geometry_union = geometry_union.possible_type("GeometryCollection");
+
+	schema = schema.register(geometry_union);
+
+	scalar_debug_validated!(schema, "Geometry_input", Kind::Geometry(vec![]));
+
+	scalar_debug_validated!(schema, "decimal", Kind::Decimal);
+	scalar_debug_validated!(schema, "number", Kind::Number);
 	scalar_debug_validated!(schema, "null", Kind::Null);
-	scalar_debug_validated!(schema, "DateTime", Kind::Datetime);
-	scalar_debug_validated!(schema, "Duration", Kind::Duration);
-	// scalar_debug_validated!(schema, "Object", Kind::Object);
-	scalar_debug_validated!(schema, "Any", Kind::Any);
+	scalar_debug_validated!(schema, "datetime", Kind::Datetime);
+	scalar_debug_validated!(schema, "duration", Kind::Duration);
+	scalar_debug_validated!(schema, "object", Kind::Object);
+	scalar_debug_validated!(schema, "any", Kind::Any);
 
-	let id_interface = Interface::new("Record")
-		.field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)));
-
+	let id_interface =
+		Interface::new("record").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)));
 	schema = schema.register(id_interface);
 
 	// TODO: when used get: `Result::unwrap()` on an `Err` value: SchemaError("Field \"like.in\" is not sub-type of \"relation.in\"")
-	let relation_interface = Interface::new("Relation")
+	let relation_interface = Interface::new("relation")
 		.field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)))
-		.field(InterfaceField::new("in", TypeRef::named_nn("Record")))
-		.field(InterfaceField::new("out", TypeRef::named_nn("Record")))
-		.implement("Record");
-
+		.field(InterfaceField::new("in", TypeRef::named_nn("record")))
+		.field(InterfaceField::new("out", TypeRef::named_nn("record")))
+		.implement("record");
 	schema = schema.register(relation_interface);
 
 	schema
 		.finish()
 		.map_err(|e| schema_error(format!("there was an error generating schema: {e:?}")))
-}
-
-fn make_table_field_resolver(
-	fd_name: impl Into<String>,
-	kind: Option<Kind>,
-) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-	let fd_name = fd_name.into();
-	move |ctx: ResolverContext| {
-		let fd_name = fd_name.clone();
-		let field_kind = kind.clone();
-		FieldFuture::new({
-			async move {
-				let (ref gtx, ref rid) = ctx
-					.parent_value
-					.downcast_ref::<ErasedRecord>()
-					.ok_or_else(|| internal_error("failed to downcast"))?;
-
-				let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
-
-				let out = match val {
-					SqlValue::Thing(rid) if fd_name != "id" => {
-						let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
-						match field_kind {
-							Some(Kind::Record(ts)) if ts.len() != 1 => {
-								tmp = tmp.with_type(rid.tb.clone())
-							}
-							_ => {}
-						}
-						Ok(Some(tmp))
-					}
-					SqlValue::None | SqlValue::Null => Ok(None),
-					v => {
-						match field_kind {
-							Some(Kind::Either(ks)) if ks.len() != 1 => {}
-							_ => {}
-						}
-						let out = sql_value_to_gql_value(v.to_owned())
-							.map_err(|_| "SQL to GQL translation failed")?;
-						Ok(Some(FieldValue::value(out)))
-					}
-				};
-				out
-			}
-		})
-	}
 }
 
 pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
@@ -706,7 +321,87 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
 				.map(|(k, v)| (Name::new(k), sql_value_to_gql_value(v).unwrap()))
 				.collect(),
 		),
-		SqlValue::Geometry(_) => return Err(resolver_error("unimplemented: Geometry types")),
+		SqlValue::Geometry(kind) => match kind {
+			Geometry::Point(point) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("Point".to_string())),
+					(
+						Name::new("coordinates"),
+						GqlValue::List(vec![point.x().try_intox()?, point.y().try_intox()?]),
+					),
+				]
+				.into(),
+			),
+			Geometry::Line(line) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("LineString".to_string())),
+					(Name::new("coordinates"), coord_collection_to_list(line)?),
+				]
+				.into(),
+			),
+			Geometry::MultiLine(multiline) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("MultiLineString".to_string())),
+					(
+						Name::new("coordinates"),
+						GqlValue::List(
+							multiline
+								.into_iter()
+								.map(coord_collection_to_list)
+								.collect::<Result<Vec<_>, GqlError>>()?,
+						),
+					),
+				]
+				.into(),
+			),
+			Geometry::MultiPoint(multipoint) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("MultiPoint".to_string())),
+					(
+						Name::new("coordinates"),
+						coord_collection_to_list(multipoint.into_iter().map(|p| p.0))?,
+					),
+				]
+				.into(),
+			),
+			Geometry::Polygon(polygon) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("Polygon".to_string())),
+					(Name::new("coordinates"), polygon_to_list(&polygon)?),
+				]
+				.into(),
+			),
+			Geometry::MultiPolygon(multipolygon) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("MultiPolygon".to_string())),
+					(
+						Name::new("coordinates"),
+						GqlValue::List(
+							multipolygon
+								.iter()
+								.map(polygon_to_list)
+								.collect::<Result<Vec<_>, _>>()?,
+						),
+					),
+				]
+				.into(),
+			),
+			Geometry::Collection(collection) => GqlValue::Object(
+				[
+					(Name::new("type"), GqlValue::String("GeometryCollection".to_string())),
+					(
+						Name::new("geometries"),
+						GqlValue::List(
+							collection
+								.into_iter()
+								.map(|g| sql_value_to_gql_value(SqlValue::Geometry(g)).unwrap())
+								.collect(),
+						),
+					),
+				]
+				.into(),
+			),
+		},
 		SqlValue::Bytes(b) => GqlValue::Binary(b.into_inner().into()),
 		SqlValue::Thing(t) => GqlValue::String(t.to_string()),
 		v => return Err(internal_error(format!("found unsupported value variant: {v:?}"))),
@@ -714,28 +409,73 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
 	Ok(out)
 }
 
-fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> {
+fn coord_to_list(coord: Coord<f64>) -> Result<GqlValue, GqlError> {
+	Ok(GqlValue::List(
+		<[f64; 2]>::from(coord)
+			.into_iter()
+			.map(GqlValue::try_fromx)
+			.collect::<Result<Vec<_>, _>>()?,
+	))
+}
+
+fn coord_collection_to_list(
+	coord_collection: impl IntoIterator<Item = Coord<f64>>,
+) -> Result<GqlValue, GqlError> {
+	Ok(GqlValue::List(
+		coord_collection.into_iter().map(coord_to_list).collect::<Result<Vec<_>, _>>()?,
+	))
+}
+
+fn polygon_to_list(polygon: &Polygon) -> Result<GqlValue, GqlError> {
+	Ok(GqlValue::List(
+		[polygon.exterior()]
+			.into_iter()
+			.chain(polygon.interiors().iter())
+			.cloned()
+			.map(coord_collection_to_list)
+			.collect::<Result<_, _>>()?,
+	))
+}
+
+fn geometry_kind_name_to_type_name(name: &str) -> Result<&'static str, GqlError> {
+	match name {
+		"point" => Ok("GeometryPoint"),
+		"line" => Ok("GeometryLineString"),
+		"polygon" => Ok("GeometryPolygon"),
+		"multipoint" => Ok("GeometryMultiPoint"),
+		"multiline" => Ok("GeometryMultiLineString"),
+		"multipolygon" => Ok("GeometryMultiPolygon"),
+		"collection" => Ok("GeometryCollection"),
+		_ => Err(internal_error(format!("expected valid geometry name"))),
+	}
+}
+
+pub fn kind_to_type(
+	kind: Kind,
+	types: &mut Vec<Type>,
+	is_input: bool,
+) -> Result<TypeRef, GqlError> {
 	let (optional, match_kind) = match kind {
 		Kind::Option(op_ty) => (true, *op_ty),
 		_ => (false, kind),
 	};
-	let out_ty = match match_kind {
-		Kind::Any => TypeRef::named("Any"),
-		Kind::Null => TypeRef::named("null"),
-		Kind::Bool => TypeRef::named(TypeRef::BOOLEAN),
-		Kind::Bytes => TypeRef::named("bytes"),
-		Kind::Datetime => TypeRef::named("DateTime"),
-		Kind::Decimal => TypeRef::named("Decimal"),
-		Kind::Duration => TypeRef::named("Duration"),
-		Kind::Float => TypeRef::named(TypeRef::FLOAT),
-		Kind::Int => TypeRef::named(TypeRef::INT),
-		Kind::Number => TypeRef::named("Number"),
-		Kind::Object => TypeRef::named("Object"),
-		Kind::Point => return Err(schema_error("Kind::Point is not yet supported")),
-		Kind::String => TypeRef::named(TypeRef::STRING),
-		Kind::Uuid => TypeRef::named("UUID"),
-		Kind::Record(mut r) => match r.len() {
-			0 => TypeRef::named("Record"),
+	let out_ty = match (match_kind, is_input) {
+		(Kind::Any, _) => TypeRef::named("any"),
+		(Kind::Null, _) => TypeRef::named("null"),
+		(Kind::Bool, _) => TypeRef::named(TypeRef::BOOLEAN),
+		(Kind::Bytes, _) => TypeRef::named("bytes"),
+		(Kind::Datetime, _) => TypeRef::named("datetime"),
+		(Kind::Decimal, _) => TypeRef::named("decimal"),
+		(Kind::Duration, _) => TypeRef::named("duration"),
+		(Kind::Float, _) => TypeRef::named(TypeRef::FLOAT),
+		(Kind::Int, _) => TypeRef::named(TypeRef::INT),
+		(Kind::Number, _) => TypeRef::named("number"),
+		(Kind::Object, _) => TypeRef::named("object"),
+		(Kind::Point, _) => return Err(schema_error("Kind::Point is not yet supported")),
+		(Kind::String, _) => TypeRef::named(TypeRef::STRING),
+		(Kind::Uuid, _) => TypeRef::named("uuid"),
+		(Kind::Record(mut r), _) => match r.len() {
+			0 => TypeRef::named("record"),
 			1 => TypeRef::named(r.pop().unwrap().0),
 			_ => {
 				let names: Vec<String> = r.into_iter().map(|t| t.0).collect();
@@ -751,19 +491,46 @@ fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> 
 				TypeRef::named(ty_name)
 			}
 		},
-		Kind::Geometry(_) => return Err(schema_error("Kind::Geometry is not yet supported")),
-		Kind::Option(t) => {
+		(Kind::Geometry(g), false) => match g.len() {
+			0 => TypeRef::named("Geometry"),
+			1 => {
+				let name = g.into_iter().next().expect("checked that length is 1");
+				TypeRef::named(geometry_kind_name_to_type_name(&name)?)
+			}
+			_ => {
+				let geo_types = g
+					.iter()
+					.map(|n| geometry_kind_name_to_type_name(n).map(TypeRef::named))
+					.collect::<Result<Vec<_>, GqlError>>()?;
+				let geo_union_name = format!("geometry_{}", g.join("_"));
+				let mut geo_union = Union::new(&geo_union_name);
+				for geo_type in geo_types {
+					geo_union = geo_union.possible_type(geo_type.type_name())
+				}
+				types.push(Type::Union(geo_union));
+				TypeRef::named(geo_union_name)
+			}
+		},
+		(Kind::Geometry(g), true) => match g.len() {
+			1 => {
+				let name = g.into_iter().next().expect("checked that length is 1");
+				TypeRef::named(format!("{}_input", geometry_kind_name_to_type_name(&name)?))
+			}
+			// TODO: more robust type checking on multiple geometries
+			_ => TypeRef::named("Geometry_input"),
+		},
+		(Kind::Option(t), _) => {
 			let mut non_op_ty = *t;
 			while let Kind::Option(inner) = non_op_ty {
 				non_op_ty = *inner;
 			}
-			kind_to_type(non_op_ty, types)?
+			kind_to_type(non_op_ty, types, is_input)?
 		}
-		Kind::Either(ks) => {
+		(Kind::Either(ks), _) => {
 			let (ls, others): (Vec<Kind>, Vec<Kind>) =
 				ks.into_iter().partition(|k| matches!(k, Kind::Literal(Literal::String(_))));
 
-			let enum_ty = if ls.len() > 0 {
+			let enum_ty = if !ls.is_empty() {
 				let vals: Vec<String> = ls
 					.into_iter()
 					.map(|l| {
@@ -782,7 +549,7 @@ fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> 
 				let enum_ty = tmp.type_name().to_string();
 
 				types.push(Type::Enum(tmp));
-				if others.len() == 0 {
+				if others.is_empty() {
 					return Ok(TypeRef::named(enum_ty));
 				}
 				Some(enum_ty)
@@ -791,7 +558,7 @@ fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> 
 			};
 
 			let pos_names: Result<Vec<TypeRef>, GqlError> =
-				others.into_iter().map(|k| kind_to_type(k, types)).collect();
+				others.into_iter().map(|k| kind_to_type(k, types, is_input)).collect();
 			let pos_names: Vec<String> = pos_names?.into_iter().map(|tr| tr.to_string()).collect();
 			let ty_name = pos_names.join("_or_");
 
@@ -807,13 +574,15 @@ fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> 
 			types.push(Type::Union(tmp_union));
 			TypeRef::named(ty_name)
 		}
-		Kind::Set(_, _) => return Err(schema_error("Kind::Set is not yet supported")),
-		Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types)?)),
-		Kind::Function(_, _) => return Err(schema_error("Kind::Function is not yet supported")),
-		Kind::Range => return Err(schema_error("Kind::Range is not yet supported")),
+		(Kind::Set(_, _), _) => return Err(schema_error("Kind::Set is not yet supported")),
+		(Kind::Array(k, _), _) => TypeRef::List(Box::new(kind_to_type(*k, types, is_input)?)),
+		(Kind::Function(_, _), _) => {
+			return Err(schema_error("Kind::Function is not yet supported"))
+		}
+		(Kind::Range, _) => return Err(schema_error("Kind::Range is not yet supported")),
 		// TODO(raphaeldarley): check if union is of literals and generate enum
 		// generate custom scalar from other literals?
-		Kind::Literal(_) => return Err(schema_error("Kind::Literal is not yet supported")),
+		(Kind::Literal(_), _) => return Err(schema_error("Kind::Literal is not yet supported")),
 	};
 
 	let out = match optional {
@@ -823,192 +592,11 @@ fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> 
 	Ok(out)
 }
 
-macro_rules! filter_impl {
-	($filter:ident, $ty:ident, $name:expr) => {
-		$filter = $filter.field(InputValue::new($name, $ty.clone()));
-	};
-}
-
-fn filter_id() -> InputObject {
-	let mut filter = InputObject::new("_filter_id");
-	let ty = TypeRef::named(TypeRef::ID);
-	filter_impl!(filter, ty, "eq");
-	filter_impl!(filter, ty, "ne");
-	filter
-}
-fn filter_from_type(
-	kind: Kind,
-	filter_name: String,
-	types: &mut Vec<Type>,
-) -> Result<InputObject, GqlError> {
-	let ty = match &kind {
-		Kind::Record(ts) => match ts.len() {
-			1 => TypeRef::named(filter_name_from_table(
-				ts.first().expect("ts should have exactly one element").as_str(),
-			)),
-			_ => TypeRef::named(TypeRef::ID),
-		},
-		k => unwrap_type(kind_to_type(k.clone(), types)?),
-	};
-
-	let mut filter = InputObject::new(filter_name);
-	filter_impl!(filter, ty, "eq");
-	filter_impl!(filter, ty, "ne");
-
-	match kind {
-		Kind::Any => {}
-		Kind::Null => {}
-		Kind::Bool => {}
-		Kind::Bytes => {}
-		Kind::Datetime => {}
-		Kind::Decimal => {}
-		Kind::Duration => {}
-		Kind::Float => {}
-		Kind::Int => {}
-		Kind::Number => {}
-		Kind::Object => {}
-		Kind::Point => {}
-		Kind::String => {}
-		Kind::Uuid => {}
-		Kind::Record(_) => {}
-		Kind::Geometry(_) => {}
-		Kind::Option(_) => {}
-		Kind::Either(_) => {}
-		Kind::Set(_, _) => {}
-		Kind::Array(_, _) => {}
-		Kind::Function(_, _) => {}
-		Kind::Range => {}
-		Kind::Literal(_) => {}
-	};
-	Ok(filter)
-}
-
-fn unwrap_type(ty: TypeRef) -> TypeRef {
+pub fn unwrap_type(ty: TypeRef) -> TypeRef {
 	match ty {
 		TypeRef::NonNull(t) => unwrap_type(*t),
 		_ => ty,
 	}
-}
-
-fn cond_from_filter(
-	filter: &IndexMap<Name, GqlValue>,
-	fds: &[DefineFieldStatement],
-) -> Result<Cond, GqlError> {
-	val_from_filter(filter, fds).map(IntoExt::intox)
-}
-
-fn val_from_filter(
-	filter: &IndexMap<Name, GqlValue>,
-	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
-	if filter.len() != 1 {
-		return Err(resolver_error("Table Filter must have one item"));
-	}
-
-	let (k, v) = filter.iter().next().unwrap();
-
-	let cond = match k.as_str().to_lowercase().as_str() {
-		"or" => aggregate(v, AggregateOp::Or, fds),
-		"and" => aggregate(v, AggregateOp::And, fds),
-		"not" => negate(v, fds),
-		_ => binop(k.as_str(), v, fds),
-	};
-
-	cond
-}
-
-fn parse_op(name: impl AsRef<str>) -> Result<sql::Operator, GqlError> {
-	match name.as_ref() {
-		"eq" => Ok(sql::Operator::Equal),
-		"ne" => Ok(sql::Operator::NotEqual),
-		op => Err(resolver_error(format!("Unsupported op: {op}"))),
-	}
-}
-
-fn negate(filter: &GqlValue, fds: &[DefineFieldStatement]) -> Result<SqlValue, GqlError> {
-	let obj = filter.as_object().ok_or(resolver_error("Value of NOT must be object"))?;
-	let inner_cond = val_from_filter(obj, fds)?;
-
-	Ok(Expression::Unary {
-		o: sql::Operator::Not,
-		v: inner_cond,
-	}
-	.into())
-}
-
-enum AggregateOp {
-	And,
-	Or,
-}
-
-fn aggregate(
-	filter: &GqlValue,
-	op: AggregateOp,
-	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
-	let op_str = match op {
-		AggregateOp::And => "AND",
-		AggregateOp::Or => "OR",
-	};
-	let op = match op {
-		AggregateOp::And => sql::Operator::And,
-		AggregateOp::Or => sql::Operator::Or,
-	};
-	let list =
-		filter.as_list().ok_or(resolver_error(format!("Value of {op_str} should be a list")))?;
-	let filter_arr = list
-		.iter()
-		.map(|v| v.as_object().map(|o| val_from_filter(o, fds)))
-		.collect::<Option<Result<Vec<SqlValue>, GqlError>>>()
-		.ok_or(resolver_error(format!("List of {op_str} should contain objects")))??;
-
-	let mut iter = filter_arr.into_iter();
-
-	let mut cond = iter
-		.next()
-		.ok_or(resolver_error(format!("List of {op_str} should contain at least one object")))?;
-
-	for clause in iter {
-		cond = Expression::Binary {
-			l: clause,
-			o: op.clone(),
-			r: cond,
-		}
-		.into();
-	}
-
-	Ok(cond)
-}
-
-fn binop(
-	field_name: &str,
-	val: &GqlValue,
-	fds: &[DefineFieldStatement],
-) -> Result<SqlValue, GqlError> {
-	let obj = val.as_object().ok_or(resolver_error("Field filter should be object"))?;
-
-	let Some(fd) = fds.iter().find(|fd| fd.name.to_string() == field_name) else {
-		return Err(resolver_error(format!("Field `{field_name}` not found")));
-	};
-
-	if obj.len() != 1 {
-		return Err(resolver_error("Field Filter must have one item"));
-	}
-
-	let lhs = sql::Value::Idiom(field_name.intox());
-
-	let (k, v) = obj.iter().next().unwrap();
-	let op = parse_op(k)?;
-
-	let rhs = gql_to_sql_kind(v, fd.kind.clone().unwrap_or_default())?;
-
-	let expr = sql::Expression::Binary {
-		l: lhs,
-		o: op,
-		r: rhs,
-	};
-
-	Ok(expr.into())
 }
 
 macro_rules! either_try_kind {
@@ -1061,7 +649,7 @@ macro_rules! any_try_kinds {
 	};
 }
 
-fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
+pub fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
 	use crate::syn;
 	match kind {
 		Kind::Any => match val {
@@ -1194,7 +782,7 @@ fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
 				}
 			}
 			GqlValue::String(s) => match syn::value(s) {
-				Ok(SqlValue::Number(n)) => Ok(SqlValue::Number(n.clone())),
+				Ok(SqlValue::Number(n)) => Ok(SqlValue::Number(n)),
 				_ => Err(type_error(kind, val)),
 			},
 			_ => Err(type_error(kind, val)),
@@ -1205,7 +793,6 @@ fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
 					.iter()
 					.map(|(k, v)| gql_to_sql_kind(v, Kind::Any).map(|sqlv| (k.to_string(), sqlv)))
 					.collect();
-
 				Ok(SqlValue::Object(out?.into()))
 			}
 			GqlValue::String(s) => match syn::value_legacy_strand(s.as_str()) {
@@ -1247,7 +834,32 @@ fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
 			_ => Err(type_error(kind, val)),
 		},
 		// TODO: add geometry
-		Kind::Geometry(_) => Err(resolver_error("Geometry is not yet supported")),
+		// Kind::Geometry(_) => Err(resolver_error("Geometry is not yet supported")),
+		Kind::Geometry(ref ts) => match &val {
+			GqlValue::Object(map) => match map.get("type") {
+				Some(t) => match t {
+					GqlValue::String(acutal_t) => {
+						let mut included = false;
+						for ty in ts {
+							if geometry_kind_name_to_type_name(ty)? == acutal_t {
+								included = true;
+								break;
+							}
+						}
+						if included {
+							extract_geometry(map)
+								.map(SqlValue::Geometry)
+								.ok_or_else(|| type_error(kind, val))
+						} else {
+							Err(type_error(kind, val))
+						}
+					}
+					_ => Err(type_error(kind, val)),
+				},
+				None => Err(type_error(kind, val)),
+			},
+			_ => Err(type_error(kind, val)),
+		},
 		Kind::Option(k) => match val {
 			GqlValue::Null => Ok(SqlValue::None),
 			v => gql_to_sql_kind(v, *k),
@@ -1322,5 +934,91 @@ fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError> {
 		Kind::Function(_, _) => Err(resolver_error("Sets are not yet supported")),
 		Kind::Range => Err(resolver_error("Ranges are not yet supported")),
 		Kind::Literal(_) => Err(resolver_error("Literals are not yet supported")),
+	}
+}
+
+fn extract_coord(arr: &[GqlValue]) -> Option<Coord> {
+	match arr {
+		[GqlValue::Number(y), GqlValue::Number(x)] => Some(Coord {
+			x: x.as_f64()?,
+			y: y.as_f64()?,
+		}),
+		_ => None,
+	}
+}
+
+fn extract_coord_list(arr: &[GqlValue]) -> Option<Vec<Coord>> {
+	arr.iter()
+		.map(|c| match c {
+			GqlValue::List(c) => extract_coord(c),
+			_ => None,
+		})
+		.collect()
+}
+
+fn extract_coord_list_list(arr: &[GqlValue]) -> Option<Vec<Vec<Coord>>> {
+	arr.iter()
+		.map(|c| match c {
+			GqlValue::List(c) => extract_coord_list(c),
+			_ => None,
+		})
+		.collect()
+}
+
+fn extract_polygon(arr: &[GqlValue]) -> Option<Polygon> {
+	let mut line_strings = extract_coord_list_list(arr)?.into_iter().map(LineString);
+	let exterior = line_strings.next()?;
+	let interior = line_strings.collect();
+	Some(Polygon::new(exterior, interior))
+}
+
+fn extract_polygon_list(arr: &[GqlValue]) -> Option<Vec<Polygon>> {
+	arr.iter()
+		.map(|c| match c {
+			GqlValue::List(c) => extract_polygon(c),
+			_ => None,
+		})
+		.collect()
+}
+
+fn extract_geometry(map: &IndexMap<Name, GqlValue>) -> Option<Geometry> {
+	let ty = match map.get("type") {
+		Some(GqlValue::String(ty)) => Some(ty),
+		_ => None,
+	};
+
+	let coordinates = match map.get("coordinates") {
+		Some(GqlValue::List(cs)) => Some(cs.as_slice()),
+		_ => None,
+	};
+
+	let geometries = match map.get("geometries") {
+		Some(GqlValue::List(cs)) => Some(cs.as_slice()),
+		_ => None,
+	};
+
+	match ty?.as_str() {
+		"GeometryPoint" => Some(Geometry::Point(Point(extract_coord(coordinates?).unwrap()))),
+		"GeometryLineString" => Some(Geometry::Line(LineString(extract_coord_list(coordinates?)?))),
+		"GeometryPolygon" => Some(Geometry::Polygon(extract_polygon(coordinates?)?)),
+		"GeometryMultiPoint" => Some(Geometry::MultiPoint(MultiPoint(
+			extract_coord_list(&coordinates?)?.into_iter().map(Point).collect(),
+		))),
+		"GeometryMultiLineString" => Some(Geometry::MultiLine(MultiLineString(
+			extract_coord_list_list(&coordinates?)?.into_iter().map(LineString).collect(),
+		))),
+		"GeometryMultiPolygon" => {
+			Some(Geometry::MultiPolygon(MultiPolygon(extract_polygon_list(&coordinates?)?)))
+		}
+		"GeometryCollection" => Some(Geometry::Collection(
+			geometries?
+				.iter()
+				.map(|g| match g {
+					GqlValue::Object(inner_map) => extract_geometry(inner_map),
+					_ => None,
+				})
+				.collect::<Option<_>>()?,
+		)),
+		_ => None,
 	}
 }
