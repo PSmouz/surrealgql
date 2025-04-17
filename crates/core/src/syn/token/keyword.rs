@@ -259,7 +259,6 @@ keyword! {
 	Ulid => "ULID",
 	Rand => "RAND",
 	References => "REFERENCES",
-	Feature => "FEATURE",
 	Line => "LINE",
 	Point => "POINT",
 	Polygon => "POLYGON",

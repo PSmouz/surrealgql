@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::dbs::Session;
+use crate::err;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
 use crate::kvs::{Datastore, Transaction};
@@ -97,7 +98,7 @@ pub async fn process_tbs(
 			.field(InputValue::new("desc", TypeRef::named(&table_orderable_name)))
 			.field(InputValue::new("then", TypeRef::named(&table_order_name)));
 
-		let table_filter_name = filter_name_from_table(tb_name);
+		let table_filter_name = filter_name_from_table(&tb_name);
 		let mut table_filter = InputObject::new(&table_filter_name);
 		table_filter = table_filter
 			.field(InputValue::new("id", TypeRef::named("_filter_id")))
@@ -112,140 +113,140 @@ pub async fn process_tbs(
 		let kvs1 = datastore.clone();
 
 		query = query.field(
-        Field::new(
-            tb.name.to_string(),
-            TypeRef::named_nn_list_nn(tb.name.to_string()),
-            move |ctx| {
-                let tb_name = first_tb_name.clone();
-                let sess1 = sess1.clone();
-                let fds1 = fds1.clone();
-                let kvs1 = kvs1.clone();
-                FieldFuture::new(async move {
-                    let gtx = GQLTx::new(&kvs1, &sess1).await?;
+			Field::new(
+				tb.name.to_string(),
+				TypeRef::named_nn_list_nn(tb.name.to_string()),
+				move |ctx| {
+					let tb_name = first_tb_name.clone();
+					let sess1 = sess1.clone();
+					let fds1 = fds1.clone();
+					let kvs1 = kvs1.clone();
+					FieldFuture::new(async move {
+						let gtx = GQLTx::new(&kvs1, &sess1).await?;
 
-                    let args = ctx.args.as_index_map();
-                    trace!("received request with args: {args:?}");
+						let args = ctx.args.as_index_map();
+						trace!("received request with args: {args:?}");
 
-                    let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
+						let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
 
-                    let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
+						let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
 
-                    let order = args.get("order");
+						let order = args.get("order");
 
-                    let filter = args.get("filter");
+						let filter = args.get("filter");
 
-					let orders = match order {
-						Some(GqlValue::Object(o)) => {
-							let mut orders = vec![];
-							let mut current = o;
-							loop {
-								let asc = current.get("asc");
-								let desc = current.get("desc");
-								match (asc, desc) {
-									(Some(_), Some(_)) => {
-										return Err("Found both ASC and DESC in order".into());
+						let orders = match order {
+							Some(GqlValue::Object(o)) => {
+								let mut orders = vec![];
+								let mut current = o;
+								loop {
+									let asc = current.get("asc");
+									let desc = current.get("desc");
+									match (asc, desc) {
+										(Some(_), Some(_)) => {
+											return Err("Found both ASC and DESC in order".into());
+										}
+										(Some(GqlValue::Enum(a)), None) => {
+											orders.push(order!(asc, a.as_str()))
+										}
+										(None, Some(GqlValue::Enum(d))) => {
+											orders.push(order!(desc, d.as_str()))
+										}
+										(_, _) => {
+											break;
+										}
 									}
-									(Some(GqlValue::Enum(a)), None) => {
-										orders.push(order!(asc, a.as_str()))
-									}
-									(None, Some(GqlValue::Enum(d))) => {
-										orders.push(order!(desc, d.as_str()))
-									}
-									(_, _) => {
+									if let Some(GqlValue::Object(next)) = current.get("then") {
+										current = next;
+									} else {
 										break;
 									}
 								}
-								if let Some(GqlValue::Object(next)) = current.get("then") {
-									current = next;
-								} else {
-									break;
-								}
+								Some(orders)
 							}
-							Some(orders)
+							_ => None,
+						};
+
+						trace!("parsed orders: {orders:?}");
+
+						let cond = match filter {
+							Some(f) => {
+								let o = match f {
+									GqlValue::Object(o) => o,
+									f => {
+										error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
+										return Err("Value in cond doesn't fit schema".into());
+									}
+								};
+
+								let cond = cond_from_filter(o, &fds1)?;
+
+								Some(cond)
+							}
+							None => None,
+						};
+
+						trace!("parsed filter: {cond:?}");
+
+						// SELECT VALUE id FROM ...
+						let ast = Statement::Select({
+							SelectStatement {
+								what: vec![SqlValue::Table(tb_name.intox())].into(),
+								expr: Fields(
+									vec![sql::Field::Single {
+										expr: SqlValue::Idiom(Idiom::from("id")),
+										alias: None,
+									}],
+									// this means the `value` keyword
+									true,
+								),
+								order: orders.map(|x| Ordering::Order(OrderList(x))),
+								cond,
+								limit,
+								start,
+								..Default::default()
+							}
+						});
+
+						trace!("generated query ast: {ast:?}");
+
+						let res = gtx.process_stmt(ast).await?;
+
+						let res_vec =
+							match res {
+								SqlValue::Array(a) => a,
+								v => {
+									error!("Found top level value, in result which should be array: {v:?}");
+									return Err("Internal Error".into());
+								}
+							};
+
+						let out: Result<Vec<FieldValue>, SqlValue> = res_vec
+							.0
+							.into_iter()
+							.map(|v| {
+								v.try_as_thing().map(|t| {
+									let erased: ErasedRecord = (gtx.clone(), t);
+									field_val_erase_owned(erased)
+								})
+							})
+							.collect();
+
+						match out {
+							Ok(l) => Ok(Some(FieldValue::list(l))),
+							Err(v) => {
+								Err(internal_error(format!("expected thing, found: {v:?}")).into())
+							}
 						}
-						_ => None,
-					};
-
-                    trace!("parsed orders: {orders:?}");
-
-                    let cond = match filter {
-                        Some(f) => {
-                            let o = match f {
-                                GqlValue::Object(o) => o,
-                                f => {
-                                    error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
-                                    return Err("Value in cond doesn't fit schema".into());
-                                }
-                            };
-
-                            let cond = cond_from_filter(o, &fds1)?;
-
-                            Some(cond)
-                        }
-                        None => None,
-                    };
-
-                    trace!("parsed filter: {cond:?}");
-
-                    // SELECT VALUE id FROM ...
-                    let ast = Statement::Select({
-                        SelectStatement {
-                            what: vec![SqlValue::Table(tb_name.intox())].into(),
-                            expr: Fields(
-                                vec![sql::Field::Single {
-                                    expr: SqlValue::Idiom(Idiom::from("id")),
-                                    alias: None,
-                                }],
-                                // this means the `value` keyword
-                                true,
-                            ),
-                            order: orders.map(|x| Ordering::Order(OrderList(x))),
-                            cond,
-                            limit,
-                            start,
-                            ..Default::default()
-                        }
-                    });
-
-                    trace!("generated query ast: {ast:?}");
-
-                    let res = gtx.process_stmt(ast).await?;
-
-                    let res_vec =
-                        match res {
-                            SqlValue::Array(a) => a,
-                            v => {
-                                error!("Found top level value, in result which should be array: {v:?}");
-                                return Err("Internal Error".into());
-                            }
-                        };
-
-                    let out: Result<Vec<FieldValue>, SqlValue> = res_vec
-                        .0
-                        .into_iter()
-                        .map(|v| {
-                            v.try_as_thing().map(|t| {
-                                let erased: ErasedRecord = (gtx.clone(), t);
-                                field_val_erase_owned(erased)
-                            })
-                        })
-                        .collect();
-
-                    match out {
-                        Ok(l) => Ok(Some(FieldValue::list(l))),
-                        Err(v) => {
-                            Err(internal_error(format!("expected thing, found: {v:?}")).into())
-                        }
-                    }
-                })
-            },
-        )
-        .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
-        .argument(limit_input!())
-        .argument(start_input!())
-        .argument(InputValue::new("order", TypeRef::named(&table_order_name)))
-        .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
-    );
+					})
+				},
+			)
+				.description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
+				.argument(limit_input!())
+				.argument(start_input!())
+				.argument(InputValue::new("order", TypeRef::named(&table_order_name)))
+				.argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
+		);
 
 		let sess2 = session.to_owned();
 		let kvs2 = datastore.to_owned();
@@ -269,7 +270,7 @@ pub async fn process_tbs(
 										return Err(internal_error(
 											"Schema validation failed: No id found in _get_",
 										)
-										.into());
+											.into());
 									}
 								};
 								let thing = match id.clone().try_into() {
@@ -288,12 +289,12 @@ pub async fn process_tbs(
 						})
 					},
 				)
-				.description(if let Some(ref c) = &tb.comment {
-					format!("{c}")
-				} else {
-					format!("Generated from table `{}`\nallows querying a single record in a table by ID", tb.name)
-				})
-				.argument(id_input!()),
+					.description(if let Some(ref c) = &tb.comment {
+						format!("{c}")
+					} else {
+						format!("Generated from table `{}`\nallows querying a single record in a table by ID", tb.name)
+					})
+					.argument(id_input!()),
 			);
 
 		let mut table_ty_obj = Object::new(tb.name.to_string())
@@ -317,9 +318,10 @@ pub async fn process_tbs(
 				continue;
 			};
 			let fd_name = Name::new(fd.name.to_string());
-			let fd_type = kind_to_type(kind.clone(), types)?;
+			let fd_type = kind_to_type(kind.clone(), types, false)?;
+			let fd_type_input = kind_to_type(kind.clone(), types, true)?;
 			table_orderable = table_orderable.item(fd_name.to_string());
-			let type_filter_name = format!("_filter_{}", unwrap_type(fd_type.clone()));
+			let type_filter_name = format!("_filter_{}", unwrap_type(fd_type_input.clone()));
 
 			let type_filter =
 				Type::InputObject(filter_from_type(kind.clone(), type_filter_name.clone(), types)?);
@@ -365,7 +367,7 @@ pub async fn process_tbs(
 							return Err(internal_error(
 								"Schema validation failed: No id found in _get",
 							)
-							.into());
+								.into());
 						}
 					};
 
@@ -385,8 +387,8 @@ pub async fn process_tbs(
 				}
 			})
 		})
-		.description("Allows fetching arbitrary records".to_string())
-		.argument(id_input!()),
+			.description("Allows fetching arbitrary records".to_string())
+			.argument(id_input!()),
 	);
 
 	Ok(query)
@@ -462,7 +464,7 @@ fn filter_from_type(
 			)),
 			_ => TypeRef::named(TypeRef::ID),
 		},
-		k => unwrap_type(kind_to_type(k.clone(), types)?),
+		k => unwrap_type(kind_to_type(k.clone(), types, true)?),
 	};
 
 	let mut filter = InputObject::new(filter_name);
@@ -484,7 +486,6 @@ fn filter_from_type(
 		Kind::Point => {}
 		Kind::String => {}
 		Kind::Uuid => {}
-		Kind::Regex => {}
 		Kind::Record(_) => {}
 		Kind::Geometry(_) => {}
 		Kind::Option(_) => {}
@@ -494,8 +495,6 @@ fn filter_from_type(
 		Kind::Function(_, _) => {}
 		Kind::Range => {}
 		Kind::Literal(_) => {}
-		Kind::References(_, _) => {}
-		Kind::File(_) => {}
 	};
 	Ok(filter)
 }
@@ -543,7 +542,7 @@ fn negate(filter: &GqlValue, fds: &[DefineFieldStatement]) -> Result<SqlValue, G
 		o: sql::Operator::Not,
 		v: inner_cond,
 	}
-	.into())
+		.into())
 }
 
 enum AggregateOp {
@@ -584,7 +583,7 @@ fn aggregate(
 			o: op.clone(),
 			r: cond,
 		}
-		.into();
+			.into();
 	}
 
 	Ok(cond)
