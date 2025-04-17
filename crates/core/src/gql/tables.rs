@@ -350,7 +350,6 @@ pub async fn process_tbs(
 			types.push(type_filter);
 
 			table_filter = table_filter
-				//TODO: check if correct camel case
 				.field(InputValue::new(fd.name.to_string().to_camel_case(), TypeRef::named
 					(type_filter_name)));
 
@@ -484,10 +483,10 @@ fn filter_from_type(
 ) -> Result<InputObject, GqlError> {
 	let ty = match &kind {
 		Kind::Record(ts) => match ts.len() {
-			1 => TypeRef::named(filter_name_from_table(
-				ts.first().expect("ts should have exactly one element").as_str(),
-			)),
-			_ => TypeRef::named(TypeRef::ID),
+			1 => TypeRef::named(TypeRef::ID),
+			_ => TypeRef::named(filter_name_from_table(
+					ts.first().expect("ts should have exactly one element").as_str(),
+				)),
 		},
 		k => unwrap_type(kind_to_type(k.clone(), types)?),
 	};
