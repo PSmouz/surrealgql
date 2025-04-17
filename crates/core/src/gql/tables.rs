@@ -356,7 +356,7 @@ pub async fn process_tbs(
 			// .to_camel_case()
 			table_ty_obj = table_ty_obj
 				.field(Field::new(
-					fd.name.to_string(),
+					fd.name.to_string().to_camel_case(),
 					fd_type,
 					make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
 				))
