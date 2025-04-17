@@ -472,6 +472,7 @@ pub fn kind_to_type(
 		(Kind::Number, _) => TypeRef::named("number"),
 		(Kind::Object, _) => TypeRef::named("object"),
 		(Kind::Point, _) => return Err(schema_error("Kind::Point is not yet supported")),
+		(Kind::Regex, _) => return Err(schema_error("Kind::Regex is not yet supported")),
 		(Kind::String, _) => TypeRef::named(TypeRef::STRING),
 		(Kind::Uuid, _) => TypeRef::named("uuid"),
 		(Kind::Record(mut r), _) => match r.len() {
@@ -525,7 +526,7 @@ pub fn kind_to_type(
 				non_op_ty = *inner;
 			}
 			kind_to_type(non_op_ty, types, is_input)?
-		}
+		},
 		(Kind::Either(ks), _) => {
 			let (ls, others): (Vec<Kind>, Vec<Kind>) =
 				ks.into_iter().partition(|k| matches!(k, Kind::Literal(Literal::String(_))));
@@ -573,25 +574,25 @@ pub fn kind_to_type(
 
 			types.push(Type::Union(tmp_union));
 			TypeRef::named(ty_name)
-		}
+		},
 		(Kind::Set(_, _), _) => return Err(schema_error("Kind::Set is not yet supported")),
 		(Kind::Array(k, _), _) => TypeRef::List(Box::new(kind_to_type(*k, types, is_input)?)),
 		(Kind::Function(_, _), _) => {
 			return Err(schema_error("Kind::Function is not yet supported"))
-		}
+		},
 		(Kind::Range, _) => return Err(schema_error("Kind::Range is not yet supported")),
 		// TODO(raphaeldarley): check if union is of literals and generate enum
 		// generate custom scalar from other literals?
-		Kind::Literal(_) => return Err(schema_error("Kind::Literal is not yet supported")),
-		Kind::References(ft, _) => {
+		(Kind::Literal(_), _) => return Err(schema_error("Kind::Literal is not yet supported")),
+		(Kind::References(ft, _), _) => {
 			let inner = match ft.to_owned() {
 				Some(ft) => Kind::Record(vec![ft]),
 				None => Kind::Record(vec![]),
 			};
 
-			TypeRef::List(Box::new(kind_to_type(inner, types)?))
-		}
-		Kind::File(_) => return Err(schema_error("Kind::File is not yet supported")),
+			TypeRef::List(Box::new(kind_to_type(inner, types, is_input)?))
+		},
+		(Kind::File(_), _) => return Err(schema_error("Kind::File is not yet supported")),
 	};
 
 	let out = match optional {

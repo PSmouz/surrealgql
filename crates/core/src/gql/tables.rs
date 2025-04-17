@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use crate::dbs::Session;
-use crate::err;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
 use crate::kvs::{Datastore, Transaction};
@@ -486,6 +485,7 @@ fn filter_from_type(
 		Kind::Point => {}
 		Kind::String => {}
 		Kind::Uuid => {}
+		Kind::Regex => {}
 		Kind::Record(_) => {}
 		Kind::Geometry(_) => {}
 		Kind::Option(_) => {}
@@ -495,6 +495,8 @@ fn filter_from_type(
 		Kind::Function(_, _) => {}
 		Kind::Range => {}
 		Kind::Literal(_) => {}
+		Kind::References(_, _) => {}
+		Kind::File(_) => {}
 	};
 	Ok(filter)
 }
