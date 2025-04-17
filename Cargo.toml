@@ -74,6 +74,7 @@ getrandom = "0.3.2"
 hex = "0.4.3"
 http = "1.1.0"
 indexmap = "2.1.0"
+Inflector = "0.11.4"
 jemallocator = { version = "0.6.0", package = "tikv-jemallocator" }
 jsonwebtoken = "9.3.0"
 linfa-linalg = "=0.1.0"

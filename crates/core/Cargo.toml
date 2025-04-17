@@ -139,6 +139,7 @@ geo = { workspace = true, features = ["use-serde"] }
 geo-types = { workspace = true }
 http.workspace = true
 hex.workspace = true
+Inflector.workspace = true
 ipnet.workspace = true
 jsonwebtoken.workspace = true
 linfa-linalg.workspace = true
