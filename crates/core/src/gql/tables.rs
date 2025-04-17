@@ -81,6 +81,14 @@ pub async fn process_tbs(
 		let first_tb_name = tb_name.clone();
 		let second_tb_name = tb_name.clone();
 
+		// TODO: maybe there is a better solution in the future
+		// TODO: can table names include `_`? if yes, convert or prohibit either
+		if tb_name.ends_with("s") {
+			GqlError::SchemaError(format!(
+				"Table name `{}` ends with `s` which is not allowed", tb.name
+			));
+		}
+
 		let table_orderable_name = format!("_orderable_{tb_name}");
 		let mut table_orderable = Enum::new(&table_orderable_name).item("id");
 		table_orderable = table_orderable.description(format!(
@@ -111,148 +119,150 @@ pub async fn process_tbs(
 		let fds1 = fds.clone();
 		let kvs1 = datastore.clone();
 
+		// All table instances
 		query = query.field(
-        Field::new(
-            tb.name.to_string(),
-            TypeRef::named_nn_list_nn(tb.name.to_string()),
-            move |ctx| {
-                let tb_name = first_tb_name.clone();
-                let sess1 = sess1.clone();
-                let fds1 = fds1.clone();
-                let kvs1 = kvs1.clone();
-                FieldFuture::new(async move {
-                    let gtx = GQLTx::new(&kvs1, &sess1).await?;
+			Field::new(
+				format!("{}s", tb.name),
+				TypeRef::named_nn_list_nn(tb.name.to_string()),
+				move |ctx| {
+					let tb_name = first_tb_name.clone();
+					let sess1 = sess1.clone();
+					let fds1 = fds1.clone();
+					let kvs1 = kvs1.clone();
+					FieldFuture::new(async move {
+						let gtx = GQLTx::new(&kvs1, &sess1).await?;
 
-                    let args = ctx.args.as_index_map();
-                    trace!("received request with args: {args:?}");
+						let args = ctx.args.as_index_map();
+						trace!("received request with args: {args:?}");
 
-                    let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
+						let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
 
-                    let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
+						let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
 
-                    let order = args.get("order");
+						let order = args.get("order");
 
-                    let filter = args.get("filter");
+						let filter = args.get("filter");
 
-					let orders = match order {
-						Some(GqlValue::Object(o)) => {
-							let mut orders = vec![];
-							let mut current = o;
-							loop {
-								let asc = current.get("asc");
-								let desc = current.get("desc");
-								match (asc, desc) {
-									(Some(_), Some(_)) => {
-										return Err("Found both ASC and DESC in order".into());
+						let orders = match order {
+							Some(GqlValue::Object(o)) => {
+								let mut orders = vec![];
+								let mut current = o;
+								loop {
+									let asc = current.get("asc");
+									let desc = current.get("desc");
+									match (asc, desc) {
+										(Some(_), Some(_)) => {
+											return Err("Found both ASC and DESC in order".into());
+										}
+										(Some(GqlValue::Enum(a)), None) => {
+											orders.push(order!(asc, a.as_str()))
+										}
+										(None, Some(GqlValue::Enum(d))) => {
+											orders.push(order!(desc, d.as_str()))
+										}
+										(_, _) => {
+											break;
+										}
 									}
-									(Some(GqlValue::Enum(a)), None) => {
-										orders.push(order!(asc, a.as_str()))
-									}
-									(None, Some(GqlValue::Enum(d))) => {
-										orders.push(order!(desc, d.as_str()))
-									}
-									(_, _) => {
+									if let Some(GqlValue::Object(next)) = current.get("then") {
+										current = next;
+									} else {
 										break;
 									}
 								}
-								if let Some(GqlValue::Object(next)) = current.get("then") {
-									current = next;
-								} else {
-									break;
-								}
+								Some(orders)
 							}
-							Some(orders)
+							_ => None,
+						};
+
+						trace!("parsed orders: {orders:?}");
+
+						let cond = match filter {
+							Some(f) => {
+								let o = match f {
+									GqlValue::Object(o) => o,
+									f => {
+										error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
+										return Err("Value in cond doesn't fit schema".into());
+									}
+								};
+
+								let cond = cond_from_filter(o, &fds1)?;
+
+								Some(cond)
+							}
+							None => None,
+						};
+
+						trace!("parsed filter: {cond:?}");
+
+						// SELECT VALUE id FROM ...
+						let ast = Statement::Select({
+							SelectStatement {
+								what: vec![SqlValue::Table(tb_name.intox())].into(),
+								expr: Fields(
+									vec![sql::Field::Single {
+										expr: SqlValue::Idiom(Idiom::from("id")),
+										alias: None,
+									}],
+									// this means the `value` keyword
+									true,
+								),
+								order: orders.map(|x| Ordering::Order(OrderList(x))),
+								cond,
+								limit,
+								start,
+								..Default::default()
+							}
+						});
+
+						trace!("generated query ast: {ast:?}");
+
+						let res = gtx.process_stmt(ast).await?;
+
+						let res_vec =
+							match res {
+								SqlValue::Array(a) => a,
+								v => {
+									error!("Found top level value, in result which should be array: {v:?}");
+									return Err("Internal Error".into());
+								}
+							};
+
+						let out: Result<Vec<FieldValue>, SqlValue> = res_vec
+							.0
+							.into_iter()
+							.map(|v| {
+								v.try_as_thing().map(|t| {
+									let erased: ErasedRecord = (gtx.clone(), t);
+									field_val_erase_owned(erased)
+								})
+							})
+							.collect();
+
+						match out {
+							Ok(l) => Ok(Some(FieldValue::list(l))),
+							Err(v) => {
+								Err(internal_error(format!("expected thing, found: {v:?}")).into())
+							}
 						}
-						_ => None,
-					};
+					})
+				},
+			)
+			.description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
+			.argument(limit_input!())
+			.argument(start_input!())
+			.argument(InputValue::new("order", TypeRef::named(&table_order_name)))
+			.argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
+		);
 
-                    trace!("parsed orders: {orders:?}");
-
-                    let cond = match filter {
-                        Some(f) => {
-                            let o = match f {
-                                GqlValue::Object(o) => o,
-                                f => {
-                                    error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
-                                    return Err("Value in cond doesn't fit schema".into());
-                                }
-                            };
-
-                            let cond = cond_from_filter(o, &fds1)?;
-
-                            Some(cond)
-                        }
-                        None => None,
-                    };
-
-                    trace!("parsed filter: {cond:?}");
-
-                    // SELECT VALUE id FROM ...
-                    let ast = Statement::Select({
-                        SelectStatement {
-                            what: vec![SqlValue::Table(tb_name.intox())].into(),
-                            expr: Fields(
-                                vec![sql::Field::Single {
-                                    expr: SqlValue::Idiom(Idiom::from("id")),
-                                    alias: None,
-                                }],
-                                // this means the `value` keyword
-                                true,
-                            ),
-                            order: orders.map(|x| Ordering::Order(OrderList(x))),
-                            cond,
-                            limit,
-                            start,
-                            ..Default::default()
-                        }
-                    });
-
-                    trace!("generated query ast: {ast:?}");
-
-                    let res = gtx.process_stmt(ast).await?;
-
-                    let res_vec =
-                        match res {
-                            SqlValue::Array(a) => a,
-                            v => {
-                                error!("Found top level value, in result which should be array: {v:?}");
-                                return Err("Internal Error".into());
-                            }
-                        };
-
-                    let out: Result<Vec<FieldValue>, SqlValue> = res_vec
-                        .0
-                        .into_iter()
-                        .map(|v| {
-                            v.try_as_thing().map(|t| {
-                                let erased: ErasedRecord = (gtx.clone(), t);
-                                field_val_erase_owned(erased)
-                            })
-                        })
-                        .collect();
-
-                    match out {
-                        Ok(l) => Ok(Some(FieldValue::list(l))),
-                        Err(v) => {
-                            Err(internal_error(format!("expected thing, found: {v:?}")).into())
-                        }
-                    }
-                })
-            },
-        )
-        .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
-        .argument(limit_input!())
-        .argument(start_input!())
-        .argument(InputValue::new("order", TypeRef::named(&table_order_name)))
-        .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
-    );
-
+		// Single table instance
 		let sess2 = session.to_owned();
 		let kvs2 = datastore.to_owned();
 		query =
 			query.field(
 				Field::new(
-					format!("_get_{}", tb.name),
+					tb.name.to_string(),
 					TypeRef::named(tb.name.to_string()),
 					move |ctx| {
 						let tb_name = second_tb_name.clone();
