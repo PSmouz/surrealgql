@@ -153,30 +153,30 @@ pub async fn generate_schema(
 
 	scalar_debug_validated!(
 		schema,
-		"uuid",
+		"UUID",
 		Kind::Uuid,
 		"String encoded UUID",
 		"https://datatracker.ietf.org/doc/html/rfc4122"
 	);
 
-	scalar_debug_validated!(schema, "decimal", Kind::Decimal);
-	scalar_debug_validated!(schema, "number", Kind::Number);
+	scalar_debug_validated!(schema, "Decimal", Kind::Decimal);
+	scalar_debug_validated!(schema, "Number", Kind::Number);
 	scalar_debug_validated!(schema, "null", Kind::Null);
-	scalar_debug_validated!(schema, "datetime", Kind::Datetime);
-	scalar_debug_validated!(schema, "duration", Kind::Duration);
-	scalar_debug_validated!(schema, "object", Kind::Object);
-	scalar_debug_validated!(schema, "any", Kind::Any);
+	scalar_debug_validated!(schema, "DateTime", Kind::Datetime);
+	scalar_debug_validated!(schema, "Duration", Kind::Duration);
+	scalar_debug_validated!(schema, "Object", Kind::Object);
+	scalar_debug_validated!(schema, "Any", Kind::Any);
 
 	let id_interface =
-		Interface::new("record").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)));
+		Interface::new("Record").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)));
 	schema = schema.register(id_interface);
 
 	// TODO: when used get: `Result::unwrap()` on an `Err` value: SchemaError("Field \"like.in\" is not sub-type of \"relation.in\"")
 	let relation_interface = Interface::new("relation")
 		.field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)))
-		.field(InterfaceField::new("in", TypeRef::named_nn("record")))
-		.field(InterfaceField::new("out", TypeRef::named_nn("record")))
-		.implement("record");
+		.field(InterfaceField::new("in", TypeRef::named_nn("Record")))
+		.field(InterfaceField::new("out", TypeRef::named_nn("Record")))
+		.implement("Record");
 	schema = schema.register(relation_interface);
 
 	schema
@@ -223,23 +223,23 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 		_ => (false, kind),
 	};
 	let out_ty = match match_kind {
-		Kind::Any => TypeRef::named("any"),
+		Kind::Any => TypeRef::named("Any"),
 		Kind::Null => TypeRef::named("null"),
 		Kind::Bool => TypeRef::named(TypeRef::BOOLEAN),
 		Kind::Bytes => TypeRef::named("bytes"),
-		Kind::Datetime => TypeRef::named("datetime"),
-		Kind::Decimal => TypeRef::named("decimal"),
-		Kind::Duration => TypeRef::named("duration"),
+		Kind::Datetime => TypeRef::named("DateTime"),
+		Kind::Decimal => TypeRef::named("Decimal"),
+		Kind::Duration => TypeRef::named("Duration"),
 		Kind::Float => TypeRef::named(TypeRef::FLOAT),
 		Kind::Int => TypeRef::named(TypeRef::INT),
-		Kind::Number => TypeRef::named("number"),
-		Kind::Object => TypeRef::named("object"),
+		Kind::Number => TypeRef::named("Number"),
+		Kind::Object => TypeRef::named("Object"),
 		Kind::Point => return Err(schema_error("Kind::Point is not yet supported")),
 		Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
 		Kind::String => TypeRef::named(TypeRef::STRING),
-		Kind::Uuid => TypeRef::named("uuid"),
+		Kind::Uuid => TypeRef::named("UUID"),
 		Kind::Record(mut r) => match r.len() {
-			0 => TypeRef::named("record"),
+			0 => TypeRef::named("Record"),
 			1 => TypeRef::named(r.pop().unwrap().0),
 			_ => {
 				let names: Vec<String> = r.into_iter().map(|t| t.0).collect();

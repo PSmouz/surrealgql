@@ -21,6 +21,7 @@ use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
+use inflector::Inflector;
 
 use super::error::{resolver_error, GqlError};
 use super::ext::IntoExt;
@@ -81,7 +82,8 @@ pub async fn process_tbs(
 		let first_tb_name = tb_name.clone();
 		let second_tb_name = tb_name.clone();
 
-		// TODO: maybe there is a better solution in the future
+		// TODO: maybe there is a better solution in the future. Inflector using feature
+		// heavyweight has to_plural and to_singular functions
 		// TODO: can table names include `_`? if yes, convert or prohibit either
 		if tb_name.ends_with("s") {
 			GqlError::SchemaError(format!(
@@ -315,7 +317,7 @@ pub async fn process_tbs(
 					Some(Kind::Record(vec![Table::from(tb.name.to_string())])),
 				),
 			))
-			.implement("record");
+			.implement("Record");
 
 		for fd in fds.iter() {
 			let Some(ref kind) = fd.kind else {
@@ -361,7 +363,7 @@ pub async fn process_tbs(
 	let sess3 = session.to_owned();
 	let kvs3 = datastore.to_owned();
 	query = query.field(
-		Field::new("_get", TypeRef::named("record"), move |ctx| {
+		Field::new("_get", TypeRef::named("Record"), move |ctx| {
 			FieldFuture::new({
 				let sess3 = sess3.clone();
 				let kvs3 = kvs3.clone();
