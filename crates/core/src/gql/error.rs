@@ -22,6 +22,8 @@ pub enum GqlError {
 	UnspecifiedDatabase,
 	#[error("GraphQL has not been configured for this database")]
 	NotConfigured,
+	#[error("Auth error: {0}")]
+	AuthError(String),
 	#[error("Internal Error: {0}")]
 	InternalError(String),
 	#[error("Error converting value: {val} to type: {target}")]
@@ -31,6 +33,8 @@ pub enum GqlError {
 	},
 }
 
+pub fn auth_error(msg: impl Into<String>) -> GqlError { GqlError::AuthError(msg.into()) }
+
 pub fn schema_error(msg: impl Into<String>) -> GqlError {
 	GqlError::SchemaError(msg.into())
 }
@@ -38,6 +42,7 @@ pub fn schema_error(msg: impl Into<String>) -> GqlError {
 pub fn resolver_error(msg: impl Into<String>) -> GqlError {
 	GqlError::ResolverError(msg.into())
 }
+
 pub fn internal_error(msg: impl Into<String>) -> GqlError {
 	let msg = msg.into();
 	let bt = backtrace::Backtrace::capture();
