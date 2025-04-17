@@ -21,6 +21,7 @@ use async_graphql::Value as GqlValue;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Number;
+use inflector::Inflector;
 
 use super::error::{resolver_error, GqlError};
 #[cfg(debug_assertions)]
@@ -161,7 +162,7 @@ pub async fn generate_schema(
 
 	scalar_debug_validated!(schema, "Decimal", Kind::Decimal);
 	scalar_debug_validated!(schema, "Number", Kind::Number);
-	scalar_debug_validated!(schema, "null", Kind::Null);
+	scalar_debug_validated!(schema, "Null", Kind::Null);
 	scalar_debug_validated!(schema, "DateTime", Kind::Datetime);
 	scalar_debug_validated!(schema, "Duration", Kind::Duration);
 	scalar_debug_validated!(schema, "Object", Kind::Object);
@@ -224,9 +225,9 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 	};
 	let out_ty = match match_kind {
 		Kind::Any => TypeRef::named("Any"),
-		Kind::Null => TypeRef::named("null"),
+		Kind::Null => TypeRef::named("Null"),
 		Kind::Bool => TypeRef::named(TypeRef::BOOLEAN),
-		Kind::Bytes => TypeRef::named("bytes"),
+		Kind::Bytes => TypeRef::named("Bytes"),
 		Kind::Datetime => TypeRef::named("DateTime"),
 		Kind::Decimal => TypeRef::named("Decimal"),
 		Kind::Duration => TypeRef::named("Duration"),
@@ -240,10 +241,10 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 		Kind::Uuid => TypeRef::named("UUID"),
 		Kind::Record(mut r) => match r.len() {
 			0 => TypeRef::named("Record"),
-			1 => TypeRef::named(r.pop().unwrap().0),
+			1 => TypeRef::named(r.pop().unwrap().0.to_pascal_case()),
 			_ => {
-				let names: Vec<String> = r.into_iter().map(|t| t.0).collect();
-				let ty_name = names.join("_or_");
+				let names: Vec<String> = r.into_iter().map(|t| t.0.to_pascal_case()).collect();
+				let ty_name = names.join("Or");
 
 				let mut tmp_union = Union::new(ty_name.clone())
 					.description(format!("A record which is one of: {}", names.join(", ")));

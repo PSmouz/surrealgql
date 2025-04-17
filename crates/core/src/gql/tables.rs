@@ -62,7 +62,8 @@ macro_rules! id_input {
 }
 
 fn filter_name_from_table(tb_name: impl Display) -> String {
-	format!("_filter_{tb_name}")
+	// format!("Filter{}", tb_name.to_string().to_sentence_case())
+	format!("{}FilterInput", tb_name.to_string().to_pascal_case())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,13 +92,15 @@ pub async fn process_tbs(
 			));
 		}
 
-		let table_orderable_name = format!("_orderable_{tb_name}");
-		let mut table_orderable = Enum::new(&table_orderable_name).item("id");
+		// FIXME: find better name
+		let table_orderable_name = format!("{}OrderableField",
+										   tb_name.to_string().to_pascal_case());
+		let mut table_orderable = Enum::new(&table_orderable_name).item("ID");
 		table_orderable = table_orderable.description(format!(
 			"Generated from `{}` the fields which a query can be ordered by",
 			tb.name
 		));
-		let table_order_name = format!("_order_{tb_name}");
+		let table_order_name = format!("{}OrderInput", tb_name.to_string().to_pascal_case());
 		let table_order = InputObject::new(&table_order_name)
 			.description(format!(
 				"Generated from `{}` an object representing a query ordering",
@@ -109,8 +112,9 @@ pub async fn process_tbs(
 
 		let table_filter_name = filter_name_from_table(tb_name);
 		let mut table_filter = InputObject::new(&table_filter_name);
+		// TODO: future names should be camelCase as well e.g. greaterThan
 		table_filter = table_filter
-			.field(InputValue::new("id", TypeRef::named("_filter_id")))
+			.field(InputValue::new("id", TypeRef::named("IDFilterInput")))
 			.field(InputValue::new("and", TypeRef::named_nn_list(&table_filter_name)))
 			.field(InputValue::new("or", TypeRef::named_nn_list(&table_filter_name)))
 			.field(InputValue::new("not", TypeRef::named(&table_filter_name)));
@@ -124,8 +128,11 @@ pub async fn process_tbs(
 		// All table instances
 		query = query.field(
 			Field::new(
-				format!("{}s", tb.name),
-				TypeRef::named_nn_list_nn(tb.name.to_string()),
+				// format!("{}s", tb.name),
+				// Uses advanced pluralization
+				// TODO: might fail for names that have the same plural20
+				tb.name.to_string().to_camel_case().to_plural(),
+				TypeRef::named_nn_list_nn(tb.name.to_string().to_pascal_case()),
 				move |ctx| {
 					let tb_name = first_tb_name.clone();
 					let sess1 = sess1.clone();
@@ -264,8 +271,9 @@ pub async fn process_tbs(
 		query =
 			query.field(
 				Field::new(
-					tb.name.to_string(),
-					TypeRef::named(tb.name.to_string()),
+					// tb.name.to_string(),
+					tb.name.to_string().to_camel_case(),
+					TypeRef::named(tb.name.to_string().to_pascal_case()),
 					move |ctx| {
 						let tb_name = second_tb_name.clone();
 						let kvs2 = kvs2.clone();
@@ -308,7 +316,7 @@ pub async fn process_tbs(
 				.argument(id_input!()),
 			);
 
-		let mut table_ty_obj = Object::new(tb.name.to_string())
+		let mut table_ty_obj = Object::new(tb.name.to_string().to_pascal_case())
 			.field(Field::new(
 				"id",
 				TypeRef::named_nn(TypeRef::ID),
@@ -324,17 +332,17 @@ pub async fn process_tbs(
 				continue;
 			};
 			if fd.name.is_id() {
-				// We have already defined "id"
+				// We have already defined "id",
 				// so we don't take any new definition for it.
 				continue;
 			};
 			let fd_name = Name::new(fd.name.to_string());
 			let fd_type = kind_to_type(kind.clone(), types)?;
-			table_orderable = table_orderable.item(fd_name.to_string());
-			let type_filter_name = format!("Input{}Filter",
+
+			table_orderable = table_orderable.item(fd_name.to_string().to_screaming_snake_case());
+			let type_filter_name = format!("{}FilterInput",
 										   unwrap_type(fd_type.clone())
 			);
-				// .to_camel_case();unwrap_type()
 
 			let type_filter =
 				Type::InputObject(filter_from_type(kind.clone(), type_filter_name.clone(), types)?);
@@ -342,7 +350,9 @@ pub async fn process_tbs(
 			types.push(type_filter);
 
 			table_filter = table_filter
-				.field(InputValue::new(fd.name.to_string(), TypeRef::named(type_filter_name)));
+				//TODO: check if correct camel case
+				.field(InputValue::new(fd.name.to_string().to_camel_case(), TypeRef::named
+					(type_filter_name)));
 
 			// .to_camel_case()
 			table_ty_obj = table_ty_obj
@@ -455,12 +465,13 @@ fn make_table_field_resolver(
 
 macro_rules! filter_impl {
 	($filter:ident, $ty:ident, $name:expr) => {
-		$filter = $filter.field(InputValue::new($name, $ty.clone()));
+		// TODO: input suffix wrong here?? Input
+		$filter = $filter.field(InputValue::new(format!("{}", $name), $ty.clone()));
 	};
 }
 
 fn filter_id() -> InputObject {
-	let mut filter = InputObject::new("_filter_id");
+	let mut filter = InputObject::new("IDFilterInput");
 	let ty = TypeRef::named(TypeRef::ID);
 	filter_impl!(filter, ty, "eq");
 	filter_impl!(filter, ty, "ne");
