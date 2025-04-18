@@ -337,7 +337,7 @@ pub async fn process_tbs(
 				continue;
 			};
 			let fd_name = Name::new(fd.name.to_string());
-			let fd_type = kind_to_type(kind.clone(), types)?;
+			let fd_type = kind_to_type(kind.clone(), types, Some(fd_name.as_str()))?;
 
 			table_orderable = table_orderable.item(fd_name.to_string().to_screaming_snake_case());
 			let type_filter_name = format!("{}FilterInput",
@@ -446,6 +446,7 @@ fn make_table_field_resolver(
 						Ok(Some(tmp))
 					}
 					SqlValue::None | SqlValue::Null => Ok(None),
+					//TODO: Dig here to fix: internal: invalid item for enum \"StatusEnum\"
 					v => {
 						match field_kind {
 							Some(Kind::Either(ks)) if ks.len() != 1 => {}
@@ -464,7 +465,6 @@ fn make_table_field_resolver(
 
 macro_rules! filter_impl {
 	($filter:ident, $ty:ident, $name:expr) => {
-		// TODO: input suffix wrong here?? Input
 		$filter = $filter.field(InputValue::new(format!("{}", $name), $ty.clone()));
 	};
 }
@@ -488,7 +488,8 @@ fn filter_from_type(
 					ts.first().expect("ts should have exactly one element").as_str(),
 				)),
 		},
-		k => unwrap_type(kind_to_type(k.clone(), types)?),
+		//TODO: remove none
+		k => unwrap_type(kind_to_type(k.clone(), types, None)?),
 	};
 
 	let mut filter = InputObject::new(filter_name);

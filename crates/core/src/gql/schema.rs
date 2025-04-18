@@ -218,7 +218,7 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
 	Ok(out)
 }
 
-pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlError> {
+pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, field_name: Option<&str>) -> Result<TypeRef, GqlError> {
 	let (optional, match_kind) = match kind {
 		Kind::Option(op_ty) => (true, *op_ty),
 		_ => (false, kind),
@@ -244,9 +244,12 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 			1 => TypeRef::named(r.pop().unwrap().0.to_pascal_case()),
 			_ => {
 				let names: Vec<String> = r.into_iter().map(|t| t.0.to_pascal_case()).collect();
-				let ty_name = names.join("Or");
+				let ty_name = field_name
+					.unwrap_or("Unnamed")
+					.to_string()
+					.to_pascal_case();
 
-				let mut tmp_union = Union::new(ty_name.clone())
+				let mut tmp_union = Union::new(format!("{}Union", ty_name))
 					.description(format!("A record which is one of: {}", names.join(", ")));
 				for n in names {
 					tmp_union = tmp_union.possible_type(n);
@@ -262,7 +265,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 			while let Kind::Option(inner) = non_op_ty {
 				non_op_ty = *inner;
 			}
-			kind_to_type(non_op_ty, types)?
+			kind_to_type(non_op_ty, types, None)?
 		}
 		Kind::Either(ks) => {
 			let (ls, others): (Vec<Kind>, Vec<Kind>) =
@@ -277,12 +280,24 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 								"just checked that this is a Kind::Literal(Literal::String(_))"
 							);
 						};
-						out.0
+						out.0.to_string().to_screaming_snake_case()
 					})
 					.collect();
 
-				let mut tmp = Enum::new(vals.join("_or_"));
-				tmp = tmp.items(vals);
+				// todo: maybe use match when handling errors/existing names
+				let ty_name = field_name
+					.unwrap_or("Unnamed")
+					.to_string()
+					.to_pascal_case();
+
+				let description = format!(
+					"Represents one of the following states: {}",
+					vals.join(", ")
+				);
+
+				let tmp = Enum::new(format!("{}Enum", ty_name))
+					.description(description)
+					.items(vals);
 
 				let enum_ty = tmp.type_name().to_string();
 
@@ -296,11 +311,14 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 			};
 
 			let pos_names: Result<Vec<TypeRef>, GqlError> =
-				others.into_iter().map(|k| kind_to_type(k, types)).collect();
+				others.into_iter().map(|k| kind_to_type(k, types, None)).collect();
 			let pos_names: Vec<String> = pos_names?.into_iter().map(|tr| tr.to_string()).collect();
-			let ty_name = pos_names.join("_or_");
+			let ty_name = field_name
+				.unwrap_or("Unnamed")
+				.to_string()
+				.to_pascal_case();
 
-			let mut tmp_union = Union::new(ty_name.clone());
+			let mut tmp_union = Union::new(format!("{}Union", ty_name));
 			for n in pos_names {
 				tmp_union = tmp_union.possible_type(n);
 			}
@@ -313,7 +331,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 			TypeRef::named(ty_name)
 		}
 		Kind::Set(_, _) => return Err(schema_error("Kind::Set is not yet supported")),
-		Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types)?)),
+		Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types, None)?)),
 		Kind::Function(_, _) => return Err(schema_error("Kind::Function is not yet supported")),
 		Kind::Range => return Err(schema_error("Kind::Range is not yet supported")),
 		// TODO(raphaeldarley): check if union is of literals and generate enum
@@ -325,7 +343,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>) -> Result<TypeRef, GqlErr
 				None => Kind::Record(vec![]),
 			};
 
-			TypeRef::List(Box::new(kind_to_type(inner, types)?))
+			TypeRef::List(Box::new(kind_to_type(inner, types, None)?))
 		}
 		Kind::File(_) => return Err(schema_error("Kind::File is not yet supported")),
 	};
