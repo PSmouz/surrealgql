@@ -150,8 +150,7 @@ pub async fn process_tbs(
                 .join(".");
             let fd_path_full = fd_path.clone().add(&*fd_name);
 
-            // TODO: maybe kind_non_optional
-            // TODO: ty_name may has to be unique, see Type
+            // TODO: maybe kind_non_optional have to be unique!!!
             let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice())?;
 
             // FIXME: only when top level field otherwise add to its proper parent
@@ -173,8 +172,8 @@ pub async fn process_tbs(
                     Kind::Object => {
                         gql_objects.insert(
                             fd_path_full.clone(),
-                            Object::new(fd_path_full.to_pascal_case().add("Object")
-                            )
+                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path_full
+                                .to_pascal_case()))
                                 .description(if let Some(ref c) = fd.comment {
                                     format!("{c}")
                                 } else {
@@ -199,14 +198,14 @@ pub async fn process_tbs(
                 }
             }
 
-            // case 2:
+            // case 2: field path "xx.yy" -> nested field -> add to nested object
             if !fd_path.is_empty() {
-                trace!("debug: fd_path: {}", fd_path);
-                trace!("debug: objects: {:?}", gql_objects);
+                // trace!("debug: fd_path: {}", fd_path);
+                // trace!("debug: objects: {:?}", gql_objects);
                 // We expect tx.all_tb_fields to return parent objects before
                 // its children.
                 let ob = gql_objects.remove(&fd_path);
-                trace!("debug: ob: {:?}", ob);
+                // trace!("debug: ob: {:?}", ob);
 
                 if ob.is_none() {
                     return Err(schema_error("nested field should have parent object"));
@@ -225,8 +224,6 @@ pub async fn process_tbs(
                     }),
                 );
 
-                // case 2: field path "xx.yy" -> nested field -> add to nested object
-                // nested field
                 //case 2: field path "xx.yy" -> nested field -> add to nested object
                 // -> find this nested object in map under key path
                 // how to do for multiple layers deep?
