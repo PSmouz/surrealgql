@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
+use std::mem;
 use std::ops::Add;
 use std::sync::Arc;
 
@@ -102,7 +103,7 @@ pub async fn process_tbs(
         let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
-        // trace!("fields '{:?}'", fds);
+        trace!("fields '{:?}'", fds);
 
         let mut tb_ty_obj = Object::new(tb_name_gql.clone())
             .field(Field::new(
@@ -143,42 +144,37 @@ pub async fn process_tbs(
             let fd_name = parts.as_slice().last().unwrap().to_string();
             let fd_name_gql = fd_name.to_camel_case();
 
-            let fd_path = parts[..parts.len() - 1]
+            let fd_path = parts
+                .as_slice()
                 .iter()
                 .map(|ident| ident.to_string())
                 .collect::<Vec<String>>()
                 .join(".");
-            let fd_path_full = fd_path.clone().add(&*fd_name);
 
-            // TODO: maybe kind_non_optional have to be unique!!!
+            let fd_path_parent = parts[..parts.len() - 1]
+                .iter()
+                .map(|ident| ident.to_string())
+                .collect::<Vec<String>>()
+                .join(".");
+
             let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice())?;
 
-            // FIXME: only when top level field otherwise add to its proper parent
-            // object. all these objects need to be in a map and then added to the schema
-            // recursive maybe?
-
-            //Idee: hier if ob parts liste oder einteilig. maybe sogar mit match
-            // dann map fuer tb generieren, in table loop but ausserhalb hier
-            // dann wenn wir neues object da hinzufuegen
-            // wenn parts liste daraus key bauen und abfragen in map
-            // wenn entry field da hinzufuegen, wenn scalar type
-
-
             // case 1: field path "" -> top level field
-            if fd_path.is_empty() {
+            if fd_path_parent.is_empty() {
+                //TODO: use typeref destruct
                 match kind_non_optional {
-                    //TODO: use typeref destruct
                     // case 1.1: object field -> create new object
                     Kind::Object => {
                         gql_objects.insert(
-                            fd_path_full.clone(),
-                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path_full
+                            fd_path.clone(),
+                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path
                                 .to_pascal_case()))
                                 .description(if let Some(ref c) = fd.comment {
                                     format!("{c}")
                                 } else {
                                     "".to_string()
                                 }),
+                            // todo: here object from fd_ty ?!?
                         );
                     }
                     // case 1.2: scalar field -> add to tb_ty_obj
@@ -199,30 +195,51 @@ pub async fn process_tbs(
             }
 
             // case 2: field path "xx.yy" -> nested field -> add to nested object
-            if !fd_path.is_empty() {
+            if !fd_path_parent.is_empty() {
+                match kind_non_optional {
+                    // case 2.1: object field -> create new object
+                    Kind::Object => {
+                        gql_objects.insert(
+                            fd_path.clone(),
+                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path
+                                .to_pascal_case()))
+                                .description(if let Some(ref c) = fd.comment {
+                                    format!("{c}")
+                                } else {
+                                    "".to_string()
+                                }),
+                        );
+                    }
+                    // case 2.2: scalar field -> add to nested object
+                    _ => {
+                        trace!("map {:?}", gql_objects);
+                        trace!("key {:?}", &fd_path_parent);
+                        let ob = gql_objects.remove(&fd_path_parent);
+                        trace!("debug: ob: {:?}", ob);
+
+                        if ob.is_none() {
+                            return Err(schema_error("nested field should have parent object"));
+                        }
+
+                        gql_objects.insert(fd_path_parent.clone(), Object::from(ob.unwrap())
+                            .field(Field::new(
+                                fd_name_gql.clone(),
+                                fd_ty.clone(),
+                                make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
+                            ))
+                            .description(if let Some(ref c) = fd.comment {
+                                format!("{c}")
+                            } else {
+                                "".to_string()
+                            }),
+                        );
+                    }
+                }
                 // trace!("debug: fd_path: {}", fd_path);
                 // trace!("debug: objects: {:?}", gql_objects);
                 // We expect tx.all_tb_fields to return parent objects before
-                // its children.
-                let ob = gql_objects.remove(&fd_path);
-                // trace!("debug: ob: {:?}", ob);
+                // its children
 
-                if ob.is_none() {
-                    return Err(schema_error("nested field should have parent object"));
-                }
-
-                gql_objects.insert(fd_path.clone(), Object::from(ob.unwrap())
-                    .field(Field::new(
-                        fd_name_gql.clone(),
-                        fd_ty.clone(),
-                        make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
-                    ))
-                    .description(if let Some(ref c) = fd.comment {
-                        format!("{c}")
-                    } else {
-                        "".to_string()
-                    }),
-                );
 
                 //case 2: field path "xx.yy" -> nested field -> add to nested object
                 // -> find this nested object in map under key path
@@ -234,12 +251,13 @@ pub async fn process_tbs(
             // 1.2 wenn obj dann neues object aufmachen
 
 
-            trace!("field {:?}", fd);
-            trace!("field_name {:?}", fd_name);
-            trace!("field_name_gql {:?}", fd_name_gql);
-            trace!("kind {:?}", kind);
-            trace!("field_path {:?}", fd_path);
-            trace!("field_type {:?}", fd_ty);
+            // trace!("field {:?}", fd);
+            // trace!("field_name {:?}", fd_name);
+            // trace!("field_name_gql {:?}", fd_name_gql);
+            // trace!("kind {:?}", kind);
+            // trace!("field_path {:?}", fd_path);
+            // trace!("fd_path_full {:?}", fd_path_full);
+            // trace!("field_type {:?}", fd_ty);
         }
 
         // =======================================================
@@ -253,7 +271,7 @@ pub async fn process_tbs(
         query = query.field(
             Field::new(
                 tb_name_query.to_singular(),
-                TypeRef::named(tb_name_gql),
+                TypeRef::named(&tb_name_gql),
                 move |ctx| {
                     let tb_name = first_tb_name.clone();
                     let kvs1 = kvs1.clone();
@@ -267,8 +285,7 @@ pub async fn process_tbs(
                                 Some(i) => i,
                                 None => {
                                     return Err(internal_error(
-                                        "Schema validation failed: No id found in all instance \
-                                        query",
+                                        "Schema validation failed: No id found in arguments",
                                     )
                                         .into());
                                 }
@@ -309,72 +326,201 @@ pub async fn process_tbs(
         let kvs2 = datastore.clone();
         let fds2 = fds.clone();
 
-        // query = query.field(
-        //     Field::new(
-        //         tb_name_query.to_plural(),
-        //         TypeRef::named_nn_list_nn(&table_pascal),
-        //         move |ctx| { // Keep resolver mostly the same, ensure it parses new OrderInput structure
-        //             let tb_name = table_name_clone1.clone();
-        //             let sess1 = sess1.clone();
-        //             // let fds1_clone = fds1; // Pass Arc<Vec<...>>
-        //             let kvs1 = kvs1.clone();
-        //             FieldFuture::new(async move {
-        //                 // ... (Resolver logic as before, BUT parse `orderBy` argument based on `field` and `direction`)
-        //                 // ... call `cond_from_filter` which now needs to handle nested filters ...
-        //                 let gtx = GQLTx::new(&kvs1, &sess1).await?;
-        //                 let args = ctx.args.as_index_map();
-        //                 let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
-        //                 let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
-        //                 let order = args.get("order"); // This is now the complex OrderInput object
-        //                 let filter = args.get("filter");
-        //
-        //                 // --- NEW Order Parsing ---
-        //                 let orders = parse_order_input(order)?; // Implement this helper
-        //                 // --- END NEW Order Parsing ---
-        //
-        //                 let cond = match filter {
-        //                     Some(f) => {
-        //                         let o = f.as_object().ok_or_else(|| resolver_error("Filter must be an object"))?;
-        //                         // Pass Arc'd fields, cond_from_filter needs update
-        //                         Some(cond_from_filter(o, &fds1))
-        //                     }
-        //                     None => None,
-        //                 };
-        //
-        //                 // ... (rest of SELECT statement generation and execution as before) ...
-        //                 let ast = Statement::Select();
-        //                 let res = gtx.process_stmt(ast).await?;
-        //                 // ... (result processing as before) ...
-        //                 Ok(Some(FieldValue::value(GqlValue::Null))) // Placeholder
-        //             })
-        //         },
-        //     )
-        //         .argument(limit_input!())
-        //         .argument(start_input!())
-        //         .argument(InputValue::new("order", TypeRef::named(&table_order_name))) // Use correct order type
-        //         .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))), // Use correct filter type
-        // );
+        query = query.field(
+            Field::new(
+                tb_name_query.to_plural(),
+                TypeRef::named_nn_list_nn(&tb_name_gql),
+                move |ctx| {
+                    let tb_name = second_tb_name.clone();
+                    let sess2 = sess2.clone();
+                    let fds2 = fds.clone();
+                    let kvs2 = kvs2.clone();
+                    FieldFuture::new(async move {
+                        let gtx = GQLTx::new(&kvs2, &sess2).await?;
+
+                        let args = ctx.args.as_index_map();
+                        trace!("received request with args: {args:?}");
+
+                        // let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
+                        //
+                        // let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
+                        //
+                        // let order = args.get("order");
+                        //
+                        // let filter = args.get("filter");
+
+                        // let orders = match order {
+                        //     Some(GqlValue::Object(o)) => {
+                        //         let mut orders = vec![];
+                        //         let mut current = o;
+                        //         loop {
+                        //             let asc = current.get("asc");
+                        //             let desc = current.get("desc");
+                        //             match (asc, desc) {
+                        //                 (Some(_), Some(_)) => {
+                        //                     return Err("Found both ASC and DESC in order".into());
+                        //                 }
+                        //                 (Some(GqlValue::Enum(a)), None) => {
+                        //                     orders.push(order!(asc, a.as_str()))
+                        //                 }
+                        //                 (None, Some(GqlValue::Enum(d))) => {
+                        //                     orders.push(order!(desc, d.as_str()))
+                        //                 }
+                        //                 (_, _) => {
+                        //                     break;
+                        //                 }
+                        //             }
+                        //             if let Some(GqlValue::Object(next)) = current.get("then") {
+                        //                 current = next;
+                        //             } else {
+                        //                 break;
+                        //             }
+                        //         }
+                        //         Some(orders)
+                        //     }
+                        //     _ => None,
+                        // };
+                        // trace!("parsed orders: {orders:?}");
+
+                        // let cond = match filter {
+                        //     Some(f) => {
+                        //         let o = match f {
+                        //             GqlValue::Object(o) => o,
+                        //             f => {
+                        //                 error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
+                        //                 return Err("Value in cond doesn't fit schema".into());
+                        //             }
+                        //         };
+                        //
+                        //         let cond = cond_from_filter(o, &fds2)?;
+                        //
+                        //         Some(cond)
+                        //     }
+                        //     None => None,
+                        // };
+                        // trace!("parsed filter: {cond:?}");
+
+                        // SELECT VALUE id FROM ...
+                        let ast = Statement::Select({
+                            SelectStatement {
+                                what: vec![SqlValue::Table(tb_name.intox())].into(),
+                                expr: Fields(
+                                    vec![sql::Field::Single {
+                                        expr: SqlValue::Idiom(Idiom::from("id")),
+                                        alias: None,
+                                    }],
+                                    // this means the `value` keyword
+                                    true,
+                                ),
+                                // order: orders.map(|x| Ordering::Order(OrderList(x))),
+                                // cond,
+                                // limit,
+                                // start,
+                                ..Default::default()
+                            }
+                        });
+                        trace!("generated query ast: {ast:?}");
+
+                        let res = gtx.process_stmt(ast).await?;
+
+                        let res_vec =
+                            match res {
+                                SqlValue::Array(a) => a,
+                                v => {
+                                    error!("Found top level value, in result which should be array: {v:?}");
+                                    return Err("Internal Error".into());
+                                }
+                            };
+
+                        let out: Result<Vec<FieldValue>, SqlValue> = res_vec
+                            .0
+                            .into_iter()
+                            .map(|v| {
+                                v.try_as_thing().map(|t| {
+                                    let erased: ErasedRecord = (gtx.clone(), t);
+                                    field_val_erase_owned(erased)
+                                })
+                            })
+                            .collect();
+
+                        match out {
+                            Ok(l) => Ok(Some(FieldValue::list(l))),
+                            Err(v) => {
+                                Err(internal_error(format!("expected thing, found: {v:?}")).into())
+                            }
+                        }
+                    })
+                },
+            )
+                .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
+            // .argument(limit_input!())
+            // .argument(start_input!())
+            // .argument(InputValue::new("order", TypeRef::named(&table_order_name)))
+            // .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
+        );
 
         // =======================================================
-        // Add types
+        // Resolve object hierarchies and add types
         // =======================================================
 
         // async-graphql Object does not implement clone, so we cant use iter()
-        for (k, v) in gql_objects {
-            tb_ty_obj = tb_ty_obj.field(Field::new(
-                k.to_camel_case(),
-                TypeRef::named(v.type_name()),
-                // Type::Object(v.clone()),
-                make_table_field_resolver(k.as_str(), Some(Kind::Object)),
-            ));
+        // for (k, v) in gql_objects {
+        //     tb_ty_obj = tb_ty_obj.field(Field::new(
+        //         k.to_camel_case(),
+        //         TypeRef::named(v.type_name()),
+        //         // Type::Object(v.clone()),
+        //         make_table_field_resolver(k.as_str(), Some(Kind::Object)),
+        //     ));
+        //
+        //     types.push(Type::Object(v));
+        // }
 
-            types.push(Type::Object(v));
+        let mut keys: Vec<String> = gql_objects.keys().cloned().collect();
+        keys.sort_by(|a, b| b.cmp(a));
+
+        for key in keys {
+            let current_obj = match gql_objects.remove(&key) {
+                Some(obj) => obj,
+                None => {
+                    return Err(internal_error(
+                        format!("key '{}' disappeared from object map", key)));
+                }
+            };
+
+            let (parent_key_opt, field_name_str) = match key.rfind('.') {
+                Some(dot_index) => {
+                    let (p_key, f_name_with_dot) = key.split_at(dot_index);
+                    (Some(p_key.to_string()), f_name_with_dot[1..].to_string())
+                }
+                None => (None, key.clone()),
+            };
+
+            let field_definition = Field::new(
+                field_name_str.to_camel_case(),
+                TypeRef::named(current_obj.type_name()), //FIXME: non null variant handle
+                make_table_field_resolver(key.as_str(), Some(Kind::Object)),
+            );
+
+            if let Some(parent_key) = parent_key_opt {
+                // Case 1: parent_key -> add to the parent object
+                if let Some(parent_obj_mut) = gql_objects.get_mut(&parent_key) {
+                    let temp_placeholder = Object::new("temp_placeholder"); // Name doesn't matter
+                    *parent_obj_mut = mem::replace(parent_obj_mut, temp_placeholder)
+                        .field(field_definition);
+                    types.push(Type::Object(current_obj));
+                } else {
+                    return Err(schema_error(format!("field/object `{}` has no parent named `{}` in \
+                    the schema", field_name_str, parent_key)));
+                }
+            } else {
+                // Case 2: no parent_key -> add to the root table object.
+                tb_ty_obj = tb_ty_obj.field(field_definition);
+                types.push(Type::Object(current_obj));
+            }
         }
 
         types.push(Type::Object(tb_ty_obj));
     }
-    trace!("types {:?}", types);
-
 
     // =======================================================
     // Pass 2: Define Inputs, Enums, Query Fields
@@ -705,73 +851,73 @@ fn filter_from_type(
     Ok(filter)
 }
 
-fn cond_from_filter(
-    filter: &IndexMap<Name, GqlValue>,
-    fds: &Arc<Vec<DefineFieldStatement>>,
-) -> Result<Cond, GqlError> {
-    // val_from_filter(filter, fds).map(IntoExt::intox)
-    // Start recursion with an empty path prefix
-    val_from_filter(filter, fds, &[]).map(IntoExt::intox)
-}
+// fn cond_from_filter(
+//     filter: &IndexMap<Name, GqlValue>,
+//     fds: &[DefineFieldStatement],
+// ) -> Result<Cond, GqlError> {
+//     // val_from_filter(filter, fds).map(IntoExt::intox)
+//     // Start recursion with an empty path prefix
+//     val_from_filter(filter, fds, &[]).map(IntoExt::intox)
+// }
 
-fn val_from_filter(
-    filter: &IndexMap<Name, GqlValue>,
-    fds: &Arc<Vec<DefineFieldStatement>>,
-    current_path: &[String],
-) -> Result<SqlValue, GqlError> {
-    if filter.len() != 1 {
-        let path_str = current_path.join(".");
-        return Err(resolver_error(format!("Filter object at path '{}' must have exactly one key (field, and, or, not)", path_str)));
-    }
-
-    let (k, v) = filter.iter().next().unwrap();
-    let key_str = k.as_str();
-
-    let cond = match key_str.to_lowercase().as_str() { // Keep matching lowercase for operators
-        "or" => aggregate(v, AggregateOp::Or, fds, current_path), // Pass path down
-        "and" => aggregate(v, AggregateOp::And, fds, current_path), // Pass path down
-        "not" => negate(v, fds, current_path), // Pass path down
-        _ => { // Assume it's a field name (camelCase from schema)
-            // Construct the new path segment
-            let mut next_path = current_path.to_vec();
-            next_path.push(key_str.to_string()); // Add the camelCase field name
-
-            // Find the DB field definition matching the potential full path
-            // This might require looking up the base field and checking if it's an object,
-            // then checking the sub-field within the nested structure.
-            // For simplicity here, we'll assume we can find the field kind based on the path.
-            let field_kind = find_field_kind_by_path(&next_path, fds)?; // Implement this helper
-
-            match field_kind {
-                // If the path points to a nested object, recurse
-                Kind::Object => {
-                    let inner_filter = v.as_object().ok_or_else(|| resolver_error(format!("Value for object filter '{}' must be an object", next_path.join("."))))?;
-                    val_from_filter(inner_filter, fds, &next_path) // Recurse with extended path
-                }
-                // If it's a scalar/record/enum etc., call binop
-                _ => Ok({
-                    binop(&next_path, v, field_kind)? // Pass full path and kind
-                })
-            }
-        }
-    };
-
-    cond
-    // if filter.len() != 1 {
-    // 	return Err(resolver_error("Table Filter must have one item"));
-    // }
-    //
-    // let (k, v) = filter.iter().next().unwrap();
-    //
-    // let cond = match k.as_str().to_lowercase().as_str() {
-    // 	"or" => aggregate(v, AggregateOp::Or, fds),
-    // 	"and" => aggregate(v, AggregateOp::And, fds),
-    // 	"not" => negate(v, fds),
-    // 	_ => binop(k.as_str(), v, fds),
-    // };
-    //
-    // cond
-}
+// fn val_from_filter(
+//     filter: &IndexMap<Name, GqlValue>,
+//     fds: &[DefineFieldStatement],
+//     current_path: &[String],
+// ) -> Result<SqlValue, GqlError> {
+//     if filter.len() != 1 {
+//         let path_str = current_path.join(".");
+//         return Err(resolver_error(format!("Filter object at path '{}' must have exactly one key (field, and, or, not)", path_str)));
+//     }
+//
+//     let (k, v) = filter.iter().next().unwrap();
+//     let key_str = k.as_str();
+//
+//     let cond = match key_str.to_lowercase().as_str() { // Keep matching lowercase for operators
+//         "or" => aggregate(v, AggregateOp::Or, fds, current_path), // Pass path down
+//         "and" => aggregate(v, AggregateOp::And, fds, current_path), // Pass path down
+//         "not" => negate(v, fds, current_path), // Pass path down
+//         _ => { // Assume it's a field name (camelCase from schema)
+//             // Construct the new path segment
+//             let mut next_path = current_path.to_vec();
+//             next_path.push(key_str.to_string()); // Add the camelCase field name
+//
+//             // Find the DB field definition matching the potential full path
+//             // This might require looking up the base field and checking if it's an object,
+//             // then checking the sub-field within the nested structure.
+//             // For simplicity here, we'll assume we can find the field kind based on the path.
+//             let field_kind = find_field_kind_by_path(&next_path, fds)?; // Implement this helper
+//
+//             match field_kind {
+//                 // If the path points to a nested object, recurse
+//                 Kind::Object => {
+//                     let inner_filter = v.as_object().ok_or_else(|| resolver_error(format!("Value for object filter '{}' must be an object", next_path.join("."))))?;
+//                     val_from_filter(inner_filter, fds, &next_path) // Recurse with extended path
+//                 }
+//                 // If it's a scalar/record/enum etc., call binop
+//                 _ => Ok({
+//                     binop(&next_path, v, field_kind)? // Pass full path and kind
+//                 })
+//             }
+//         }
+//     };
+//
+//     cond
+//     // if filter.len() != 1 {
+//     // 	return Err(resolver_error("Table Filter must have one item"));
+//     // }
+//     //
+//     // let (k, v) = filter.iter().next().unwrap();
+//     //
+//     // let cond = match k.as_str().to_lowercase().as_str() {
+//     // 	"or" => aggregate(v, AggregateOp::Or, fds),
+//     // 	"and" => aggregate(v, AggregateOp::And, fds),
+//     // 	"not" => negate(v, fds),
+//     // 	_ => binop(k.as_str(), v, fds),
+//     // };
+//     //
+//     // cond
+// }
 
 fn parse_op(name: impl AsRef<str>) -> Result<sql::Operator, GqlError> {
     match name.as_ref() {
@@ -795,57 +941,57 @@ fn find_field_kind_by_path(path: &[String], fds: &Arc<Vec<DefineFieldStatement>>
         .ok_or_else(|| resolver_error(format!("Field definition not found for path '{}' (DB path '{}')", path.join("."), db_path_str)))
 }
 
-fn negate(filter: &GqlValue, fds: &Arc<Vec<DefineFieldStatement>>, current_path: &[String]) -> Result<SqlValue, GqlError> {
-    let obj = filter.as_object().ok_or(resolver_error("Value of NOT must be object"))?;
-
-    let inner_cond = val_from_filter(obj, fds, current_path)?;
-    Ok(Expression::Unary { o: sql::Operator::Not, v: inner_cond }.into())
-}
+// fn negate(filter: &GqlValue, fds: &Arc<Vec<DefineFieldStatement>>, current_path: &[String]) -> Result<SqlValue, GqlError> {
+//     let obj = filter.as_object().ok_or(resolver_error("Value of NOT must be object"))?;
+//
+//     let inner_cond = val_from_filter(obj, fds, current_path)?;
+//     Ok(Expression::Unary { o: sql::Operator::Not, v: inner_cond }.into())
+// }
 
 enum AggregateOp {
     And,
     Or,
 }
 
-fn aggregate(
-    filter: &GqlValue,
-    op: AggregateOp,
-    fds: &Arc<Vec<DefineFieldStatement>>,
-    current_path: &[String],
-) -> Result<SqlValue, GqlError> {
-    let op_str = match op {
-        AggregateOp::And => "AND",
-        AggregateOp::Or => "OR",
-    };
-    let op = match op {
-        AggregateOp::And => sql::Operator::And,
-        AggregateOp::Or => sql::Operator::Or,
-    };
-    let list =
-        filter.as_list().ok_or(resolver_error(format!("Value of {op_str} should be a list")))?;
-    let filter_arr = list
-        .iter()
-        .map(|v| v.as_object().map(|o| val_from_filter(o, fds, current_path)))
-        .collect::<Option<Result<Vec<SqlValue>, GqlError>>>()
-        .ok_or(resolver_error(format!("List of {op_str} should contain objects")))??;
-
-    let mut iter = filter_arr.into_iter();
-
-    let mut cond = iter
-        .next()
-        .ok_or(resolver_error(format!("List of {op_str} should contain at least one object")))?;
-
-    for clause in iter {
-        cond = Expression::Binary {
-            l: clause,
-            o: op.clone(),
-            r: cond,
-        }
-            .into();
-    }
-
-    Ok(cond)
-}
+// fn aggregate(
+//     filter: &GqlValue,
+//     op: AggregateOp,
+//     fds: &Arc<Vec<DefineFieldStatement>>,
+//     current_path: &[String],
+// ) -> Result<SqlValue, GqlError> {
+//     let op_str = match op {
+//         AggregateOp::And => "AND",
+//         AggregateOp::Or => "OR",
+//     };
+//     let op = match op {
+//         AggregateOp::And => sql::Operator::And,
+//         AggregateOp::Or => sql::Operator::Or,
+//     };
+//     let list =
+//         filter.as_list().ok_or(resolver_error(format!("Value of {op_str} should be a list")))?;
+//     let filter_arr = list
+//         .iter()
+//         .map(|v| v.as_object().map(|o| val_from_filter(o, fds, current_path)))
+//         .collect::<Option<Result<Vec<SqlValue>, GqlError>>>()
+//         .ok_or(resolver_error(format!("List of {op_str} should contain objects")))??;
+//
+//     let mut iter = filter_arr.into_iter();
+//
+//     let mut cond = iter
+//         .next()
+//         .ok_or(resolver_error(format!("List of {op_str} should contain at least one object")))?;
+//
+//     for clause in iter {
+//         cond = Expression::Binary {
+//             l: clause,
+//             o: op.clone(),
+//             r: cond,
+//         }
+//             .into();
+//     }
+//
+//     Ok(cond)
+// }
 
 fn binop(
     gql_path: &[String], // e.g., ["size", "width"]
