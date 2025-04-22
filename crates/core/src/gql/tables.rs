@@ -138,8 +138,6 @@ pub async fn process_tbs(
 
             // Should always contain at least the field name
             if parts.is_empty() { continue; }
-            // let x = parts.as_slice().iter().map(|ident| ident.to_string()).collect::<Vec<String>>
-            // ().join(".");
 
             let fd_name = parts.as_slice().last().unwrap().to_string();
             let fd_name_gql = fd_name.to_camel_case();
@@ -159,26 +157,20 @@ pub async fn process_tbs(
 
             let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice())?;
 
-            // case 1: field path "" -> top level field
-            if fd_path_parent.is_empty() {
-                //TODO: use typeref destruct
-                match kind_non_optional {
-                    // case 1.1: object field -> create new object
-                    Kind::Object => {
-                        gql_objects.insert(
-                            fd_path.clone(),
-                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path
-                                .to_pascal_case()))
-                                .description(if let Some(ref c) = fd.comment {
-                                    format!("{c}")
-                                } else {
-                                    "".to_string()
-                                }),
-                            // todo: here object from fd_ty ?!?
-                        );
-                    }
-                    // case 1.2: scalar field -> add to tb_ty_obj
-                    _ => {
+            match kind_non_optional {
+                Kind::Object => {
+                    gql_objects.insert(
+                        fd_path.clone(),
+                        Object::new(fd_ty.type_name())
+                            .description(if let Some(ref c) = fd.comment {
+                                format!("{c}")
+                            } else {
+                                "".to_string()
+                            }),
+                    );
+                }
+                _ => {
+                    if fd_path_parent.is_empty() {
                         tb_ty_obj = tb_ty_obj
                             .field(Field::new(
                                 fd_name_gql.clone(),
@@ -190,66 +182,26 @@ pub async fn process_tbs(
                             } else {
                                 "".to_string()
                             });
-                    }
-                }
-            }
-
-            // case 2: field path "xx.yy" -> nested field -> add to nested object
-            if !fd_path_parent.is_empty() {
-                match kind_non_optional {
-                    // case 2.1: object field -> create new object
-                    Kind::Object => {
-                        gql_objects.insert(
-                            fd_path.clone(),
-                            Object::new(format!("{}{}Object", &tb_name_gql, &fd_path
-                                .to_pascal_case()))
+                    } else {
+                        if let Some(obj) = gql_objects.remove(&fd_path_parent) {
+                            gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
+                                .field(Field::new(
+                                    fd_name_gql.clone(),
+                                    fd_ty.clone(),
+                                    make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
+                                ))
                                 .description(if let Some(ref c) = fd.comment {
                                     format!("{c}")
                                 } else {
                                     "".to_string()
                                 }),
-                        );
-                    }
-                    // case 2.2: scalar field -> add to nested object
-                    _ => {
-                        trace!("map {:?}", gql_objects);
-                        trace!("key {:?}", &fd_path_parent);
-                        let ob = gql_objects.remove(&fd_path_parent);
-                        trace!("debug: ob: {:?}", ob);
-
-                        if ob.is_none() {
-                            return Err(schema_error("nested field should have parent object"));
+                            );
+                        } else {
+                            return Err(schema_error("Nested field should have parent object."));
                         }
-
-                        gql_objects.insert(fd_path_parent.clone(), Object::from(ob.unwrap())
-                            .field(Field::new(
-                                fd_name_gql.clone(),
-                                fd_ty.clone(),
-                                make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
-                            ))
-                            .description(if let Some(ref c) = fd.comment {
-                                format!("{c}")
-                            } else {
-                                "".to_string()
-                            }),
-                        );
                     }
                 }
-                // trace!("debug: fd_path: {}", fd_path);
-                // trace!("debug: objects: {:?}", gql_objects);
-                // We expect tx.all_tb_fields to return parent objects before
-                // its children
-
-
-                //case 2: field path "xx.yy" -> nested field -> add to nested object
-                // -> find this nested object in map under key path
-                // how to do for multiple layers deep?
             }
-
-
-            //case 1: field path "" -> top level field -> add to tb_ty_obj
-            // 1.2 wenn obj dann neues object aufmachen
-
 
             // trace!("field {:?}", fd);
             // trace!("field_name {:?}", fd_name);
