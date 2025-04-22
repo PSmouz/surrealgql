@@ -64,6 +64,7 @@ keyword! {
 	Content => "CONTENT",
 	Continue => "CONTINUE",
 	Create => "CREATE",
+	Cursor => "CURSOR",
 	Database => "DATABASE",
 	Default => "DEFAULT",
 	Define => "DEFINE",
