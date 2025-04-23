@@ -92,6 +92,7 @@ pub async fn generate_schema(
 
     let mut query = Object::new("Query");
     let mut types: Vec<Type> = Vec::new();
+    let cursor = config.cursor; //TODO: use cursor config here
 
     trace!(ns, db, ?tbs, ?fns, "generating schema");
 

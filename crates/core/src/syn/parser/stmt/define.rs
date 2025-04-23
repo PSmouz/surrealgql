@@ -1550,7 +1550,7 @@ impl Parser<'_> {
         use graphql::{FunctionsConfig, TablesConfig};
         let mut tmp_tables = Option::<TablesConfig>::None;
         let mut tmp_fncs = Option::<FunctionsConfig>::None;
-        let mut tmp_cursor = Option::<bool>::None;
+        let mut tmp_cursor = false;
         loop {
             match self.peek_kind() {
                 t!("NONE") => {
@@ -1603,7 +1603,7 @@ impl Parser<'_> {
                 }
                 t!("CURSOR") => {
                     self.pop_peek();
-                    tmp_cursor = Some(true);
+                    tmp_cursor = true;
                 }
                 _ => break,
             }
@@ -1612,7 +1612,7 @@ impl Parser<'_> {
         Ok(GraphQLConfig {
             tables: tmp_tables.unwrap_or_default(),
             functions: tmp_fncs.unwrap_or_default(),
-            cursor: tmp_cursor.unwrap_or_default(),
+            cursor: tmp_cursor,
         })
     }
 
