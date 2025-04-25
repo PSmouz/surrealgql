@@ -66,6 +66,91 @@ macro_rules! id_input {
 	};
 }
 
+macro_rules! add_page_info_type {
+    ($types:ident) => {
+        $types.push(Type::Object({
+            Object::new("PageInfo")
+            .field(
+                Field::new(
+                "hasNextPage",
+                TypeRef::named_nn(TypeRef::BOOLEAN),
+                page_info_resolver("".to_string(), None),
+                ).description("When paginating forwards, are there more items?")
+            )
+            .field(
+                Field::new(
+                "hasPreviousPage",
+                TypeRef::named_nn(TypeRef::BOOLEAN),
+                page_info_resolver("".to_string(), None),
+                ).description("When paginating backwards, are there more items?")
+            )
+            .field(
+                Field::new(
+                "startCursor",
+                TypeRef::named_nn(TypeRef::STRING),
+                page_info_resolver("".to_string(), None),
+                ).description("When paginating backwards, the cursor to continue.")
+            )
+            .field(
+                Field::new(
+                "endCursor",
+                TypeRef::named_nn(TypeRef::STRING),
+                page_info_resolver("".to_string(), None),
+                ).description("When paginating forwards, the cursor to continue.")
+            )
+            .description("Information about pagination in a connection.")
+        }))
+    };
+}
+
+macro_rules! cursor_pagination {
+    ($obj:ident, $types:ident, $fd_type:ident, $fd_name:ident) => {
+        let edge = Object::new(format!("{}Edge", $fd_type))
+            .field(Field::new(
+                "cursor",
+                TypeRef::named_nn(TypeRef::STRING),
+                page_info_resolver("".to_string(), None),
+            ).description("A cursor for use in pagination."))
+            .field(Field::new(
+                "node",
+                TypeRef::named($fd_type),
+                page_info_resolver("".to_string(), None),
+            ).description("The item at the end of the edge."))
+            .description("An edge in a connection.");
+
+        let connection = Object::new(format!("{}Connection", $fd_type))
+            .field(Field::new(
+                "edges",
+                TypeRef::named_list(format!("{}Edge", $fd_type)),
+                page_info_resolver("".to_string(), None),
+            ).description("A list of edges."))
+            .field(Field::new(
+                "nodes",
+                TypeRef::named_list($fd_type),
+                page_info_resolver("".to_string(), None),
+            ).description("A list of nodes."))
+            .field(Field::new(
+                "pageInfo",
+                TypeRef::named_nn("PageInfo"),
+                page_info_resolver("".to_string(), None),
+            ).description("Information to aid in pagination."))
+            .field(Field::new(
+                "total",
+                TypeRef::named_nn(TypeRef::INT),
+                page_info_resolver("".to_string(), None),
+            ).description("Identifies the total count of items in the connection."))
+            .description(format!("The connection type for {}.", $fd_type));
+
+        $types.push(Type::Object(edge));
+        $types.push(Type::Object(connection));
+        $obj = $obj.field(Field::new(
+            $fd_name,
+            TypeRef::named_nn(format!("{}Connection", $fd_type)),
+            page_info_resolver("".to_string(), None),
+        ))
+    };
+}
+
 fn filter_name_from_table(tb_name: impl Display) -> String {
     // format!("Filter{}", tb_name.to_string().to_sentence_case())
     format!("{}FilterInput", tb_name.to_string().to_pascal_case())
@@ -186,17 +271,31 @@ pub async fn process_tbs(
             }
 
             if fd_path_parent.is_empty() {
-                tb_ty_obj = tb_ty_obj
-                    .field(Field::new(
-                        fd_name_gql,
-                        fd_ty,
-                        make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                    ))
-                    .description(if let Some(ref c) = fd.comment {
-                        format!("{c}")
-                    } else {
-                        "".to_string()
-                    });
+                match kind_non_optional {
+                    Kind::Array(_, _) => {
+                        if let kind = kind.inner_kind().unwrap() {
+                            let ty_ref = kind_to_type(kind.clone(), types, parts.as_slice(),
+                                                      tb_name_gql.clone())?;
+                            let ty_name = ty_ref.type_name();
+                            cursor_pagination!(tb_ty_obj, types, ty_name, fd_name_gql);
+                        } else {
+                            return Err(internal_error("Kind Array has no inner type."));
+                        }
+                    }
+                    _ => {
+                        tb_ty_obj = tb_ty_obj
+                            .field(Field::new(
+                                fd_name_gql,
+                                fd_ty,
+                                make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
+                            ))
+                            .description(if let Some(ref c) = fd.comment {
+                                format!("{c}")
+                            } else {
+                                "".to_string()
+                            });
+                    }
+                }
             } else {
                 // Array inner type is scalar, thus already set when adding the list field
                 if fd_path.chars().last() == Some('*') { continue; }
@@ -424,14 +523,17 @@ pub async fn process_tbs(
             // .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
         );
 
+        // cursor_pagination!(tb_ty_obj, types, "ImageSize");
+
         // =======================================================
-        // Add types
+        // Add Object types
         // =======================================================
         // for loop because Type::Object needs owned obj, not a reference
         for (_, obj) in gql_objects {
             types.push(Type::Object(obj));
         }
         types.push(Type::Object(tb_ty_obj));
+        add_page_info_type!(types);
     }
 
     // =======================================================
@@ -870,6 +972,35 @@ macro_rules! filter_impl {
 	($filter:ident, $ty:ident, $name:expr) => {
 		$filter = $filter.field(InputValue::new(format!("{}", $name), $ty.clone()));
 	};
+}
+
+// let mut tb_ty_obj = Object::new(tb_name_gql.clone())
+// .field(Field::new(
+// "id",
+// TypeRef::named_nn(TypeRef::ID),
+// make_table_field_resolver(
+// "id",
+// Some(Kind::Record(vec![Table::from(tb_name)])),
+// ),
+// ))
+// .implement("Record");
+// Object::new(fd_ty.type_name())
+// .description(if let Some(ref c) = fd.comment {
+// format!("{c}")
+// } else {
+// "".to_string()
+// }),
+
+//FIXME: implement
+fn page_info_resolver(
+    db_name: String, // DB name (e.g., "created_at", "size")
+    kind: Option<Kind>,
+) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+    move |_ctx: ResolverContext| {
+        FieldFuture::new(async move {
+            Ok(Some(FieldValue::value("".to_string()))) // Return `None` as a placeholder
+        })
+    }
 }
 
 fn filter_id() -> InputObject {
