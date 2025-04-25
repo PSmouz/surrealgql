@@ -143,11 +143,21 @@ macro_rules! cursor_pagination {
 
         $types.push(Type::Object(edge));
         $types.push(Type::Object(connection));
-        $obj = $obj.field(Field::new(
-            $fd_name,
-            TypeRef::named_nn(format!("{}Connection", $fd_type)),
-            page_info_resolver("".to_string(), None),
-        ))
+        $obj = $obj.field(
+            Field::new(
+                $fd_name,
+                TypeRef::named_nn(format!("{}Connection", $fd_type)),
+                page_info_resolver("".to_string(), None),
+            )
+            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING))
+                .description("Returns the elements in the list that come after the specified cursor."))
+            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING))
+                .description("Returns the elements in the list that come before the specified cursor."))
+            .argument(InputValue::new("first", TypeRef::named(TypeRef::INT))
+                .description("Returns the first n elements from the list."))
+            .argument(InputValue::new("last", TypeRef::named(TypeRef::INT))
+                .description("Returns the last n elements from the list."))
+        )
     };
 }
 
