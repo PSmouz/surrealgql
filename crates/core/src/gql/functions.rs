@@ -15,6 +15,7 @@ use async_graphql::dynamic::Object;
 use async_graphql::dynamic::Type;
 use async_graphql::dynamic::{Field, FieldValue};
 
+//FIXME: usage of kind to type
 pub async fn process_fns(
     fns: Arc<[DefineFunctionStatement]>,
     mut query: Object,
@@ -33,7 +34,7 @@ pub async fn process_fns(
         let kind1 = kind.clone();
         let mut field = Field::new(
             format!("fn_{}", fnd.name),
-            kind_to_type(kind.clone(), types, &[&fnd1.name])?,
+            kind_to_type(kind.clone(), types, &[&fnd1.name], "S".to_string())?,
             move |ctx| {
                 let sess1 = sess1.clone();
                 let kvs1 = kvs1.clone();
@@ -77,7 +78,7 @@ pub async fn process_fns(
 
         let fnd2 = fnd.clone();
         for (arg_name, arg_kind) in fnd2.args {
-            let arg_ty = kind_to_type(arg_kind.clone(), types, &[&fnd2.name])?;
+            let arg_ty = kind_to_type(arg_kind.clone(), types, &[&fnd2.name], "S".to_string())?;
             field = field.argument(InputValue::new(&arg_name.0, arg_ty))
         }
 

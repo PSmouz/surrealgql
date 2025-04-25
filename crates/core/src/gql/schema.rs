@@ -98,7 +98,7 @@ pub async fn generate_schema(
 
     match tbs {
         Some(tbs) if !tbs.is_empty() => {
-            query = process_tbs(tbs, query, &mut types, &tx, ns, db, session, datastore).await?;
+            query = process_tbs(tbs, query, &mut types, &tx, ns, db, session, datastore, cursor).await?;
         }
         _ => {}
     }
@@ -220,7 +220,8 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
     Ok(out)
 }
 
-pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Result<TypeRef,
+pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident], tb: String) ->
+Result<TypeRef,
     GqlError> {
     let (optional, match_kind) = match kind {
         Kind::Option(op_ty) => (true, *op_ty),
@@ -239,9 +240,8 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Resul
         Kind::Number => TypeRef::named("Number"),
         Kind::Object => {
             let mut ty_name = path.iter().map(|i| i.0.to_string()).collect::<Vec<_>>().join(".");
-            ty_name = ty_name.to_pascal_case().add("Object");
-
-            TypeRef::named(ty_name)
+            // Use table name for object uniqueness across multiple tables
+            TypeRef::named(format!("{}{}Object", tb, ty_name.to_pascal_case()))
         }
         Kind::Point => return Err(schema_error("Kind::Point is not yet supported")),
         Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
@@ -275,7 +275,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Resul
             while let Kind::Option(inner) = non_op_ty {
                 non_op_ty = *inner;
             }
-            kind_to_type(non_op_ty, types, path)?
+            kind_to_type(non_op_ty, types, path, tb)?
         }
         Kind::Either(ks) => {
             let (ls, others): (Vec<Kind>, Vec<Kind>) =
@@ -318,7 +318,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Resul
             };
 
             let pos_names: Result<Vec<TypeRef>, GqlError> =
-                others.into_iter().map(|k| kind_to_type(k, types, path)).collect();
+                others.into_iter().map(|k| kind_to_type(k, types, path, tb.clone())).collect();
             let pos_names: Vec<String> = pos_names?.into_iter().map(|tr| tr.to_string()).collect();
             // FIXME
             let ty_name = "Either";
@@ -340,7 +340,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Resul
             TypeRef::named(ty_name)
         }
         Kind::Set(_, _) => return Err(schema_error("Kind::Set is not yet supported")),
-        Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types, path)?)),
+        Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types, path, tb)?)),
         Kind::Function(_, _) => return Err(schema_error("Kind::Function is not yet supported")),
         Kind::Range => return Err(schema_error("Kind::Range is not yet supported")),
         // TODO(raphaeldarley): check if union is of literals and generate enum
@@ -352,7 +352,7 @@ pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) -> Resul
                 None => Kind::Record(vec![]),
             };
 
-            TypeRef::List(Box::new(kind_to_type(inner, types, path)?))
+            TypeRef::List(Box::new(kind_to_type(inner, types, path, tb)?))
         }
         Kind::File(_) => return Err(schema_error("Kind::File is not yet supported")),
     };

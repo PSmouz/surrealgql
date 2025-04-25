@@ -95,8 +95,6 @@ pub async fn process_tbs(
     datastore: &Arc<Datastore>,
     cursor: bool,
 ) -> Result<Object, GqlError> {
-    // trace!("tables '{:?}'", tbs);
-
     // Type::Any is not supported. FIXME: throw error in the future.
     let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs.iter().partition(|tb| {
         match tb.kind {
@@ -116,7 +114,6 @@ pub async fn process_tbs(
         let tb_name_query = tb_name.to_camel_case();
 
         let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
-        let mut arrays: HashMap<String, String> = HashMap::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
         trace!("fields '{:?}'", fds);
@@ -135,28 +132,9 @@ pub async fn process_tbs(
         // =======================================================
         // Parse Fields
         // =======================================================
-
-        for fd in fds.iter() {
-            let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
-                Part::Field(ident) => Some(ident),
-                // Part::All => Some(&Ident::from("*")),
-                _ => None
-            }).collect();
-
-            trace!("parts: {:?}", parts);
-
-            // trace!("Idiom to path: {}", )
-        }
-
-
         for fd in fds.iter() {
             // We have already defined "id", so we don't take any new definition for it.
             if fd.name.is_id() { continue; };
-
-            // if fd.name.0.last().map_or(false, |p| matches!(p, Part::All)) {
-            //     continue;
-            // }
-            // //
 
             let kind = match fd.kind.clone() {
                 Some(k) => k,
@@ -181,10 +159,9 @@ pub async fn process_tbs(
                 .strip_prefix(".")
                 .unwrap()
                 .to_string();
-
             let fd_path_parent = remove_last_segment(&*fd_path.as_str());
 
-            let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice())?;
+            let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice(), tb_name_gql.clone())?;
 
             trace!("field {:?}", fd);
             trace!("idiom path: {:?}", path);
@@ -195,57 +172,38 @@ pub async fn process_tbs(
             trace!("field_path {:?}", fd_path);
             trace!("fd_path_parent {:?}", fd_path_parent);
 
-            match kind_non_optional {
-                Kind::Object => {
-                    gql_objects.insert(
-                        fd_path.clone(),
-                        Object::new(fd_ty.type_name())
-                            .description(if let Some(ref c) = fd.comment {
-                                format!("{c}")
-                            } else {
-                                "".to_string()
-                            }),
-                    );
-                }
-                // Kind::Array(inner, _) => {
-                //     match inner.as_ref() {
-                //         Kind::Object => {
-                //             gql_objects.insert(
-                //                 fd_path.clone(),
-                //                 Object::new(fd_ty.type_name())
-                //                     .description(if let Some(ref c) = fd.comment {
-                //                         format!("{c}")
-                //                     } else {
-                //                         "".to_string()
-                //                     }),
-                //             );
-                //         }
-                //         _ => {
-                //             tb_ty_obj = tb_ty_obj
-                //                 .field(Field::new(
-                //                     fd_name_gql,
-                //                     fd_ty,
-                //                     //FIXME: resolver ist die kunst
-                //                     make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                //                 ))
-                //                 .description(if let Some(ref c) = fd.comment {
-                //                     format!("{c}")
-                //                 } else {
-                //                     "".to_string()
-                //                 });
-                //         }
-                //     }
-                //
-                //     arrays.insert(fd_path.clone(), fd_path.to_string());
-                // }
-                _ => {
-                    //hier prob wenn schon in arr
-                    // if arrays.contains_key(&fd_path_parent) {
-                    //     continue;
-                    // }
+            // object map used to build fields step by step
+            if kind_non_optional == Kind::Object {
+                gql_objects.insert(
+                    fd_path.clone(),
+                    Object::new(fd_ty.type_name())
+                        .description(if let Some(ref c) = fd.comment {
+                            format!("{c}")
+                        } else {
+                            "".to_string()
+                        }),
+                );
+            }
 
-                    if fd_path_parent.is_empty() {
-                        tb_ty_obj = tb_ty_obj
+            if fd_path_parent.is_empty() {
+                tb_ty_obj = tb_ty_obj
+                    .field(Field::new(
+                        fd_name_gql,
+                        fd_ty,
+                        make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
+                    ))
+                    .description(if let Some(ref c) = fd.comment {
+                        format!("{c}")
+                    } else {
+                        "".to_string()
+                    });
+            } else {
+                // Array inner type is scalar, thus already set when adding the list field
+                if fd_path.chars().last() == Some('*') { continue; }
+
+                match gql_objects.remove(&fd_path_parent) {
+                    Some(obj) => {
+                        gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
                             .field(Field::new(
                                 fd_name_gql,
                                 fd_ty,
@@ -255,29 +213,10 @@ pub async fn process_tbs(
                                 format!("{c}")
                             } else {
                                 "".to_string()
-                            });
-                    } else {
-                        // Array inner type is scalar
-                        if fd_path.chars().last() == Some('*') { continue; }
-
-
-                        if let Some(obj) = gql_objects.remove(&fd_path_parent) {
-                            gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
-                                .field(Field::new(
-                                    fd_name_gql,
-                                    fd_ty,
-                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                                ))
-                                .description(if let Some(ref c) = fd.comment {
-                                    format!("{c}")
-                                } else {
-                                    "".to_string()
-                                }),
-                            );
-                        } else {
-                            return Err(schema_error("Nested field should have parent object."));
-                        }
+                            }),
+                        );
                     }
+                    None => return Err(schema_error("Nested field should have parent object.")),
                 }
             }
         }
@@ -486,92 +425,12 @@ pub async fn process_tbs(
         );
 
         // =======================================================
-        // Resolve object hierarchies and add types
+        // Add types
         // =======================================================
-
-        // async-graphql Object does not implement clone, so we cant use iter()
-        // for (k, v) in gql_objects {
-        //     tb_ty_obj = tb_ty_obj.field(Field::new(
-        //         k.to_camel_case(),
-        //         TypeRef::named(v.type_name()),
-        //         // Type::Object(v.clone()),
-        //         make_table_field_resolver(k.as_str(), Some(Kind::Object)),
-        //     ));
-        //
-        //     types.push(Type::Object(v));
-        // }
-
-        let mut keys: Vec<String> = gql_objects.keys().cloned().collect();
-        keys.sort_by(|a, b| b.cmp(a));
-
-        for key in keys {
-            let current_obj = match gql_objects.remove(&key) {
-                Some(obj) => obj,
-                None => {
-                    return Err(internal_error(
-                        format!("key '{}' disappeared from object map", key)));
-                }
-            };
-
-            let (parent_key_opt, field_name_str) = match key.rfind('.') {
-                Some(dot_index) => {
-                    let (p_key, f_name_with_dot) = key.split_at(dot_index);
-                    (Some(p_key.to_string()), f_name_with_dot[1..].to_string())
-                }
-                None => (None, key.clone()),
-            };
-
-
-            let field_definition = Field::new(
-                field_name_str.to_camel_case(),
-                TypeRef::named(current_obj.type_name()), //FIXME: non null variant handle
-                make_table_field_resolver(key.as_str(), Some(Kind::Object)),
-            );
-            // wenn field_name_str == *
-            // if field_name_str == "*" {
-            //     tb_ty_obj = tb_ty_obj.field(field_definition);
-            //     types.push(Type::Object(current_obj));
-            // }
-
-            // if let Some(parent_key) = parent_key_opt {
-            //     // Case 1: parent_key -> add to the parent object
-            //     if let Some(parent_obj_mut) = gql_objects.get_mut(&parent_key) {
-            //         let temp_placeholder = Object::new("temp_placeholder"); // Name doesn't matter
-            //         *parent_obj_mut = mem::replace(parent_obj_mut, temp_placeholder)
-            //             .field(field_definition);
-            //         types.push(Type::Object(current_obj));
-            //     } else {
-            //         return Err(schema_error(format!("field/object `{}` has no parent named `{}` in \
-            //         the schema", field_name_str, parent_key)));
-            //     }
-            // } else {
-            //     // Case 2: no parent_key -> add to the root table object.
-            //     tb_ty_obj = tb_ty_obj.field(field_definition);
-            //     types.push(Type::Object(current_obj));
-            // }
-
-            if field_name_str == "*" {
-                types.push(Type::Object(current_obj));
-            } else if let Some(parent_key) = parent_key_opt {
-                // Case: Add to the parent object
-                if let Some(parent_obj_mut) = gql_objects.get_mut(&parent_key) {
-                    let temp_placeholder = Object::new("temp_placeholder"); // Name doesn't matter
-                    *parent_obj_mut = mem::replace(parent_obj_mut, temp_placeholder)
-                        .field(field_definition);
-                    types.push(Type::Object(current_obj));
-                } else {
-                    return Err(schema_error(format!(
-                        "field/object `{}` has no parent named `{}` in the schema",
-                        field_name_str, parent_key
-                    )));
-                }
-            } else {
-                // Case: Add to the root table object or handle wildcard field
-                tb_ty_obj = tb_ty_obj.field(field_definition);
-                types.push(Type::Object(current_obj));
-            }
+        // for loop because Type::Object needs owned obj, not a reference
+        for (_, obj) in gql_objects {
+            types.push(Type::Object(obj));
         }
-
         types.push(Type::Object(tb_ty_obj));
     }
 
