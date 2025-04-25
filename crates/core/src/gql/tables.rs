@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::mem;
 use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::error::{resolver_error, schema_error, GqlError};
 use super::ext::IntoExt;
@@ -28,6 +28,7 @@ use async_graphql::dynamic::TypeRef;
 use async_graphql::dynamic::{Enum, FieldValue, Type};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
+use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use inflector::Inflector;
@@ -70,6 +71,18 @@ fn filter_name_from_table(tb_name: impl Display) -> String {
     format!("{}FilterInput", tb_name.to_string().to_pascal_case())
 }
 
+
+// fn path_from_parts()
+fn remove_last_segment(input: &str) -> String {
+    let mut parts = input.rsplitn(2, '.'); // Split from the right, limit to 2 parts
+    parts.next(); // Discard the last segment
+    parts.next().unwrap_or("").to_string() // Take the remaining part
+}
+
+fn remove_leading_dot(input: &str) -> &str {
+    input.strip_prefix('.').unwrap_or(input)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn process_tbs(
     tbs: Arc<[DefineTableStatement]>,
@@ -80,6 +93,7 @@ pub async fn process_tbs(
     db: &str,
     session: &Session,
     datastore: &Arc<Datastore>,
+    cursor: bool,
 ) -> Result<Object, GqlError> {
     // trace!("tables '{:?}'", tbs);
 
@@ -92,6 +106,7 @@ pub async fn process_tbs(
         }
     });
 
+    // types.push(PageInfo);
 
     for tb in tables.iter() {
         let tb_name = tb.name.to_string();
@@ -101,6 +116,7 @@ pub async fn process_tbs(
         let tb_name_query = tb_name.to_camel_case();
 
         let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
+        let mut arrays: HashMap<String, String> = HashMap::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
         trace!("fields '{:?}'", fds);
@@ -121,8 +137,26 @@ pub async fn process_tbs(
         // =======================================================
 
         for fd in fds.iter() {
+            let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
+                Part::Field(ident) => Some(ident),
+                // Part::All => Some(&Ident::from("*")),
+                _ => None
+            }).collect();
+
+            trace!("parts: {:?}", parts);
+
+            // trace!("Idiom to path: {}", )
+        }
+
+
+        for fd in fds.iter() {
             // We have already defined "id", so we don't take any new definition for it.
             if fd.name.is_id() { continue; };
+
+            // if fd.name.0.last().map_or(false, |p| matches!(p, Part::All)) {
+            //     continue;
+            // }
+            // //
 
             let kind = match fd.kind.clone() {
                 Some(k) => k,
@@ -142,20 +176,24 @@ pub async fn process_tbs(
             let fd_name = parts.as_slice().last().unwrap().to_string();
             let fd_name_gql = fd_name.to_camel_case();
 
-            let fd_path = parts
-                .as_slice()
-                .iter()
-                .map(|ident| ident.to_string())
-                .collect::<Vec<String>>()
-                .join(".");
+            let fd_path = fd.name.to_path()
+                .replace("/", ".")
+                .strip_prefix(".")
+                .unwrap()
+                .to_string();
 
-            let fd_path_parent = parts[..parts.len() - 1]
-                .iter()
-                .map(|ident| ident.to_string())
-                .collect::<Vec<String>>()
-                .join(".");
+            let fd_path_parent = remove_last_segment(&*fd_path.as_str());
 
             let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice())?;
+
+            trace!("field {:?}", fd);
+            trace!("idiom path: {:?}", path);
+            trace!("field_name {:?}", fd_name);
+            trace!("field_name_gql {:?}", fd_name_gql);
+            trace!("kind {:?}", kind);
+            trace!("field_type {:?}", fd_ty);
+            trace!("field_path {:?}", fd_path);
+            trace!("fd_path_parent {:?}", fd_path_parent);
 
             match kind_non_optional {
                 Kind::Object => {
@@ -169,13 +207,49 @@ pub async fn process_tbs(
                             }),
                     );
                 }
+                // Kind::Array(inner, _) => {
+                //     match inner.as_ref() {
+                //         Kind::Object => {
+                //             gql_objects.insert(
+                //                 fd_path.clone(),
+                //                 Object::new(fd_ty.type_name())
+                //                     .description(if let Some(ref c) = fd.comment {
+                //                         format!("{c}")
+                //                     } else {
+                //                         "".to_string()
+                //                     }),
+                //             );
+                //         }
+                //         _ => {
+                //             tb_ty_obj = tb_ty_obj
+                //                 .field(Field::new(
+                //                     fd_name_gql,
+                //                     fd_ty,
+                //                     //FIXME: resolver ist die kunst
+                //                     make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
+                //                 ))
+                //                 .description(if let Some(ref c) = fd.comment {
+                //                     format!("{c}")
+                //                 } else {
+                //                     "".to_string()
+                //                 });
+                //         }
+                //     }
+                //
+                //     arrays.insert(fd_path.clone(), fd_path.to_string());
+                // }
                 _ => {
+                    //hier prob wenn schon in arr
+                    // if arrays.contains_key(&fd_path_parent) {
+                    //     continue;
+                    // }
+
                     if fd_path_parent.is_empty() {
                         tb_ty_obj = tb_ty_obj
                             .field(Field::new(
-                                fd_name_gql.clone(),
-                                fd_ty.clone(),
-                                make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
+                                fd_name_gql,
+                                fd_ty,
+                                make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
                             ))
                             .description(if let Some(ref c) = fd.comment {
                                 format!("{c}")
@@ -183,12 +257,16 @@ pub async fn process_tbs(
                                 "".to_string()
                             });
                     } else {
+                        // Array inner type is scalar
+                        if fd_path.chars().last() == Some('*') { continue; }
+
+
                         if let Some(obj) = gql_objects.remove(&fd_path_parent) {
                             gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
                                 .field(Field::new(
-                                    fd_name_gql.clone(),
-                                    fd_ty.clone(),
-                                    make_table_field_resolver(fd_name.as_str(), fd.kind.clone()),
+                                    fd_name_gql,
+                                    fd_ty,
+                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
                                 ))
                                 .description(if let Some(ref c) = fd.comment {
                                     format!("{c}")
@@ -202,14 +280,6 @@ pub async fn process_tbs(
                     }
                 }
             }
-
-            // trace!("field {:?}", fd);
-            // trace!("field_name {:?}", fd_name);
-            // trace!("field_name_gql {:?}", fd_name_gql);
-            // trace!("kind {:?}", kind);
-            // trace!("field_path {:?}", fd_path);
-            // trace!("fd_path_full {:?}", fd_path_full);
-            // trace!("field_type {:?}", fd_ty);
         }
 
         // =======================================================
@@ -375,6 +445,8 @@ pub async fn process_tbs(
 
                         let res = gtx.process_stmt(ast).await?;
 
+                        trace!("query result: {res:?}");
+
                         let res_vec =
                             match res {
                                 SqlValue::Array(a) => a,
@@ -383,6 +455,8 @@ pub async fn process_tbs(
                                     return Err("Internal Error".into());
                                 }
                             };
+
+                        trace!("query result array: {res_vec:?}");
 
                         let out: Result<Vec<FieldValue>, SqlValue> = res_vec
                             .0
@@ -447,25 +521,52 @@ pub async fn process_tbs(
                 None => (None, key.clone()),
             };
 
+
             let field_definition = Field::new(
                 field_name_str.to_camel_case(),
                 TypeRef::named(current_obj.type_name()), //FIXME: non null variant handle
                 make_table_field_resolver(key.as_str(), Some(Kind::Object)),
             );
+            // wenn field_name_str == *
+            // if field_name_str == "*" {
+            //     tb_ty_obj = tb_ty_obj.field(field_definition);
+            //     types.push(Type::Object(current_obj));
+            // }
 
-            if let Some(parent_key) = parent_key_opt {
-                // Case 1: parent_key -> add to the parent object
+            // if let Some(parent_key) = parent_key_opt {
+            //     // Case 1: parent_key -> add to the parent object
+            //     if let Some(parent_obj_mut) = gql_objects.get_mut(&parent_key) {
+            //         let temp_placeholder = Object::new("temp_placeholder"); // Name doesn't matter
+            //         *parent_obj_mut = mem::replace(parent_obj_mut, temp_placeholder)
+            //             .field(field_definition);
+            //         types.push(Type::Object(current_obj));
+            //     } else {
+            //         return Err(schema_error(format!("field/object `{}` has no parent named `{}` in \
+            //         the schema", field_name_str, parent_key)));
+            //     }
+            // } else {
+            //     // Case 2: no parent_key -> add to the root table object.
+            //     tb_ty_obj = tb_ty_obj.field(field_definition);
+            //     types.push(Type::Object(current_obj));
+            // }
+
+            if field_name_str == "*" {
+                types.push(Type::Object(current_obj));
+            } else if let Some(parent_key) = parent_key_opt {
+                // Case: Add to the parent object
                 if let Some(parent_obj_mut) = gql_objects.get_mut(&parent_key) {
                     let temp_placeholder = Object::new("temp_placeholder"); // Name doesn't matter
                     *parent_obj_mut = mem::replace(parent_obj_mut, temp_placeholder)
                         .field(field_definition);
                     types.push(Type::Object(current_obj));
                 } else {
-                    return Err(schema_error(format!("field/object `{}` has no parent named `{}` in \
-                    the schema", field_name_str, parent_key)));
+                    return Err(schema_error(format!(
+                        "field/object `{}` has no parent named `{}` in the schema",
+                        field_name_str, parent_key
+                    )));
                 }
             } else {
-                // Case 2: no parent_key -> add to the root table object.
+                // Case: Add to the root table object or handle wildcard field
                 tb_ty_obj = tb_ty_obj.field(field_definition);
                 types.push(Type::Object(current_obj));
             }
@@ -537,8 +638,7 @@ pub async fn process_tbs(
     //                 })
     //             },
     //         )
-    //             .argument(id_input!()),
-    //     );
+    //             .argument(id_input!()), //     );
     // } // End Pass 2 loop
 
     // types.extend(generated_filter_inputs.into_values());
@@ -549,46 +649,215 @@ pub async fn process_tbs(
 }
 
 fn make_table_field_resolver(
-    fd_name: impl Into<String>,
+    // fd_name: impl Into<String>,
+    fd_path: impl Into<String>,
     kind: Option<Kind>,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    let fd_name = fd_name.into();
+    let fd_path = fd_path.into();
     move |ctx: ResolverContext| {
-        let fd_name = fd_name.clone();
+        let fd_path = fd_path.clone();
         let field_kind = kind.clone();
+
         FieldFuture::new({
             async move {
+
+                // // --- Try Case 1: Parent is the top-level ErasedRecord ---
+                // if let Some((gtx, rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+                //
+                //     // Fetch the field value directly from the database usiag the record ID
+                //     let val: SqlValue = gtx
+                //         .get_record_field(rid.clone(), fd_name.as_str())II
+                //         .await?; // Handle SurrealError appropriately
+                //
+                //
+                //     // Process the fetched value
+                //     match val {
+                //         SqlValue::Thing(nested_rid) if fd_name != "id" => {
+                //             trace!("Field is a Thing (Record Link) for field {} with nested ID \
+                //             {}", fd_name, nested_rid);
+                //             // Wrap the linked record's context for further resolution
+                //             let erased_nested = (gtx.clone(), nested_rid.clone()); // Clone GQLTx if needed
+                //             let mut field_value = field_val_erase_owned(erased_nested);
+                //
+                //             // Add type hint if it's a union/interface based on Kind::Record
+                //             match field_kind {
+                //                 Some(Kind::Record(ref ts)) if ts.len() != 1 => {
+                //                     field_value = field_value.with_type(nested_rid.tb.clone());
+                //                 }
+                //                 Some(Kind::Either(ref _ks)) if matches!(field_kind, Some(Kind::Record(_))) => {
+                //                     // Handle potential unions defined via Kind::Either containing Kind::Record types?
+                //                     // This logic might need refinement based on how unions are defined.
+                //                     // For now, assume Kind::Record handles the primary case.
+                //                     field_value = field_value.with_type(nested_rid.tb.clone());
+                //                 }
+                //                 _ => {}
+                //             }
+                //             Ok(Some(field_value))
+                //         }
+                //         SqlValue::None | SqlValue::Null => Ok(None),
+                //         v => {
+                //             // Convert any other SQL value (Scalar, Object, Array) to GraphQL Value
+                //             // This includes converting nested SqlValue::Object to GqlValue::Object
+                //             trace!("Converting fetched scalar/object/array to GQL Value {} for \
+                //             field {}", v, fd_name);
+                //             let gql_val = sql_value_to_gql_value(v) // sql_value_to_gql_value MUST handle Objects/Arrays
+                //                 .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for field '{}': {}", fd_name, e)))?;
+                //             // GqlError::new(format!("SQL to GQL conversion error for field '{}': {}", fd_name, e))
+                //             trace!("Conversion successful! Returning GQL Value {} for field {}", gql_val, fd_name);
+                //             Ok(Some(FieldValue::value(gql_val))) // Return the converted GQL Value
+                //         }
+                //     }
+                // }
+                // // --- Try Case 2: Parent is already a resolved GQL Value (for nested fields) ---
+                // else if let Some(parent_gql_value) = ctx.parent_value.downcast_ref::<GqlValue>() {
+                //     trace!("Parent is GqlValue (nested) {:?} for field {}", parent_gql_value, fd_name);
+                //     match parent_gql_value {
+                //         GqlValue::Object(parent_map) => {
+                //             // Find the field within the parent GQL object's map
+                //             // Use the simple field name (e.g., "height") which was passed to this resolver instance
+                //             let gql_field_name = Name::new(&fd_name); // Use async_graphql::Name for lookup
+                //
+                //             if let Some(nested_gql_value) = parent_map.get(&gql_field_name) {
+                //                 trace!("Found field {} in parent GQL object for field {:?}",
+                //                     nested_gql_value,
+                //                     fd_name);
+                //                 // The value is already a GQL value, just clone and return it
+                //                 Ok(Some(FieldValue::value(nested_gql_value.clone())))
+                //             } else {
+                //                 // Field not found in the parent GQL object map
+                //                 trace!("Field {} not found in parent GQL \
+                //                 object", fd_name);
+                //                 // Return null if the field doesn't exist in the parent map
+                //                 // (GraphQL handles nullability based on schema type)
+                //                 Ok(None)
+                //             }
+                //         }
+                //         // Handle if parent is List? Might not occur if lists always resolve fully.
+                //         // GqlValue::List(_) => { ... }
+                //         _ => {
+                //             // Parent was a GqlValue, but not an Object. This indicates a schema mismatch or unexpected state.
+                //             Err(internal_error(format!(
+                //                 "Parent value for nested field '{}' was an unexpected GqlValue type: {:?}. Expected Object.",
+                //                 fd_name, parent_gql_value
+                //             )).into()) // Ensure error implements Into<async_graphql::Error>
+                //         }
+                //     }
+                // }
+                // // --- Error Case: Unknown parent type ---
+                // else {
+                //     Err(internal_error(format!(
+                //         "Failed to downcast parent value for field '{}'. Unexpected parent type ID: {:?}",
+                //         fd_name,
+                //         ctx.parent_value
+                //     )).into()) // Ensure error implements Into<async_graphql::Error>
+                // }
+
+                trace!(
+                    "Creating/Running resolver for DB path '{}' (Kind: {:?}) with parent: {:?}",
+                    fd_path,
+                    field_kind,
+                    ctx.parent_value // Use the user-provided trace format
+                );
+
+                // trace!("parent_value: {:?}", ctx.parent_value);
                 let (ref gtx, ref rid) = ctx
                     .parent_value
                     .downcast_ref::<ErasedRecord>()
                     .ok_or_else(|| internal_error("failed to downcast"))?;
 
-                let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
+                trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
 
-                let out = match val {
-                    SqlValue::Thing(rid) if fd_name != "id" => {
-                        let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
-                        match field_kind {
-                            Some(Kind::Record(ts)) if ts.len() != 1 => {
-                                tmp = tmp.with_type(rid.tb.clone())
+                match field_kind {
+                    // A) Field is Object or Record link (not 'id'): Pass ErasedRecord context down
+                    Some(Kind::Object) | Some(Kind::Record(_)) if fd_path != "id" => {
+                        trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", fd_path);
+                        let gtx_clone = gtx.clone();
+                        let rid_clone = rid.clone();
+                        let nested_context: ErasedRecord = (gtx_clone, rid_clone);
+                        let field_value = field_val_erase_owned(nested_context);
+                        // Optional: Add .with_type() hints for record link unions/interfaces here if needed
+                        Ok(Some(field_value))
+                    }
+
+                    // B) Field is scalar/terminal/'id': Fetch value using (modified) get_record_field
+                    _ => {
+                        trace!("Field at path '{}' is scalar/id/terminal, fetching value via get_record_field", fd_path);
+
+                        // Call the modified get_record_field which accepts a path string
+                        let sql_value: SqlValue = gtx
+                            .get_record_field(rid.clone(), &fd_path)
+                            .await?;
+
+                        trace!("Fetched value for path '{}': {:?}", fd_path, sql_value);
+
+                        // --- Convert the fetched value ---
+                        match sql_value {
+                            SqlValue::None | SqlValue::Null => Ok(None),
+
+                            // This case primarily handles 'id' now or potentially Things returned
+                            // unexpectedly for scalar paths.
+                            SqlValue::Thing(thing_val) => {
+                                trace!("Value for path '{}' is Thing: {}", fd_path, thing_val);
+                                let gql_val = sql_value_to_gql_value(SqlValue::Thing(thing_val))?;
+                                Ok(Some(FieldValue::value(gql_val)))
                             }
-                            _ => {}
+
+                            // Handle scalars and Enums
+                            v => {
+                                trace!("Converting value {:?} for path '{}'", v, fd_path);
+                                let is_dynamic_enum = match &field_kind { // Use the kind passed to factory
+                                    Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
+                                    Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
+                                    _ => false,
+                                };
+
+                                let gql_val = if is_dynamic_enum {
+                                    match v {
+                                        SqlValue::Strand(db_string) => {
+                                            let gql_enum_member = db_string.as_str().to_screaming_snake_case();
+                                            trace!("Dynamic Enum conversion: DB '{}' -> GQL '{}' for path {}", db_string.as_str(), gql_enum_member, fd_path);
+                                            GqlValue::Enum(Name::new(gql_enum_member))
+                                        }
+                                        _ => return Err(internal_error(format!("Expected String/Strand from DB for dynamic enum at path '{}', got {:?}", fd_path, v)).into())
+                                    }
+                                } else {
+                                    sql_value_to_gql_value(v)
+                                        .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for path '{}': {}", fd_path, e)))?
+                                };
+
+                                trace!("Conversion successful for path '{}': {:?}", fd_path, gql_val);
+                                Ok(Some(FieldValue::value(gql_val)))
+                            }
                         }
-                        Ok(Some(tmp))
                     }
-                    SqlValue::None | SqlValue::Null => Ok(None),
-                    //TODO: Dig here to fix: internal: invalid item for enum \"StatusEnum\"
-                    v => {
-                        match field_kind {
-                            Some(Kind::Either(ks)) if ks.len() != 1 => {}
-                            _ => {}
-                        }
-                        let out = sql_value_to_gql_value(v.to_owned())
-                            .map_err(|_| "SQL to GQL translation failed")?;
-                        Ok(Some(FieldValue::value(out)))
-                    }
-                };
-                out
+                }
+
+                // let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
+                //
+                // let out = match val {
+                //     SqlValue::Thing(rid) if fd_name != "id" => {
+                //         let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
+                //         match field_kind {
+                //             Some(Kind::Record(ts)) if ts.len() != 1 => {
+                //                 tmp = tmp.with_type(rid.tb.clone())
+                //             }
+                //             _ => {}
+                //         }
+                //         Ok(Some(tmp))
+                //     }
+                //     SqlValue::None | SqlValue::Null => Ok(None),
+                //     //TODO: Dig here to fix: internal: invalid item for enum \"StatusEnum\"
+                //     v => {
+                //         match field_kind {
+                //             Some(Kind::Either(ks)) if ks.len() != 1 => {}
+                //             _ => {}
+                //         }
+                //         let out = sql_value_to_gql_value(v.to_owned())
+                //             .map_err(|_| "SQL to GQL translation failed")?;
+                //         Ok(Some(FieldValue::value(out)))
+                //     }
+                // };
+                // out
             }
         })
     }
@@ -1004,3 +1273,19 @@ fn parse_order_input(order: Option<&GqlValue>) -> Result<Option<Vec<sql::Order>>
     }
     Ok(Some(orders))
 }
+
+
+//TODO: resolve with get_record_field funktioniert fuer ein level nested.
+// hier bei 'size.location.`info`' findet er obvious nicht: None -> Error
+
+
+// TODO: auch bei .url oder users.0.image.size.height
+// weil hier path: size.height und der nicht gefunden wird fuer query
+// SELECT * FROM user:id
+
+
+// 2025-04-22T19:32:25.885157Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:659: Creating/Running resolver for DB path 'size.location.`info`' (Kind: Some(Float)) with parent: (surrealdb_core::gql::utils::GQLTx, surrealdb_core::sql::thing::Thing)     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
+// 2025-04-22T19:32:25.885164Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:672: Parent is ErasedRecord for path 'size.location.`info`', RID: image:ppli74w1kj8biujquu43     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
+// 2025-04-22T19:32:25.885172Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:688: Field at path 'size.location.`info`' is scalar/id/terminal, fetching value via get_record_field     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
+// 2025-04-22T19:32:25.885188Z TRACE request: surrealdb::core::dbs: crates/core/src/dbs/iterator.rs:354: Iterating statement statement=SELECT * FROM image:ppli74w1kj8biujquu43 otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
+// 2025-04-22T19:32:25.885258Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:695: Fetched value for path 'size.location.`info`': None     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
