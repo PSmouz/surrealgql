@@ -199,8 +199,6 @@ pub async fn process_tbs(
         }
     });
 
-    // types.push(PageInfo);
-
     for tb in tables.iter() {
         let tb_name = tb.name.to_string();
         let first_tb_name = tb_name.clone();
@@ -267,7 +265,7 @@ pub async fn process_tbs(
             trace!("field_path {:?}", fd_path);
             trace!("fd_path_parent {:?}", fd_path_parent);
 
-            // object map used to build fields step by step
+            // object map used to add fields step by step to the objects
             if kind_non_optional == Kind::Object {
                 gql_objects.insert(
                     fd_path.clone(),
@@ -280,9 +278,9 @@ pub async fn process_tbs(
                 );
             }
 
-            if fd_path_parent.is_empty() {
+            if fd_path_parent.is_empty() { // top level field
                 match kind_non_optional {
-                    Kind::Array(_, _) => {
+                    Kind::Array(_, _) if cursor => {
                         if let kind = kind.inner_kind().unwrap() {
                             let ty_ref = kind_to_type(kind.clone(), types, parts.as_slice(),
                                                       tb_name_gql.clone())?;
@@ -306,10 +304,12 @@ pub async fn process_tbs(
                             });
                     }
                 }
-            } else {
+            } else { // nested field
                 // Array inner type is scalar, thus already set when adding the list field
                 if fd_path.chars().last() == Some('*') { continue; }
 
+                // expects the parent's `DefineFieldStatement` to come before its children as is
+                // with `tx.all_tb_fields()`
                 match gql_objects.remove(&fd_path_parent) {
                     Some(obj) => {
                         gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
@@ -325,7 +325,7 @@ pub async fn process_tbs(
                             }),
                         );
                     }
-                    None => return Err(schema_error("Nested field should have parent object.")),
+                    None => return Err(internal_error("Nested field should have parent object.")),
                 }
             }
         }
@@ -533,8 +533,6 @@ pub async fn process_tbs(
             // .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
         );
 
-        // cursor_pagination!(tb_ty_obj, types, "ImageSize");
-
         // =======================================================
         // Add Object types
         // =======================================================
@@ -543,7 +541,8 @@ pub async fn process_tbs(
             types.push(Type::Object(obj));
         }
         types.push(Type::Object(tb_ty_obj));
-        add_page_info_type!(types);
+
+        if cursor { add_page_info_type!(types); } //Needed for cursor connections
     }
 
     // =======================================================
