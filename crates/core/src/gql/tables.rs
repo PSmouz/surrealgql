@@ -54,6 +54,13 @@ macro_rules! limit_input {
 	};
 }
 
+/// This macro needs the order input types to be defined with `define_order_input_types`.
+macro_rules! order_input {
+	($name: expr) => {
+		InputValue::new("orderBy", TypeRef::named(format!("{}Order", $name.to_pascal_case())))
+	};
+}
+
 macro_rules! start_input {
 	() => {
 		InputValue::new("start", TypeRef::named(TypeRef::INT))
@@ -66,7 +73,7 @@ macro_rules! id_input {
 	};
 }
 
-macro_rules! add_page_info_type {
+macro_rules! define_page_info_type {
     ($types:ident) => {
         $types.push(Type::Object({
             Object::new("PageInfo")
@@ -103,7 +110,7 @@ macro_rules! add_page_info_type {
     };
 }
 
-macro_rules! add_order_by_enum {
+macro_rules! define_order_direction_enum {
     ($types:ident) => {
         $types.push(Type::Enum({
             Enum::new("OrderDirection")
@@ -117,28 +124,35 @@ macro_rules! add_order_by_enum {
     };
 }
 
+/// This macro needs the order direction enum type defined. you may use
+/// `define_order_direction_enum` for it.
+macro_rules! define_order_input_types {
+    (
+        $types:ident,
+        $base_name:expr,
+        $( $field_enum_name:ident ),* $(,)?
+    ) => {
+        let base_name_pascal = $base_name.to_pascal_case();
+        let enum_name = format!("{}OrderField", base_name_pascal);
+        let obj_name = format!("{}Order", base_name_pascal);
 
-macro_rules! add_order_by_argument {
-    ($types:ident, $name:ident) => {
-        let enum_name = format!("{}OrderField", $name);
         let order_by_enum = Enum::new(&enum_name)
-        .item(EnumItem::new("ID").description("xxx by ID."));
-
-        let obj_name = format!("{}Order", $name);
-        let order_by_obj = InputObject::new(&obj_name)
-        .field(
-            InputValue::new("field", TypeRef::named(&enum_name))
-            .description("The field to order xxx by."))
-        .field(
-            InputValue::new("direction", TypeRef::named("OrderDirection"))
-            .description("The ordering direction."))
-        .description("Ordering options for xxx xxx connections");
-
-
+            .item(EnumItem::new("ID").description(format!("{} by ID.", $base_name)))
+            $(.item(EnumItem::new(stringify!($field_enum_name).to_screaming_snake_case())
+                .description(format!("{} by {}.",
+                $base_name, stringify!($field_enum_name).to_screaming_snake_case()))))*
+            .description(format!("Properties by which {} can be ordered.", $base_name));
         $types.push(Type::Enum(order_by_enum));
-        $types.push(Type::InputObject(order_by_obj))
 
-        // .argument(InputValue::new("orderBy", TypeRef::named(&obj_name)))
+        let order_by_obj = InputObject::new(&obj_name)
+            .field(
+                InputValue::new("field", TypeRef::named(&enum_name))
+                .description(format!("The field to order {} by.", $base_name)))
+            .field(
+                InputValue::new("direction", TypeRef::named("OrderDirection"))
+                .description("The ordering direction."))
+            .description(format!("Ordering options for {} connections", $base_name));
+        $types.push(Type::InputObject(order_by_obj))
     };
 }
 
@@ -256,7 +270,7 @@ pub async fn process_tbs(
                 TypeRef::named_nn(TypeRef::ID),
                 make_table_field_resolver(
                     "id",
-                    Some(Kind::Record(vec![Table::from(tb_name)])),
+                    Some(Kind::Record(vec![Table::from(tb_name.clone())])),
                 ),
             ))
             .implement("Record");
@@ -371,6 +385,12 @@ pub async fn process_tbs(
         }
 
         // =======================================================
+        // Add filters
+        // =======================================================
+
+        define_order_input_types!(types, tb_name,);
+
+        // =======================================================
         // Add single instance query
         // =======================================================
 
@@ -419,15 +439,10 @@ pub async fn process_tbs(
                 .description(if let Some(ref c) = &tb.comment {
                     format!("{c}")
                 } else {
-                    format!("Generated from table `{}`\nallows querying a single record in a table by ID", tb.name)
+                    format!("Generated from table `{}`\nallows querying a single record in a table by ID", &tb_name)
                 })
                 .argument(id_input!()),
         );
-
-        // =======================================================
-        // Add filters
-        // =======================================================
-
 
         // =======================================================
         // Add all instances query
@@ -436,8 +451,6 @@ pub async fn process_tbs(
         let sess2 = session.to_owned();
         let kvs2 = datastore.clone();
         let fds2 = fds.clone();
-
-        add_order_by_argument!(types, tb_name_gql);
 
         query = query.field(
             Field::new(
@@ -569,12 +582,14 @@ pub async fn process_tbs(
                     })
                 },
             )
-                .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
+                .description(if let Some(ref c) = &tb.comment {
+                    format!("{c}")
+                } else {
+                    format!("Generated from table `{}`\nallows querying a table with filters",
+                            &tb_name)
+                })
                 .argument(limit_input!())
-                // .argument(start_input!())
-                .argument(InputValue::new("orderBy", TypeRef::named(format!("{}Order",
-                                                                            tb_name_gql))))
-            // .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
+                .argument(order_input!(&tb_name))
         );
 
         // =======================================================
@@ -586,8 +601,8 @@ pub async fn process_tbs(
         }
         types.push(Type::Object(tb_ty_obj));
 
-        if cursor { add_page_info_type!(types); } //Needed for cursor connections
-        add_order_by_enum!(types);
+        if cursor { define_page_info_type!(types); } //Needed for cursor connections
+        define_order_direction_enum!(types); // Needed for order_input
     }
 
     Ok(query)
