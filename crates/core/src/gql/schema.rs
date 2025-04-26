@@ -449,9 +449,7 @@ Result<TypeRef,
             // Use table name for object uniqueness across multiple tables
             TypeRef::named(format!("{}{}Object", tb, ty_name.to_pascal_case()))
         }
-        Kind::Point => {
-            TypeRef::named("POINT") //todo
-        }
+        Kind::Point => TypeRef::named("GeometryPoint"),
         Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
         Kind::String => TypeRef::named(TypeRef::STRING),
         Kind::Uuid => TypeRef::named("UUID"),
