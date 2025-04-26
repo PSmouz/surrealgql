@@ -87,14 +87,14 @@ macro_rules! add_page_info_type {
             .field(
                 Field::new(
                 "startCursor",
-                TypeRef::named_nn(TypeRef::STRING),
+                TypeRef::named(TypeRef::STRING),
                 page_info_resolver("".to_string(), None),
                 ).description("When paginating backwards, the cursor to continue.")
             )
             .field(
                 Field::new(
                 "endCursor",
-                TypeRef::named_nn(TypeRef::STRING),
+                TypeRef::named(TypeRef::STRING),
                 page_info_resolver("".to_string(), None),
                 ).description("When paginating forwards, the cursor to continue.")
             )
@@ -206,7 +206,6 @@ fn filter_name_from_table(tb_name: impl Display) -> String {
 }
 
 
-// fn path_from_parts()
 fn remove_last_segment(input: &str) -> String {
     let mut parts = input.rsplitn(2, '.'); // Split from the right, limit to 2 parts
     parts.next(); // Discard the last segment
@@ -571,7 +570,7 @@ pub async fn process_tbs(
                 },
             )
                 .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
-                // .argument(limit_input!())
+                .argument(limit_input!())
                 // .argument(start_input!())
                 .argument(InputValue::new("orderBy", TypeRef::named(format!("{}Order",
                                                                             tb_name_gql))))
@@ -591,78 +590,80 @@ pub async fn process_tbs(
         add_order_by_enum!(types);
     }
 
-    // =======================================================
-    // Pass 2: Define Inputs, Enums, Query Fields
-    // =======================================================
-    // trace!("Starting Pass 2: Defining Inputs, Enums, Queries");
-    // let mut generated_filter_inputs: BTreeMap<String, Type> = BTreeMap::new(); // Avoid duplicate filter defs
-    // let mut generated_order_inputs: BTreeMap<String, Type> = BTreeMap::new();
-    // let mut generated_orderable_enums: BTreeMap<String, Type> = BTreeMap::new();
-    //
-    // // Define base scalar filters if not already present (do this once)
-    // if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IDFilterInput")) {
-    //     types.push(Type::InputObject(filter_id())); // Assuming filter_id() defines IDFilterInput
-    // }
-    // // Add other base filters like StringFilterInput, IntFilterInput etc. Ensure they are defined once.
-    // // Example (needs proper implementation in filter_from_type or similar):
-    // if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "StringFilterInput")) {
-    //     let string_filter = filter_from_type(Kind::String, "StringFilterInput".to_string(), types)?;
-    //     generated_filter_inputs.insert("StringFilterInput".to_string(), Type::InputObject(string_filter));
-    // }
-    // if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IntFilterInput")) {
-    //     let int_filter = filter_from_type(Kind::Int, "IntFilterInput".to_string(), types)?;
-    //     generated_filter_inputs.insert("IntFilterInput".to_string(), Type::InputObject(int_filter));
-    // }
-    // if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "DateTimeFilterInput")) {
-    //     let dt_filter = filter_from_type(Kind::Datetime, "DateTimeFilterInput".to_string(), types)?;
-    //     generated_filter_inputs.insert("DateTimeFilterInput".to_string(), Type::InputObject(dt_filter));
-    // }
-    // // Add BooleanFilterInput, FloatFilterInput etc.
-    //
-
-
-    //
-    //     // Single query field (e.g., image)
-    //     let single_query_name = table_name_str.to_camel_case();
-    //     trace!("Pass 2: Defining single query '{}'", single_query_name);
-    //     let sess2 = session.to_owned();
-    //     let kvs2 = datastore.clone();
-    //     let table_name_clone2 = table_name_str.clone();
-    //     query = query.field(
-    //         Field::new(
-    //             single_query_name,
-    //             TypeRef::named(&table_pascal), // Correct type ref
-    //             move |ctx| { // Resolver logic remains largely the same
-    //                 let tb_name = table_name_clone2.clone();
-    //                 let kvs2 = kvs2.clone();
-    //                 let sess2 = sess2.clone();
-    //                 FieldFuture::new(async move {
-    //                     // ... (fetch by ID as before) ...
-    //                     let gtx = GQLTx::new(&kvs2, &sess2).await?;
-    //                     let args = ctx.args.as_index_map();
-    //                     let id_val = args.get("id").ok_or_else(|| internal_error("Missing ID argument"))?;
-    //                     let id = id_val.as_string().ok_or_else(|| internal_error("ID must be a string"))?;
-    //
-    //                     let thing = match Thing::try_from(id.clone()) {
-    //                         Ok(t) => t,
-    //                         Err(_) => Thing::from((tb_name, id)),
-    //                     };
-    //                     match gtx.get_record_field(thing, "id").await? {
-    //                         SqlValue::Thing(t) => Ok(Some(field_val_erase_owned((gtx, t)))),
-    //                         _ => Ok(None),
-    //                     }
-    //                 })
-    //             },
-    //         )
-    //             .argument(id_input!()), //     );
-    // } // End Pass 2 loop
-
-    // types.extend(generated_filter_inputs.into_values());
-    // types.extend(generated_order_inputs.into_values());
-    // types.extend(generated_orderable_enums.into_values());
-
     Ok(query)
 }
+
+
+// =======================================================
+// Pass 2: Define Inputs, Enums, Query Fields
+// =======================================================
+// trace!("Starting Pass 2: Defining Inputs, Enums, Queries");
+// let mut generated_filter_inputs: BTreeMap<String, Type> = BTreeMap::new(); // Avoid duplicate filter defs
+// let mut generated_order_inputs: BTreeMap<String, Type> = BTreeMap::new();
+// let mut generated_orderable_enums: BTreeMap<String, Type> = BTreeMap::new();
+//
+// // Define base scalar filters if not already present (do this once)
+// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IDFilterInput")) {
+//     types.push(Type::InputObject(filter_id())); // Assuming filter_id() defines IDFilterInput
+// }
+// // Add other base filters like StringFilterInput, IntFilterInput etc. Ensure they are defined once.
+// // Example (needs proper implementation in filter_from_type or similar):
+// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "StringFilterInput")) {
+//     let string_filter = filter_from_type(Kind::String, "StringFilterInput".to_string(), types)?;
+//     generated_filter_inputs.insert("StringFilterInput".to_string(), Type::InputObject(string_filter));
+// }
+// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IntFilterInput")) {
+//     let int_filter = filter_from_type(Kind::Int, "IntFilterInput".to_string(), types)?;
+//     generated_filter_inputs.insert("IntFilterInput".to_string(), Type::InputObject(int_filter));
+// }
+// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "DateTimeFilterInput")) {
+//     let dt_filter = filter_from_type(Kind::Datetime, "DateTimeFilterInput".to_string(), types)?;
+//     generated_filter_inputs.insert("DateTimeFilterInput".to_string(), Type::InputObject(dt_filter));
+// }
+// // Add BooleanFilterInput, FloatFilterInput etc.
+//
+
+
+//
+//     // Single query field (e.g., image)
+//     let single_query_name = table_name_str.to_camel_case();
+//     trace!("Pass 2: Defining single query '{}'", single_query_name);
+//     let sess2 = session.to_owned();
+//     let kvs2 = datastore.clone();
+//     let table_name_clone2 = table_name_str.clone();
+//     query = query.field(
+//         Field::new(
+//             single_query_name,
+//             TypeRef::named(&table_pascal), // Correct type ref
+//             move |ctx| { // Resolver logic remains largely the same
+//                 let tb_name = table_name_clone2.clone();
+//                 let kvs2 = kvs2.clone();
+//                 let sess2 = sess2.clone();
+//                 FieldFuture::new(async move {
+//                     // ... (fetch by ID as before) ...
+//                     let gtx = GQLTx::new(&kvs2, &sess2).await?;
+//                     let args = ctx.args.as_index_map();
+//                     let id_val = args.get("id").ok_or_else(|| internal_error("Missing ID argument"))?;
+//                     let id = id_val.as_string().ok_or_else(|| internal_error("ID must be a string"))?;
+//
+//                     let thing = match Thing::try_from(id.clone()) {
+//                         Ok(t) => t,
+//                         Err(_) => Thing::from((tb_name, id)),
+//                     };
+//                     match gtx.get_record_field(thing, "id").await? {
+//                         SqlValue::Thing(t) => Ok(Some(field_val_erase_owned((gtx, t)))),
+//                         _ => Ok(None),
+//                     }
+//                 })
+//             },
+//         )
+//             .argument(id_input!()), //     );
+// } // End Pass 2 loop
+
+// types.extend(generated_filter_inputs.into_values());
+// types.extend(generated_order_inputs.into_values());
+// types.extend(generated_orderable_enums.into_values());
+
 
 fn make_table_field_resolver(
     // fd_name: impl Into<String>,
