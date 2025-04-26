@@ -33,24 +33,57 @@ use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use inflector::Inflector;
 use log::trace;
+// macro_rules! order {
+// 	(asc, $field:expr) => {{
+// 		let mut tmp = sql::Order::default();
+// 		tmp.value = $field.into();
+// 		tmp.direction = true;
+// 		tmp
+// 	}};
+// 	(desc, $field:expr) => {{
+// 		let mut tmp = sql::Order::default();
+// 		tmp.value = $field.into();
+// 		tmp
+// 	}};
+// }
+macro_rules! first_input {
+	() => {
+		InputValue::new("first", TypeRef::named(TypeRef::INT))
+        .description("Returns the first *n* elements from the list.")
+	};
+}
 
-macro_rules! order {
-	(asc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.value = $field.into();
-		tmp.direction = true;
-		tmp
-	}};
-	(desc, $field:expr) => {{
-		let mut tmp = sql::Order::default();
-		tmp.value = $field.into();
-		tmp
-	}};
+macro_rules! last_input {
+	() => {
+		InputValue::new("last", TypeRef::named(TypeRef::INT))
+        .description("Returns the last *n* elements from the list.")
+	};
+}
+
+macro_rules! before_input {
+	() => {
+		InputValue::new("before", TypeRef::named(TypeRef::STRING))
+        .description("Returns the elements in the list that come before the specified cursor.")
+	};
+}
+
+macro_rules! after_input {
+	() => {
+		InputValue::new("after", TypeRef::named(TypeRef::STRING))
+        .description("Returns the elements in the list that come after the specified cursor.")
+	};
 }
 
 macro_rules! limit_input {
 	() => {
 		InputValue::new("limit", TypeRef::named(TypeRef::INT))
+        .description("xxx")
+	};
+}
+
+macro_rules! id_input {
+	() => {
+		InputValue::new("id", TypeRef::named(TypeRef::ID))
 	};
 }
 
@@ -58,18 +91,13 @@ macro_rules! limit_input {
 macro_rules! order_input {
 	($name: expr) => {
 		InputValue::new("orderBy", TypeRef::named(format!("{}Order", $name.to_pascal_case())))
+        .description(format!("Ordering options for `{}` connections.", $name))
 	};
 }
 
-macro_rules! start_input {
-	() => {
-		InputValue::new("start", TypeRef::named(TypeRef::INT))
-	};
-}
-
-macro_rules! id_input {
-	() => {
-		InputValue::new("id", TypeRef::named_nn(TypeRef::ID))
+macro_rules! filter_input {
+	($name: expr) => {
+		InputValue::new("filterBy", TypeRef::named(format!("{}Filter", $name.to_pascal_case())))
 	};
 }
 
@@ -156,9 +184,29 @@ macro_rules! define_order_input_types {
     };
 }
 
+/// Adds a connection field to the specified object.
+///
+/// # Parameters
+/// - `obj`: The object to which the connection field is added.
+/// - `types`: The types vector to which the connection and edge types are added.
+/// - `fd_name`: The name of the connection field.
+/// - `node_ty_name`: The name of the node type.
+/// - `connection_resolver`: The resolver for the connection field.
+/// - `edges`: Additional edge fields.
+/// - `args`: Additional connection arguments.
+#[macro_export]
 macro_rules! cursor_pagination {
-    ($obj:ident, $types:ident, $fd_type:ident, $fd_name:ident) => {
-        let edge = Object::new(format!("{}Edge", $fd_type))
+    (
+        $obj:ident,
+        $types:ident,
+        $fd_name:expr,
+        $node_ty_name:expr,
+        //TODO
+        // $connection_resolver:expr,      // The actual resolver for the connection field on $obj
+        edges: [ $( $extra_edge_field:expr ),* $(,)? ]
+        args: [ $( $extra_connection_arg:expr ),* $(,)? ]
+    ) => {
+        let mut edge = Object::new(format!("{}Edge", $node_ty_name))
             .field(Field::new(
                 "cursor",
                 TypeRef::named_nn(TypeRef::STRING),
@@ -166,20 +214,21 @@ macro_rules! cursor_pagination {
             ).description("A cursor for use in pagination."))
             .field(Field::new(
                 "node",
-                TypeRef::named($fd_type),
+                TypeRef::named($node_ty_name),
                 page_info_resolver("".to_string(), None),
             ).description("The item at the end of the edge."))
             .description("An edge in a connection.");
+        $( edge = edge.field($extra_edge_field); )*
 
-        let connection = Object::new(format!("{}Connection", $fd_type))
+        let connection = Object::new(format!("{}Connection", $node_ty_name))
             .field(Field::new(
                 "edges",
-                TypeRef::named_list(format!("{}Edge", $fd_type)),
+                TypeRef::named_list(format!("{}Edge", $node_ty_name)),
                 page_info_resolver("".to_string(), None),
             ).description("A list of edges."))
             .field(Field::new(
                 "nodes",
-                TypeRef::named_list($fd_type),
+                TypeRef::named_list($node_ty_name),
                 page_info_resolver("".to_string(), None),
             ).description("A list of nodes."))
             .field(Field::new(
@@ -188,31 +237,29 @@ macro_rules! cursor_pagination {
                 page_info_resolver("".to_string(), None),
             ).description("Information to aid in pagination."))
             .field(Field::new(
-                "total",
+                "totalCount",
                 TypeRef::named_nn(TypeRef::INT),
                 page_info_resolver("".to_string(), None),
             ).description("Identifies the total count of items in the connection."))
-            .description(format!("The connection type for {}.", $fd_type));
+            .description(format!("The connection type for {}.", $node_ty_name));
 
         $types.push(Type::Object(edge));
         $types.push(Type::Object(connection));
         $obj = $obj.field(
             Field::new(
                 $fd_name,
-                TypeRef::named_nn(format!("{}Connection", $fd_type)),
+                TypeRef::named_nn(format!("{}Connection", $node_ty_name)),
                 page_info_resolver("".to_string(), None),
             )
-            .argument(InputValue::new("after", TypeRef::named(TypeRef::STRING))
-                .description("Returns the elements in the list that come after the specified cursor."))
-            .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING))
-                .description("Returns the elements in the list that come before the specified cursor."))
-            .argument(InputValue::new("first", TypeRef::named(TypeRef::INT))
-                .description("Returns the first *n* elements from the list."))
-            .argument(InputValue::new("last", TypeRef::named(TypeRef::INT))
-                .description("Returns the last *n* elements from the list."))
+            .argument(after_input!())
+            .argument(before_input!())
+            .argument(first_input!())
+            .argument(last_input!())
+            $(.argument($extra_connection_arg))*
         )
     };
 }
+
 
 fn filter_name_from_table(tb_name: impl Display) -> String {
     // format!("Filter{}", tb_name.to_string().to_sentence_case())
@@ -339,7 +386,8 @@ pub async fn process_tbs(
                             let ty_ref = kind_to_type(kind.clone(), types, parts.as_slice(),
                                                       tb_name_gql.clone())?;
                             let ty_name = ty_ref.type_name();
-                            cursor_pagination!(tb_ty_obj, types, ty_name, fd_name_gql);
+                            cursor_pagination!(tb_ty_obj, types, fd_name_gql, ty_name, edges: []
+                                args: []); // maybe overload macro definition for non-edges/args
                         } else {
                             return Err(internal_error("Kind Array has no inner type."));
                         }
@@ -388,7 +436,9 @@ pub async fn process_tbs(
         // Add filters
         // =======================================================
 
+        // Add additional orderBy fields here:
         define_order_input_types!(types, tb_name,);
+
 
         // =======================================================
         // Add single instance query
@@ -452,148 +502,164 @@ pub async fn process_tbs(
         let kvs2 = datastore.clone();
         let fds2 = fds.clone();
 
-        query = query.field(
-            Field::new(
+        if cursor {
+            cursor_pagination!(
+                query,
+                types,
                 tb_name_query.to_plural(),
-                TypeRef::named_nn_list_nn(&tb_name_gql),
-                move |ctx| {
-                    let tb_name = second_tb_name.clone();
-                    let sess2 = sess2.clone();
-                    let fds2 = fds.clone();
-                    let kvs2 = kvs2.clone();
-                    FieldFuture::new(async move {
-                        let gtx = GQLTx::new(&kvs2, &sess2).await?;
+                &tb_name_gql,
+                edges: []
+                args: [
+                    limit_input!(),
+                    order_input!(&tb_name)
+                ]
+            );
+            define_page_info_type!(types);
+        } else {
+            query = query.field(
+                Field::new(
+                    tb_name_query.to_plural(),
+                    TypeRef::named_nn_list_nn(&tb_name_gql),
+                    move |ctx| {
+                        let tb_name = second_tb_name.clone();
+                        let sess2 = sess2.clone();
+                        let fds2 = fds.clone();
+                        let kvs2 = kvs2.clone();
+                        FieldFuture::new(async move {
+                            let gtx = GQLTx::new(&kvs2, &sess2).await?;
 
-                        let args = ctx.args.as_index_map();
-                        trace!("received request with args: {args:?}");
+                            let args = ctx.args.as_index_map();
+                            trace!("received request with args: {args:?}");
 
-                        // let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
-                        //
-                        // let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
-                        //
-                        // let order = args.get("order");
-                        //
-                        // let filter = args.get("filter");
+                            // let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
+                            //
+                            // let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
+                            //
+                            // let order = args.get("order");
+                            //
+                            // let filter = args.get("filter");
 
-                        // let orders = match order {
-                        //     Some(GqlValue::Object(o)) => {
-                        //         let mut orders = vec![];
-                        //         let mut current = o;
-                        //         loop {
-                        //             let asc = current.get("asc");
-                        //             let desc = current.get("desc");
-                        //             match (asc, desc) {
-                        //                 (Some(_), Some(_)) => {
-                        //                     return Err("Found both ASC and DESC in order".into());
-                        //                 }
-                        //                 (Some(GqlValue::Enum(a)), None) => {
-                        //                     orders.push(order!(asc, a.as_str()))
-                        //                 }
-                        //                 (None, Some(GqlValue::Enum(d))) => {
-                        //                     orders.push(order!(desc, d.as_str()))
-                        //                 }
-                        //                 (_, _) => {
-                        //                     break;
-                        //                 }
-                        //             }
-                        //             if let Some(GqlValue::Object(next)) = current.get("then") {
-                        //                 current = next;
-                        //             } else {
-                        //                 break;
-                        //             }
-                        //         }
-                        //         Some(orders)
-                        //     }
-                        //     _ => None,
-                        // };
-                        // trace!("parsed orders: {orders:?}");
+                            // let orders = match order {
+                            //     Some(GqlValue::Object(o)) => {
+                            //         let mut orders = vec![];
+                            //         let mut current = o;
+                            //         loop {
+                            //             let asc = current.get("asc");
+                            //             let desc = current.get("desc");
+                            //             match (asc, desc) {
+                            //                 (Some(_), Some(_)) => {
+                            //                     return Err("Found both ASC and DESC in order".into());
+                            //                 }
+                            //                 (Some(GqlValue::Enum(a)), None) => {
+                            //                     orders.push(order!(asc, a.as_str()))
+                            //                 }
+                            //                 (None, Some(GqlValue::Enum(d))) => {
+                            //                     orders.push(order!(desc, d.as_str()))
+                            //                 }
+                            //                 (_, _) => {
+                            //                     break;
+                            //                 }
+                            //             }
+                            //             if let Some(GqlValue::Object(next)) = current.get("then") {
+                            //                 current = next;
+                            //             } else {
+                            //                 break;
+                            //             }
+                            //         }
+                            //         Some(orders)
+                            //     }
+                            //     _ => None,
+                            // };
+                            // trace!("parsed orders: {orders:?}");
 
-                        // let cond = match filter {
-                        //     Some(f) => {
-                        //         let o = match f {
-                        //             GqlValue::Object(o) => o,
-                        //             f => {
-                        //                 error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
-                        //                 return Err("Value in cond doesn't fit schema".into());
-                        //             }
-                        //         };
-                        //
-                        //         let cond = cond_from_filter(o, &fds2)?;
-                        //
-                        //         Some(cond)
-                        //     }
-                        //     None => None,
-                        // };
-                        // trace!("parsed filter: {cond:?}");
+                            // let cond = match filter {
+                            //     Some(f) => {
+                            //         let o = match f {
+                            //             GqlValue::Object(o) => o,
+                            //             f => {
+                            //                 error!("Found filter {f}, which should be object and should have been rejected by async graphql.");
+                            //                 return Err("Value in cond doesn't fit schema".into());
+                            //             }
+                            //         };
+                            //
+                            //         let cond = cond_from_filter(o, &fds2)?;
+                            //
+                            //         Some(cond)
+                            //     }
+                            //     None => None,
+                            // };
+                            // trace!("parsed filter: {cond:?}");
 
-                        // SELECT VALUE id FROM ...
-                        let ast = Statement::Select({
-                            SelectStatement {
-                                what: vec![SqlValue::Table(tb_name.intox())].into(),
-                                expr: Fields(
-                                    vec![sql::Field::Single {
-                                        expr: SqlValue::Idiom(Idiom::from("id")),
-                                        alias: None,
-                                    }],
-                                    // this means the `value` keyword
-                                    true,
-                                ),
-                                // order: orders.map(|x| Ordering::Order(OrderList(x))),
-                                // cond,
-                                // limit,
-                                // start,
-                                ..Default::default()
-                            }
-                        });
-                        trace!("generated query ast: {ast:?}");
-
-                        let res = gtx.process_stmt(ast).await?;
-
-                        trace!("query result: {res:?}");
-
-                        let res_vec =
-                            match res {
-                                SqlValue::Array(a) => a,
-                                v => {
-                                    error!("Found top level value, in result which should be array: {v:?}");
-                                    return Err("Internal Error".into());
+                            // SELECT VALUE id FROM ...
+                            let ast = Statement::Select({
+                                SelectStatement {
+                                    what: vec![SqlValue::Table(tb_name.intox())].into(),
+                                    expr: Fields(
+                                        vec![sql::Field::Single {
+                                            expr: SqlValue::Idiom(Idiom::from("id")),
+                                            alias: None,
+                                        }],
+                                        // this means the `value` keyword
+                                        true,
+                                    ),
+                                    // order: orders.map(|x| Ordering::Order(OrderList(x))),
+                                    // cond,
+                                    // limit,
+                                    // start,
+                                    ..Default::default()
                                 }
-                            };
+                            });
+                            trace!("generated query ast: {ast:?}");
 
-                        trace!("query result array: {res_vec:?}");
+                            let res = gtx.process_stmt(ast).await?;
 
-                        let out: Result<Vec<FieldValue>, SqlValue> = res_vec
-                            .0
-                            .into_iter()
-                            .map(|v| {
-                                v.try_as_thing().map(|t| {
-                                    let erased: ErasedRecord = (gtx.clone(), t);
-                                    field_val_erase_owned(erased)
+                            trace!("query result: {res:?}");
+
+                            let res_vec =
+                                match res {
+                                    SqlValue::Array(a) => a,
+                                    v => {
+                                        error!("Found top level value, in result which should be array: {v:?}");
+                                        return Err("Internal Error".into());
+                                    }
+                                };
+
+                            trace!("query result array: {res_vec:?}");
+
+                            let out: Result<Vec<FieldValue>, SqlValue> = res_vec
+                                .0
+                                .into_iter()
+                                .map(|v| {
+                                    v.try_as_thing().map(|t| {
+                                        let erased: ErasedRecord = (gtx.clone(), t);
+                                        field_val_erase_owned(erased)
+                                    })
                                 })
-                            })
-                            .collect();
+                                .collect();
 
-                        match out {
-                            Ok(l) => Ok(Some(FieldValue::list(l))),
-                            Err(v) => {
-                                Err(internal_error(format!("expected thing, found: {v:?}")).into())
+                            match out {
+                                Ok(l) => Ok(Some(FieldValue::list(l))),
+                                Err(v) => {
+                                    Err(internal_error(format!("expected thing, found: {v:?}")).into())
+                                }
                             }
-                        }
+                        })
+                    },
+                )
+                    .description(if let Some(ref c) = &tb.comment {
+                        format!("{c}")
+                    } else {
+                        format!("Generated from table `{}`\nallows querying a table with filters",
+                                &tb_name)
                     })
-                },
-            )
-                .description(if let Some(ref c) = &tb.comment {
-                    format!("{c}")
-                } else {
-                    format!("Generated from table `{}`\nallows querying a table with filters",
-                            &tb_name)
-                })
-                .argument(limit_input!())
-                .argument(order_input!(&tb_name))
-        );
+                    .argument(limit_input!())
+                    .argument(order_input!(&tb_name))
+                // .argument(filter_input!(&tb_name))
+            );
+        }
 
         // =======================================================
-        // Add Object types
+        // Add types
         // =======================================================
         // for loop because Type::Object needs owned obj, not a reference
         for (_, obj) in gql_objects {
@@ -601,7 +667,6 @@ pub async fn process_tbs(
         }
         types.push(Type::Object(tb_ty_obj));
 
-        if cursor { define_page_info_type!(types); } //Needed for cursor connections
         define_order_direction_enum!(types); // Needed for order_input
     }
 
@@ -1044,23 +1109,6 @@ macro_rules! filter_impl {
 		$filter = $filter.field(InputValue::new(format!("{}", $name), $ty.clone()));
 	};
 }
-
-// let mut tb_ty_obj = Object::new(tb_name_gql.clone())
-// .field(Field::new(
-// "id",
-// TypeRef::named_nn(TypeRef::ID),
-// make_table_field_resolver(
-// "id",
-// Some(Kind::Record(vec![Table::from(tb_name)])),
-// ),
-// ))
-// .implement("Record");
-// Object::new(fd_ty.type_name())
-// .description(if let Some(ref c) = fd.comment {
-// format!("{c}")
-// } else {
-// "".to_string()
-// }),
 
 //FIXME: implement
 fn page_info_resolver(
