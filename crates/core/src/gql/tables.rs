@@ -22,10 +22,10 @@ use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
 use crate::sql::{Statement, Thing};
 use async_graphql::dynamic::indexmap::IndexMap;
-use async_graphql::dynamic::FieldFuture;
 use async_graphql::dynamic::InputValue;
 use async_graphql::dynamic::TypeRef;
 use async_graphql::dynamic::{Enum, FieldValue, Type};
+use async_graphql::dynamic::{EnumItem, FieldFuture};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::types::connection::{Connection, Edge, PageInfo};
@@ -103,6 +103,45 @@ macro_rules! add_page_info_type {
     };
 }
 
+macro_rules! add_order_by_enum {
+    ($types:ident) => {
+        $types.push(Type::Enum({
+            Enum::new("OrderDirection")
+            .item(EnumItem::new("ASC").description("Specifies an ascending order for a given \
+            `orderBy` argument."))
+            .item(EnumItem::new("DESC").description("Specifies a descending order for a given \
+            `orderBy` argument."))
+            .description("Possible directions in which to order a list of \
+            items when provided and `orderBy` argument.")
+        }))
+    };
+}
+
+
+macro_rules! add_order_by_argument {
+    ($types:ident, $name:ident) => {
+        let enum_name = format!("{}OrderField", $name);
+        let order_by_enum = Enum::new(&enum_name)
+        .item(EnumItem::new("ID").description("xxx by ID."));
+
+        let obj_name = format!("{}Order", $name);
+        let order_by_obj = InputObject::new(&obj_name)
+        .field(
+            InputValue::new("field", TypeRef::named(&enum_name))
+            .description("The field to order xxx by."))
+        .field(
+            InputValue::new("direction", TypeRef::named("OrderDirection"))
+            .description("The ordering direction."))
+        .description("Ordering options for xxx xxx connections");
+
+
+        $types.push(Type::Enum(order_by_enum));
+        $types.push(Type::InputObject(order_by_obj))
+
+        // .argument(InputValue::new("orderBy", TypeRef::named(&obj_name)))
+    };
+}
+
 macro_rules! cursor_pagination {
     ($obj:ident, $types:ident, $fd_type:ident, $fd_name:ident) => {
         let edge = Object::new(format!("{}Edge", $fd_type))
@@ -154,9 +193,9 @@ macro_rules! cursor_pagination {
             .argument(InputValue::new("before", TypeRef::named(TypeRef::STRING))
                 .description("Returns the elements in the list that come before the specified cursor."))
             .argument(InputValue::new("first", TypeRef::named(TypeRef::INT))
-                .description("Returns the first n elements from the list."))
+                .description("Returns the first *n* elements from the list."))
             .argument(InputValue::new("last", TypeRef::named(TypeRef::INT))
-                .description("Returns the last n elements from the list."))
+                .description("Returns the last *n* elements from the list."))
         )
     };
 }
@@ -191,7 +230,8 @@ pub async fn process_tbs(
     cursor: bool,
 ) -> Result<Object, GqlError> {
     // Type::Any is not supported. FIXME: throw error in the future.
-    let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs.iter().partition(|tb| {
+    let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs
+        .iter().partition(|tb| {
         match tb.kind {
             TableType::Normal => true,
             TableType::Relation(_) => false,
@@ -256,14 +296,14 @@ pub async fn process_tbs(
 
             let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice(), tb_name_gql.clone())?;
 
-            trace!("field {:?}", fd);
-            trace!("idiom path: {:?}", path);
-            trace!("field_name {:?}", fd_name);
-            trace!("field_name_gql {:?}", fd_name_gql);
-            trace!("kind {:?}", kind);
-            trace!("field_type {:?}", fd_ty);
-            trace!("field_path {:?}", fd_path);
-            trace!("fd_path_parent {:?}", fd_path_parent);
+            // trace!("field {:?}", fd);
+            // trace!("idiom path: {:?}", path);
+            // trace!("field_name {:?}", fd_name);
+            // trace!("field_name_gql {:?}", fd_name_gql);
+            // trace!("kind {:?}", kind);
+            // trace!("field_type {:?}", fd_ty);
+            // trace!("field_path {:?}", fd_path);
+            // trace!("fd_path_parent {:?}", fd_path_parent);
 
             // object map used to add fields step by step to the objects
             if kind_non_optional == Kind::Object {
@@ -280,6 +320,7 @@ pub async fn process_tbs(
 
             if fd_path_parent.is_empty() { // top level field
                 match kind_non_optional {
+                    // cursor connections only if specified in config
                     Kind::Array(_, _) if cursor => {
                         if let kind = kind.inner_kind().unwrap() {
                             let ty_ref = kind_to_type(kind.clone(), types, parts.as_slice(),
@@ -388,6 +429,7 @@ pub async fn process_tbs(
         // Add filters
         // =======================================================
 
+
         // =======================================================
         // Add all instances query
         // =======================================================
@@ -395,6 +437,8 @@ pub async fn process_tbs(
         let sess2 = session.to_owned();
         let kvs2 = datastore.clone();
         let fds2 = fds.clone();
+
+        add_order_by_argument!(types, tb_name_gql);
 
         query = query.field(
             Field::new(
@@ -527,9 +571,10 @@ pub async fn process_tbs(
                 },
             )
                 .description(if let Some(ref c) = &tb.comment { format!("{c}") } else { format!("Generated from table `{}`\nallows querying a table with filters", tb.name) })
-            // .argument(limit_input!())
-            // .argument(start_input!())
-            // .argument(InputValue::new("order", TypeRef::named(&table_order_name)))
+                // .argument(limit_input!())
+                // .argument(start_input!())
+                .argument(InputValue::new("orderBy", TypeRef::named(format!("{}Order",
+                                                                            tb_name_gql))))
             // .argument(InputValue::new("filter", TypeRef::named(&table_filter_name))),
         );
 
@@ -543,6 +588,7 @@ pub async fn process_tbs(
         types.push(Type::Object(tb_ty_obj));
 
         if cursor { add_page_info_type!(types); } //Needed for cursor connections
+        add_order_by_enum!(types);
     }
 
     // =======================================================
