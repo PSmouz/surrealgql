@@ -299,6 +299,9 @@ pub async fn process_tbs(
         }
     });
 
+    // trace!("tables: {:?}", tables);
+    // trace!("relations: {:?}", relations);
+
     for tb in tables.iter() {
         let tb_name = tb.name.to_string();
         let first_tb_name = tb_name.clone();
@@ -309,7 +312,7 @@ pub async fn process_tbs(
         let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
-        trace!("fields '{:?}'", fds);
+        // trace!("fields '{:?}'", fds);
 
         let mut tb_ty_obj = Object::new(tb_name_gql.clone())
             .field(Field::new(
@@ -510,7 +513,6 @@ pub async fn process_tbs(
                 &tb_name_gql,
                 edges: []
                 args: [
-                    limit_input!(),
                     order_input!(&tb_name)
                 ]
             );
@@ -668,7 +670,37 @@ pub async fn process_tbs(
         types.push(Type::Object(tb_ty_obj));
 
         define_order_direction_enum!(types); // Needed for order_input
+
+        // =======================================================
+        // Add types
+        // =======================================================
+
+        // for rel in relations.iter().filter(|stmt| {
+        //     if let TableType::Relation(r) = &stmt.kind {
+        //         match &r.from {
+        //             Some(Kind::Record(tbs)) => {
+        //                 tbs.iter().any(|from| from.0 == tb.name.to_raw())
+        //             }
+        //             _ => false,
+        //         }
+        //     } else {
+        //         false
+        //     }
+        // }) {
+        //     // trace!("table: {:?}", tb.name.clone());
+        //     // trace!("relation: {:?}", rel);
+        //
+        //     let mut xxx: BTreeMap<String, Object> = BTreeMap::new();
+        //
+        //     let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
+        //
+        //     for fd in fds.iter() {
+        //         trace!("field: {:?}", fd);
+        //         // FIXME: we need union for possible node type for cursor as out is vector
+        //     }
+        // }
     }
+
 
     Ok(query)
 }
