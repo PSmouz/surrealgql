@@ -357,7 +357,12 @@ pub async fn process_tbs(
                 .to_string();
             let fd_path_parent = remove_last_segment(&*fd_path.as_str());
 
-            let fd_ty = kind_to_type(kind.clone(), types, parts.as_slice(), tb_name_gql.clone())?;
+            // Use table name for e.g., object uniqueness across multiple tables
+            let mut path = Vec::with_capacity(parts.len() + 1);
+            path.push(&Ident::from(tb_name.clone()));
+            path.extend_from_slice(parts.as_slice());
+
+            let fd_ty = kind_to_type(kind.clone(), types, path.as_slice())?;
 
             // trace!("field {:?}", fd);
             // trace!("idiom path: {:?}", path);
@@ -386,8 +391,7 @@ pub async fn process_tbs(
                     // cursor connections only if specified in config
                     Kind::Array(_, _) if cursor => {
                         if let kind = kind.inner_kind().unwrap() {
-                            let ty_ref = kind_to_type(kind.clone(), types, parts.as_slice(),
-                                                      tb_name_gql.clone())?;
+                            let ty_ref = kind_to_type(kind.clone(), types, path.as_slice())?;
                             let ty_name = ty_ref.type_name();
                             cursor_pagination!(tb_ty_obj, types, fd_name_gql, ty_name, edges: []
                                 args: []); // maybe overload macro definition for non-edges/args
@@ -672,7 +676,7 @@ pub async fn process_tbs(
         define_order_direction_enum!(types); // Needed for order_input
 
         // =======================================================
-        // Add types
+        // Add relations
         // =======================================================
 
         // for rel in relations.iter().filter(|stmt| {
