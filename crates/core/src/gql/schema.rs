@@ -426,9 +426,11 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
     Ok(out)
 }
 
-pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident], tb: String) ->
+pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) ->
 Result<TypeRef,
     GqlError> {
+    let ty_name = path.iter().map(|i| i.0.to_string())
+        .collect::<Vec<_>>().join(".").to_pascal_case();
     let (optional, match_kind) = match kind {
         Kind::Option(op_ty) => (true, *op_ty),
         _ => (false, kind),
@@ -444,11 +446,7 @@ Result<TypeRef,
         Kind::Float => TypeRef::named(TypeRef::FLOAT),
         Kind::Int => TypeRef::named(TypeRef::INT),
         Kind::Number => TypeRef::named("Number"),
-        Kind::Object => {
-            let mut ty_name = path.iter().map(|i| i.0.to_string()).collect::<Vec<_>>().join(".");
-            // Use table name for object uniqueness across multiple tables
-            TypeRef::named(format!("{}{}Object", tb, ty_name.to_pascal_case()))
-        }
+        Kind::Object => TypeRef::named(format!("{}Object", ty_name)),
         Kind::Point => TypeRef::named("GeometryPoint"),
         Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
         Kind::String => TypeRef::named(TypeRef::STRING),
@@ -458,21 +456,16 @@ Result<TypeRef,
             1 => TypeRef::named(r.pop().unwrap().0.to_pascal_case()),
             _ => {
                 let names: Vec<String> = r.into_iter().map(|t| t.0.to_pascal_case()).collect();
-                // let ty_name = field_name
-                //     .unwrap_or("Unnamed")
-                //     .to_string()
-                //     .to_pascal_case();
-                // FIXME
-                let ty_name = "Record";
 
-                let mut tmp_union = Union::new(format!("{}Union", ty_name))
+                let union_name = format!("{}RecordUnion", ty_name);
+                let mut tmp_union = Union::new(&union_name)
                     .description(format!("A record which is one of: {}", names.join(", ")));
                 for n in names {
                     tmp_union = tmp_union.possible_type(n);
                 }
 
                 types.push(Type::Union(tmp_union));
-                TypeRef::named(ty_name)
+                TypeRef::named(union_name)
             }
         },
         Kind::Geometry(g) => match g.len() {
@@ -486,14 +479,16 @@ Result<TypeRef,
                     .iter()
                     .map(|n| geometry_kind_name_to_type_name(n).map(TypeRef::named))
                     .collect::<Result<Vec<_>, GqlError>>()?;
-                //FIXME:
-                let geo_union_name = format!("geometry_{}", g.join("_"));
-                let mut geo_union = Union::new(&geo_union_name);
+
+                let union_name = format!("{}Union", ty_name);
+                let mut tmp_union = Union::new(&union_name)
+                    .description(format!("A geometry which is one of: {}",
+                                         geo_types.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")));
                 for geo_type in geo_types {
-                    geo_union = geo_union.possible_type(geo_type.type_name())
+                    tmp_union = tmp_union.possible_type(geo_type.type_name())
                 }
-                types.push(Type::Union(geo_union));
-                TypeRef::named(geo_union_name)
+                types.push(Type::Union(tmp_union));
+                TypeRef::named(union_name)
             }
         },
         Kind::Option(t) => {
@@ -501,7 +496,7 @@ Result<TypeRef,
             while let Kind::Option(inner) = non_op_ty {
                 non_op_ty = *inner;
             }
-            kind_to_type(non_op_ty, types, path, tb)?
+            kind_to_type(non_op_ty, types, path)?
         }
         Kind::Either(ks) => {
             let (ls, others): (Vec<Kind>, Vec<Kind>) =
@@ -520,40 +515,27 @@ Result<TypeRef,
                     })
                     .collect();
 
-                // FIXME
-                let ty_name = "Either";
-
-                let description = format!(
-                    "Represents one of the following states: {}",
-                    vals.join(", ")
-                );
-
-                let tmp = Enum::new(format!("{}Enum", ty_name))
-                    .description(description)
+                let enum_name = format!("{}Enum", ty_name);
+                let tmp_enum = Enum::new(&enum_name)
+                    .description(format!("Represents one of the following states: {}", vals.join(", ")))
                     .items(vals);
 
-                let enum_ty = tmp.type_name().to_string();
-
-                types.push(Type::Enum(tmp));
+                types.push(Type::Enum(tmp_enum));
                 if others.is_empty() {
-                    return Ok(TypeRef::named(enum_ty));
+                    return Ok(TypeRef::named(enum_name));
                 }
-                Some(enum_ty)
+                Some(enum_name)
             } else {
                 None
             };
 
             let pos_names: Result<Vec<TypeRef>, GqlError> =
-                others.into_iter().map(|k| kind_to_type(k, types, path, tb.clone())).collect();
+                others.into_iter().map(|k| kind_to_type(k, types, path)).collect();
             let pos_names: Vec<String> = pos_names?.into_iter().map(|tr| tr.to_string()).collect();
-            // FIXME
-            let ty_name = "Either";
-            // let ty_name = field_name
-            //     .unwrap_or("Unnamed")
-            //     .to_string()
-            //     .to_pascal_case();
 
-            let mut tmp_union = Union::new(format!("{}Union", ty_name));
+            let union_name = format!("{}Union", ty_name);
+            let mut tmp_union = Union::new(&union_name)
+                .description(format!("A union of: {}", pos_names.join(", ")));
             for n in pos_names {
                 tmp_union = tmp_union.possible_type(n);
             }
@@ -563,13 +545,13 @@ Result<TypeRef,
             }
 
             types.push(Type::Union(tmp_union));
-            TypeRef::named(ty_name)
+            TypeRef::named(union_name)
         }
         Kind::Set(_, _) => return Err(schema_error("Kind::Set is not yet supported")),
-        Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types, path, tb)?)),
+        Kind::Array(k, _) => TypeRef::List(Box::new(kind_to_type(*k, types, path)?)),
         Kind::Function(_, _) => return Err(schema_error("Kind::Function is not yet supported")),
         Kind::Range => return Err(schema_error("Kind::Range is not yet supported")),
-        // TODO(raphaeldarley): check if union is of literals and generate enum
+        //TODO(raphaeldarley): check if union is of literals and generate enum
         // generate custom scalar from other literals?
         Kind::Literal(_) => return Err(schema_error("Kind::Literal is not yet supported")),
         Kind::References(ft, _) => {
@@ -577,8 +559,7 @@ Result<TypeRef,
                 Some(ft) => Kind::Record(vec![ft]),
                 None => Kind::Record(vec![]),
             };
-
-            TypeRef::List(Box::new(kind_to_type(inner, types, path, tb)?))
+            TypeRef::List(Box::new(kind_to_type(inner, types, path)?))
         }
         Kind::File(_) => return Err(schema_error("Kind::File is not yet supported")),
     };
