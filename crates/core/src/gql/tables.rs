@@ -778,8 +778,7 @@ pub async fn process_tbs(
                     "id" => false,
                     _ => true,
                 }
-            })
-            {
+            }) {
                 trace!("relation_field: {:?}", fd);
                 let kind = match fd.kind.clone() {
                     Some(k) => k,
@@ -896,9 +895,10 @@ pub async fn process_tbs(
                 tmp_union.type_name(),
                 edge_fields: fd_vec,
                 args: [
-                    // order_input!(&rel.name)
+                    order_input!(&rel.name)
                 ]
             );
+            define_order_input_types!(types, rel.name.to_raw(),);
 
             for (_, obj) in fd_map {
                 types.push(Type::Object(obj));
