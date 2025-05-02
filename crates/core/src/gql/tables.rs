@@ -880,30 +880,42 @@ pub async fn process_tbs(
 
             // kind_to_type(Kind::Object, types, &[])?;
 
-            // Output type for the connection, union of all the `to` tables.
-            let mut tmp_union = Union::new(format!("{}Union", rel.name.to_raw().to_pascal_case()));
-            for n in outs {
-                tmp_union = tmp_union.possible_type(n.0.to_string().to_pascal_case());
-                trace!("xyz: {}", n.0.to_string().to_pascal_case());
-            }
-            // type name for the connection, possible union of the records
+            // Node type for the relation connection
+            let node_ty_name = match outs.len() {
+                // we have only one `to` table, thus we can use the object type directly
+                1 => outs.first().unwrap().to_string().to_pascal_case(),
+                // we have more than one `to` table, thus we need a union type
+                _ => {
+                    let mut tmp_union = Union::new(format!("{}Union", rel.name.to_raw().to_pascal_case()));
+                    for n in outs {
+                        tmp_union = tmp_union.possible_type(n.0.to_string().to_pascal_case());
+                        trace!("xyz: {}", n.0.to_string().to_pascal_case());
+                    }
+                    // async_graphql types do not implement clone, thus we need to get the typename
+                    // before the move
+                    let union_name = tmp_union.type_name().to_string();
+                    types.push(Type::Union(tmp_union));
+
+                    union_name
+                }
+            };
 
             cursor_pagination!(
                 tb_ty_obj,
                 types,
                 rel.name.to_raw().to_camel_case().to_plural(), // fieldname
-                tmp_union.type_name(),
+                &node_ty_name,
                 edge_fields: fd_vec,
                 args: [
                     order_input!(&rel.name)
                 ]
             );
+
             define_order_input_types!(types, rel.name.to_raw(),);
 
             for (_, obj) in fd_map {
                 types.push(Type::Object(obj));
             }
-            types.push(Type::Union(tmp_union));
         }
 
         // =======================================================
