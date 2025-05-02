@@ -22,12 +22,12 @@ use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
 use crate::sql::{Statement, Thing};
 use async_graphql::dynamic::indexmap::IndexMap;
-use async_graphql::dynamic::InputValue;
 use async_graphql::dynamic::TypeRef;
 use async_graphql::dynamic::{Enum, FieldValue, Type};
 use async_graphql::dynamic::{EnumItem, FieldFuture};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
+use async_graphql::dynamic::{InputValue, Union};
 use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
@@ -94,6 +94,7 @@ macro_rules! order_input {
         .description(format!("Ordering options for `{}` connections.", $name))
 	};
 }
+//todo: fix here xxOrder type not found
 
 macro_rules! filter_input {
 	($name: expr) => {
@@ -187,7 +188,7 @@ macro_rules! define_order_input_types {
 /// Adds a connection field to the specified object.
 ///
 /// # Parameters
-/// - `obj`: The object to which the connection field is added.
+/// - (`obj`: The object to which the connection field is added.)
 /// - `types`: The types vector to which the connection and edge types are added.
 /// - `fd_name`: The name of the connection field.
 /// - `node_ty_name`: The name of the node type.
@@ -203,7 +204,7 @@ macro_rules! cursor_pagination {
         $node_ty_name:expr,
         //TODO
         // $connection_resolver:expr,      // The actual resolver for the connection field on $obj
-        edges: [ $( $extra_edge_field:expr ),* $(,)? ]
+        edge_fields: $edge_fields_expr:expr,
         args: [ $( $extra_connection_arg:expr ),* $(,)? ]
     ) => {
         let mut edge = Object::new(format!("{}Edge", $node_ty_name))
@@ -218,7 +219,10 @@ macro_rules! cursor_pagination {
                 page_info_resolver("".to_string(), None),
             ).description("The item at the end of the edge."))
             .description("An edge in a connection.");
-        $( edge = edge.field($extra_edge_field); )*
+        //$( // edge = edge.field($extra_edge_field); )*
+        for fd in $edge_fields_expr {
+            edge = edge.field(fd);
+        }
 
         let connection = Object::new(format!("{}Connection", $node_ty_name))
             .field(Field::new(
@@ -251,12 +255,76 @@ macro_rules! cursor_pagination {
                 TypeRef::named_nn(format!("{}Connection", $node_ty_name)),
                 page_info_resolver("".to_string(), None),
             )
+            .description(format!("The connection object for the table `{}`", $fd_name))
             .argument(after_input!())
             .argument(before_input!())
             .argument(first_input!())
             .argument(last_input!())
             $(.argument($extra_connection_arg))*
-        )
+        );
+    };
+    (
+        $types:ident,
+        $fd_name:expr,
+        $node_ty_name:expr,
+        //TODO
+        // $connection_resolver:expr,      // The actual resolver for the connection field on $obj
+        edges: [ $( $extra_edge_field:expr ),* $(,)? ]
+        args: [ $( $extra_connection_arg:expr ),* $(,)? ]
+    ) => {
+        {
+            let mut edge = Object::new(format!("{}Edge", $node_ty_name))
+                .field(Field::new(
+                    "cursor",
+                    TypeRef::named_nn(TypeRef::STRING),
+                    page_info_resolver("".to_string(), None),
+                ).description("A cursor for use in pagination."))
+                .field(Field::new(
+                    "node",
+                    TypeRef::named($node_ty_name),
+                    page_info_resolver("".to_string(), None),
+                ).description("The item at the end of the edge."))
+                .description("An edge in a connection.");
+            $( edge = edge.field($extra_edge_field); )*
+
+            let connection = Object::new(format!("{}Connection", $node_ty_name))
+                .field(Field::new(
+                    "edges",
+                    TypeRef::named_list(format!("{}Edge", $node_ty_name)),
+                    page_info_resolver("".to_string(), None),
+                ).description("A list of edges."))
+                .field(Field::new(
+                    "nodes",
+                    TypeRef::named_list($node_ty_name),
+                    page_info_resolver("".to_string(), None),
+                ).description("A list of nodes."))
+                .field(Field::new(
+                    "pageInfo",
+                    TypeRef::named_nn("PageInfo"),
+                    page_info_resolver("".to_string(), None),
+                ).description("Information to aid in pagination."))
+                .field(Field::new(
+                    "totalCount",
+                    TypeRef::named_nn(TypeRef::INT),
+                    page_info_resolver("".to_string(), None),
+                ).description("Identifies the total count of items in the connection."))
+                .description(format!("The connection type for {}.", $node_ty_name));
+
+            $types.push(Type::Object(edge));
+            $types.push(Type::Object(connection));
+
+            Field::new(
+                $fd_name,
+                TypeRef::named_nn(format!("{}Connection", $node_ty_name)),
+                page_info_resolver("".to_string(), None),
+            )
+            .description(format!("The connection object for the table `{}`", $fd_name))
+            .argument(after_input!())
+            .argument(before_input!())
+            .argument(first_input!())
+            .argument(last_input!())
+            $(.argument($extra_connection_arg))*
+        }
     };
 }
 
@@ -307,9 +375,10 @@ pub async fn process_tbs(
         let first_tb_name = tb_name.clone();
         let second_tb_name = tb_name.clone();
         let tb_name_gql = tb_name.to_pascal_case();
-        let tb_name_query = tb_name.to_camel_case();
+        let tb_name_query = tb_name.to_camel_case(); // field name for the table in the query
 
         let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
+        let mut gql_fields: Vec<Field> = Vec::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
         // trace!("fields '{:?}'", fds);
@@ -337,9 +406,8 @@ pub async fn process_tbs(
                 None => continue
             };
             let kind_non_optional = kind.non_optional().clone();
-            let path = fd.name.clone(); // maybe inline
 
-            let parts: Vec<&Ident> = path.0.iter().filter_map(|part| match part {
+            let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
                 Part::Field(ident) => Some(ident),
                 _ => None
             }).collect();
@@ -359,7 +427,8 @@ pub async fn process_tbs(
 
             // Use table name for e.g., object uniqueness across multiple tables
             let mut path = Vec::with_capacity(parts.len() + 1);
-            path.push(&Ident::from(tb_name.clone()));
+            let table_ident = Ident::from(tb_name.clone());
+            path.push(&table_ident);
             path.extend_from_slice(parts.as_slice());
 
             let fd_ty = kind_to_type(kind.clone(), types, path.as_slice())?;
@@ -393,10 +462,9 @@ pub async fn process_tbs(
                         if let kind = kind.inner_kind().unwrap() {
                             let ty_ref = kind_to_type(kind.clone(), types, path.as_slice())?;
                             let ty_name = ty_ref.type_name();
-                            cursor_pagination!(tb_ty_obj, types, fd_name_gql, ty_name, edges: []
+                            cursor_pagination!(tb_ty_obj, types, &fd_name_gql, ty_name,
+                                edge_fields: [],
                                 args: []); // maybe overload macro definition for non-edges/args
-                        } else {
-                            return Err(internal_error("Kind Array has no inner type."));
                         }
                     }
                     _ => {
@@ -437,6 +505,11 @@ pub async fn process_tbs(
                     None => return Err(internal_error("Nested field should have parent object.")),
                 }
             }
+        }
+
+        // maybe move somewhere else??!?!?
+        for fd in gql_fields {
+            tb_ty_obj = tb_ty_obj.field(fd);
         }
 
         // =======================================================
@@ -515,7 +588,7 @@ pub async fn process_tbs(
                 types,
                 tb_name_query.to_plural(),
                 &tb_name_gql,
-                edges: []
+                edge_fields: [],
                 args: [
                     order_input!(&tb_name)
                 ]
@@ -665,6 +738,175 @@ pub async fn process_tbs(
         }
 
         // =======================================================
+        // Add relations
+        // =======================================================
+
+        for rel in relations.iter().filter(|stmt| {
+            match &stmt.kind {
+                TableType::Relation(r) => match &r.from {
+                    Some(Kind::Record(tbs)) => tbs.contains(&Table::from(tb_name.clone())),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }) {
+            // trace!("table: {:?}", tb.name.clone());
+            trace!("relation: {:?}", rel);
+
+            let (ins, outs) = match &rel.kind {
+                TableType::Relation(r) => match (&r.from, &r.to) {
+                    (Some(Kind::Record(from)), Some(Kind::Record(to))) => (from, to),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+
+            trace!("outs: {:?}", outs);
+            trace!("ins: {:?}", ins);
+
+            let mut fd_map: BTreeMap<String, Object> = BTreeMap::new();
+            let mut fd_vec = Vec::<Field>::new();
+
+            let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
+
+            //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
+            // possible performance improvements by skipping fields for prev relations
+            for fd in fds.iter().filter(|fd| {
+                match fd.name.to_string().as_str() {
+                    "in" => false,
+                    "out" => false,
+                    "id" => false,
+                    _ => true,
+                }
+            })
+            {
+                trace!("relation_field: {:?}", fd);
+                let kind = match fd.kind.clone() {
+                    Some(k) => k,
+                    None => continue
+                };
+                let kind_non_optional = kind.non_optional().clone();
+
+                let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
+                    Part::Field(ident) => Some(ident),
+                    _ => None
+                }).collect();
+
+                // Should always contain at least the field name
+                if parts.is_empty() { continue; }
+
+                let fd_name = parts.as_slice().last().unwrap().to_string();
+                let fd_name_gql = fd_name.to_camel_case();
+
+                let fd_path = fd.name.to_path()
+                    .replace("/", ".")
+                    .strip_prefix(".")
+                    .unwrap()
+                    .to_string();
+                let fd_path_parent = remove_last_segment(&*fd_path.as_str());
+
+                // Use table name for e.g., object uniqueness across multiple tables
+                let mut path = Vec::with_capacity(parts.len() + 1);
+                let table_ident = Ident::from(tb_name.clone());
+                path.push(&table_ident);
+                path.extend_from_slice(parts.as_slice());
+
+                let fd_ty = kind_to_type(kind.clone(), types, path.as_slice())?;
+
+                // object map used to add fields step by step to the objects
+                if kind_non_optional == Kind::Object {
+                    fd_map.insert(
+                        fd_path.clone(),
+                        Object::new(fd_ty.type_name())
+                            .description(if let Some(ref c) = fd.comment {
+                                format!("{c}")
+                            } else {
+                                "".to_string()
+                            }),
+                    );
+                }
+
+                if fd_path_parent.is_empty() { // top level field
+                    match kind_non_optional {
+                        // cursor connections only if specified in config
+                        Kind::Array(_, _) if cursor => {
+                            if let kind = kind.inner_kind().unwrap() {
+                                let ty_ref = kind_to_type(kind.clone(), types, path.as_slice())?;
+                                let ty_name = ty_ref.type_name();
+                                fd_vec.push(
+                                    cursor_pagination!(types, &fd_name_gql, ty_name, edges: []
+                                args: []) // maybe overload macro definition for non-edges/args
+                                );
+                            }
+                        }
+                        _ => {
+                            fd_vec.push(
+                                Field::new(
+                                    fd_name_gql,
+                                    fd_ty,
+                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
+                                ).description(if let Some(ref c) = fd.comment {
+                                    format!("{c}")
+                                } else {
+                                    "".to_string()
+                                })
+                            );
+                        }
+                    }
+                } else { // nested field
+                    // Array inner type is scalar, thus already set when adding the list field
+                    if fd_path.chars().last() == Some('*') { continue; }
+
+                    // expects the parent's `DefineFieldStatement` to come before its children as is
+                    // with `tx.all_tb_fields()`
+                    match fd_map.remove(&fd_path_parent) {
+                        Some(obj) => {
+                            fd_map.insert(fd_path_parent.clone(), Object::from(obj)
+                                .field(Field::new(
+                                    fd_name_gql,
+                                    fd_ty,
+                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
+                                ))
+                                .description(if let Some(ref c) = fd.comment {
+                                    format!("{c}")
+                                } else {
+                                    "".to_string()
+                                }),
+                            );
+                        }
+                        None => return Err(internal_error("Nested field should have parent object.")),
+                    }
+                }
+            }
+
+            // kind_to_type(Kind::Object, types, &[])?;
+
+            // Output type for the connection, union of all the `to` tables.
+            let mut tmp_union = Union::new(format!("{}Union", rel.name.to_raw().to_pascal_case()));
+            for n in outs {
+                tmp_union = tmp_union.possible_type(n.0.to_string().to_pascal_case());
+                trace!("xyz: {}", n.0.to_string().to_pascal_case());
+            }
+            // type name for the connection, possible union of the records
+
+            cursor_pagination!(
+                tb_ty_obj,
+                types,
+                rel.name.to_raw().to_camel_case().to_plural(), // fieldname
+                tmp_union.type_name(),
+                edge_fields: fd_vec,
+                args: [
+                    // order_input!(&rel.name)
+                ]
+            );
+
+            for (_, obj) in fd_map {
+                types.push(Type::Object(obj));
+            }
+            types.push(Type::Union(tmp_union));
+        }
+
+        // =======================================================
         // Add types
         // =======================================================
         // for loop because Type::Object needs owned obj, not a reference
@@ -674,112 +916,11 @@ pub async fn process_tbs(
         types.push(Type::Object(tb_ty_obj));
 
         define_order_direction_enum!(types); // Needed for order_input
-
-        // =======================================================
-        // Add relations
-        // =======================================================
-
-        // for rel in relations.iter().filter(|stmt| {
-        //     if let TableType::Relation(r) = &stmt.kind {
-        //         match &r.from {
-        //             Some(Kind::Record(tbs)) => {
-        //                 tbs.iter().any(|from| from.0 == tb.name.to_raw())
-        //             }
-        //             _ => false,
-        //         }
-        //     } else {
-        //         false
-        //     }
-        // }) {
-        //     // trace!("table: {:?}", tb.name.clone());
-        //     // trace!("relation: {:?}", rel);
-        //
-        //     let mut xxx: BTreeMap<String, Object> = BTreeMap::new();
-        //
-        //     let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
-        //
-        //     for fd in fds.iter() {
-        //         trace!("field: {:?}", fd);
-        //         // FIXME: we need union for possible node type for cursor as out is vector
-        //     }
-        // }
     }
 
 
     Ok(query)
 }
-
-
-// =======================================================
-// Pass 2: Define Inputs, Enums, Query Fields
-// =======================================================
-// trace!("Starting Pass 2: Defining Inputs, Enums, Queries");
-// let mut generated_filter_inputs: BTreeMap<String, Type> = BTreeMap::new(); // Avoid duplicate filter defs
-// let mut generated_order_inputs: BTreeMap<String, Type> = BTreeMap::new();
-// let mut generated_orderable_enums: BTreeMap<String, Type> = BTreeMap::new();
-//
-// // Define base scalar filters if not already present (do this once)
-// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IDFilterInput")) {
-//     types.push(Type::InputObject(filter_id())); // Assuming filter_id() defines IDFilterInput
-// }
-// // Add other base filters like StringFilterInput, IntFilterInput etc. Ensure they are defined once.
-// // Example (needs proper implementation in filter_from_type or similar):
-// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "StringFilterInput")) {
-//     let string_filter = filter_from_type(Kind::String, "StringFilterInput".to_string(), types)?;
-//     generated_filter_inputs.insert("StringFilterInput".to_string(), Type::InputObject(string_filter));
-// }
-// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "IntFilterInput")) {
-//     let int_filter = filter_from_type(Kind::Int, "IntFilterInput".to_string(), types)?;
-//     generated_filter_inputs.insert("IntFilterInput".to_string(), Type::InputObject(int_filter));
-// }
-// if !types.iter().any(|t| matches!(t, Type::InputObject(io) if io.type_name() == "DateTimeFilterInput")) {
-//     let dt_filter = filter_from_type(Kind::Datetime, "DateTimeFilterInput".to_string(), types)?;
-//     generated_filter_inputs.insert("DateTimeFilterInput".to_string(), Type::InputObject(dt_filter));
-// }
-// // Add BooleanFilterInput, FloatFilterInput etc.
-//
-
-
-//
-//     // Single query field (e.g., image)
-//     let single_query_name = table_name_str.to_camel_case();
-//     trace!("Pass 2: Defining single query '{}'", single_query_name);
-//     let sess2 = session.to_owned();
-//     let kvs2 = datastore.clone();
-//     let table_name_clone2 = table_name_str.clone();
-//     query = query.field(
-//         Field::new(
-//             single_query_name,
-//             TypeRef::named(&table_pascal), // Correct type ref
-//             move |ctx| { // Resolver logic remains largely the same
-//                 let tb_name = table_name_clone2.clone();
-//                 let kvs2 = kvs2.clone();
-//                 let sess2 = sess2.clone();
-//                 FieldFuture::new(async move {
-//                     // ... (fetch by ID as before) ...
-//                     let gtx = GQLTx::new(&kvs2, &sess2).await?;
-//                     let args = ctx.args.as_index_map();
-//                     let id_val = args.get("id").ok_or_else(|| internal_error("Missing ID argument"))?;
-//                     let id = id_val.as_string().ok_or_else(|| internal_error("ID must be a string"))?;
-//
-//                     let thing = match Thing::try_from(id.clone()) {
-//                         Ok(t) => t,
-//                         Err(_) => Thing::from((tb_name, id)),
-//                     };
-//                     match gtx.get_record_field(thing, "id").await? {
-//                         SqlValue::Thing(t) => Ok(Some(field_val_erase_owned((gtx, t)))),
-//                         _ => Ok(None),
-//                     }
-//                 })
-//             },
-//         )
-//             .argument(id_input!()), //     );
-// } // End Pass 2 loop
-
-// types.extend(generated_filter_inputs.into_values());
-// types.extend(generated_order_inputs.into_values());
-// types.extend(generated_orderable_enums.into_values());
-
 
 fn make_table_field_resolver(
     // fd_name: impl Into<String>,
