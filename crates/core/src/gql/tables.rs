@@ -198,78 +198,12 @@ macro_rules! define_order_input_types {
 #[macro_export]
 macro_rules! cursor_pagination {
     (
-        $obj:ident,
         $types:ident,
         $fd_name:expr,
         $node_ty_name:expr,
         //TODO
         // $connection_resolver:expr,      // The actual resolver for the connection field on $obj
         edge_fields: $edge_fields_expr:expr,
-        args: [ $( $extra_connection_arg:expr ),* $(,)? ]
-    ) => {
-        let mut edge = Object::new(format!("{}Edge", $node_ty_name))
-            .field(Field::new(
-                "cursor",
-                TypeRef::named_nn(TypeRef::STRING),
-                page_info_resolver("".to_string(), None),
-            ).description("A cursor for use in pagination."))
-            .field(Field::new(
-                "node",
-                TypeRef::named($node_ty_name),
-                page_info_resolver("".to_string(), None),
-            ).description("The item at the end of the edge."))
-            .description("An edge in a connection.");
-        //$( // edge = edge.field($extra_edge_field); )*
-        for fd in $edge_fields_expr {
-            edge = edge.field(fd);
-        }
-
-        let connection = Object::new(format!("{}Connection", $node_ty_name))
-            .field(Field::new(
-                "edges",
-                TypeRef::named_list(format!("{}Edge", $node_ty_name)),
-                page_info_resolver("".to_string(), None),
-            ).description("A list of edges."))
-            .field(Field::new(
-                "nodes",
-                TypeRef::named_list($node_ty_name),
-                page_info_resolver("".to_string(), None),
-            ).description("A list of nodes."))
-            .field(Field::new(
-                "pageInfo",
-                TypeRef::named_nn("PageInfo"),
-                page_info_resolver("".to_string(), None),
-            ).description("Information to aid in pagination."))
-            .field(Field::new(
-                "totalCount",
-                TypeRef::named_nn(TypeRef::INT),
-                page_info_resolver("".to_string(), None),
-            ).description("Identifies the total count of items in the connection."))
-            .description(format!("The connection type for {}.", $node_ty_name));
-
-        $types.push(Type::Object(edge));
-        $types.push(Type::Object(connection));
-        $obj = $obj.field(
-            Field::new(
-                $fd_name,
-                TypeRef::named_nn(format!("{}Connection", $node_ty_name)),
-                page_info_resolver("".to_string(), None),
-            )
-            .description(format!("The connection object for the table `{}`", $fd_name))
-            .argument(after_input!())
-            .argument(before_input!())
-            .argument(first_input!())
-            .argument(last_input!())
-            $(.argument($extra_connection_arg))*
-        );
-    };
-    (
-        $types:ident,
-        $fd_name:expr,
-        $node_ty_name:expr,
-        //TODO
-        // $connection_resolver:expr,      // The actual resolver for the connection field on $obj
-        edges: [ $( $extra_edge_field:expr ),* $(,)? ]
         args: [ $( $extra_connection_arg:expr ),* $(,)? ]
     ) => {
         {
@@ -285,7 +219,9 @@ macro_rules! cursor_pagination {
                     page_info_resolver("".to_string(), None),
                 ).description("The item at the end of the edge."))
                 .description("An edge in a connection.");
-            $( edge = edge.field($extra_edge_field); )*
+            for fd in $edge_fields_expr {
+                edge = edge.field(fd);
+            }
 
             let connection = Object::new(format!("{}Connection", $node_ty_name))
                 .field(Field::new(
@@ -324,6 +260,127 @@ macro_rules! cursor_pagination {
             .argument(first_input!())
             .argument(last_input!())
             $(.argument($extra_connection_arg))*
+        }
+    };
+}
+
+/// This macro is used to parse a field definition and add it to the object map.
+/// It handles different kinds of fields, including nested fields and array fields.
+/// It also manages the creation of connection fields for array types.
+///
+/// # Parameters
+/// - `$fd`: The field definition to parse.
+/// - `$types`: The types vector to which the field type is added.
+/// - `$cursor`: A boolean indicating whether to use cursor pagination.
+/// - `$tb_name`: The name of the table.
+/// - `$map`: The object map to which the field is added.
+/// - `$field_ident`: The identifier for the field.
+/// - `$action_tokens`: The action tokens to execute after parsing the field.
+macro_rules! parse_field {
+    (
+        $fd:ident,
+        $types:ident,
+        $cursor:ident,
+        $tb_name:ident,
+        $map:ident,
+        |$field_ident:ident| $($action_tokens:tt)*
+    ) => {
+        let kind = match $fd.kind.clone() {
+            Some(k) => k,
+            None => continue
+        };
+        let kind_non_optional = kind.non_optional().clone();
+
+        let parts: Vec<&Ident> = $fd.name.0.iter().filter_map(|part| match part {
+            Part::Field(ident) => Some(ident),
+            _ => None
+        }).collect();
+
+        // Should always contain at least the field name
+        if parts.is_empty() { continue; }
+
+        let fd_name = parts.as_slice().last().unwrap().to_string();
+        let fd_name_gql = fd_name.to_camel_case();
+
+        let fd_path = $fd.name.to_path()
+            .replace("/", ".")
+            .strip_prefix(".")
+            .unwrap()
+            .to_string();
+        let fd_path_parent = remove_last_segment(&*fd_path.as_str());
+
+        // Use table name for e.g., object uniqueness across multiple tables //TODO: not needed
+        // for rel fields i think
+        let mut path = Vec::with_capacity(parts.len() + 1);
+        let table_ident = Ident::from($tb_name.clone());
+        path.push(&table_ident);
+        path.extend_from_slice(parts.as_slice());
+
+        let fd_ty = kind_to_type(kind.clone(), $types, path.as_slice())?;
+
+        // object map used to add fields step by step to the objects
+        if kind_non_optional == Kind::Object {
+            $map.insert(
+                fd_path.clone(),
+                Object::new(fd_ty.type_name())
+                    .description(if let Some(ref c) = $fd.comment {
+                        format!("{c}")
+                    } else {
+                        "".to_string()
+                    }),
+            );
+        }
+
+        if fd_path_parent.is_empty() { // top level field
+            match kind_non_optional {
+                // cursor connections only if specified in config
+                Kind::Array(_, _) if $cursor => {
+                    if let kind = kind.inner_kind().unwrap() {
+                        let ty_ref = kind_to_type(kind.clone(), $types, path.as_slice())?;
+                        let ty_name = ty_ref.type_name();
+
+                        let $field_ident = cursor_pagination!($types, &fd_name_gql, ty_name,
+                        edge_fields: [], args: []);
+                        $($action_tokens)*;
+                    }
+                }
+                _ => {
+                     let $field_ident = Field::new(
+                            fd_name_gql,
+                            fd_ty,
+                            make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                        )
+                        .description(if let Some(ref c) = $fd.comment {
+                            format!("{c}")
+                        } else {
+                            "".to_string()
+                        });
+                    $($action_tokens)*;
+                }
+            }
+        } else { // nested field
+            // Array inner type is scalar, thus already set when adding the list field
+            if fd_path.chars().last() == Some('*') { continue; }
+
+            // expects the parent's `DefineFieldStatement` to come before its children as is
+            // with `tx.all_tb_fields()`
+            match $map.remove(&fd_path_parent) {
+                Some(obj) => {
+                    $map.insert(fd_path_parent.clone(), Object::from(obj)
+                        .field(Field::new(
+                            fd_name_gql,
+                            fd_ty,
+                            make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                        ))
+                        .description(if let Some(ref c) = $fd.comment {
+                            format!("{c}")
+                        } else {
+                            "".to_string()
+                        }),
+                    );
+                }
+                None => return Err(internal_error("Nested field should have parent object.")),
+            }
         }
     };
 }
@@ -401,110 +458,8 @@ pub async fn process_tbs(
             // We have already defined "id", so we don't take any new definition for it.
             if fd.name.is_id() { continue; };
 
-            let kind = match fd.kind.clone() {
-                Some(k) => k,
-                None => continue
-            };
-            let kind_non_optional = kind.non_optional().clone();
-
-            let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
-                Part::Field(ident) => Some(ident),
-                _ => None
-            }).collect();
-
-            // Should always contain at least the field name
-            if parts.is_empty() { continue; }
-
-            let fd_name = parts.as_slice().last().unwrap().to_string();
-            let fd_name_gql = fd_name.to_camel_case();
-
-            let fd_path = fd.name.to_path()
-                .replace("/", ".")
-                .strip_prefix(".")
-                .unwrap()
-                .to_string();
-            let fd_path_parent = remove_last_segment(&*fd_path.as_str());
-
-            // Use table name for e.g., object uniqueness across multiple tables
-            let mut path = Vec::with_capacity(parts.len() + 1);
-            let table_ident = Ident::from(tb_name.clone());
-            path.push(&table_ident);
-            path.extend_from_slice(parts.as_slice());
-
-            let fd_ty = kind_to_type(kind.clone(), types, path.as_slice())?;
-
-            // trace!("field {:?}", fd);
-            // trace!("idiom path: {:?}", path);
-            // trace!("field_name {:?}", fd_name);
-            // trace!("field_name_gql {:?}", fd_name_gql);
-            // trace!("kind {:?}", kind);
-            // trace!("field_type {:?}", fd_ty);
-            // trace!("field_path {:?}", fd_path);
-            // trace!("fd_path_parent {:?}", fd_path_parent);
-
-            // object map used to add fields step by step to the objects
-            if kind_non_optional == Kind::Object {
-                gql_objects.insert(
-                    fd_path.clone(),
-                    Object::new(fd_ty.type_name())
-                        .description(if let Some(ref c) = fd.comment {
-                            format!("{c}")
-                        } else {
-                            "".to_string()
-                        }),
-                );
-            }
-
-            if fd_path_parent.is_empty() { // top level field
-                match kind_non_optional {
-                    // cursor connections only if specified in config
-                    Kind::Array(_, _) if cursor => {
-                        if let kind = kind.inner_kind().unwrap() {
-                            let ty_ref = kind_to_type(kind.clone(), types, path.as_slice())?;
-                            let ty_name = ty_ref.type_name();
-                            cursor_pagination!(tb_ty_obj, types, &fd_name_gql, ty_name,
-                                edge_fields: [],
-                                args: []); // maybe overload macro definition for non-edges/args
-                        }
-                    }
-                    _ => {
-                        tb_ty_obj = tb_ty_obj
-                            .field(Field::new(
-                                fd_name_gql,
-                                fd_ty,
-                                make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                            ))
-                            .description(if let Some(ref c) = fd.comment {
-                                format!("{c}")
-                            } else {
-                                "".to_string()
-                            });
-                    }
-                }
-            } else { // nested field
-                // Array inner type is scalar, thus already set when adding the list field
-                if fd_path.chars().last() == Some('*') { continue; }
-
-                // expects the parent's `DefineFieldStatement` to come before its children as is
-                // with `tx.all_tb_fields()`
-                match gql_objects.remove(&fd_path_parent) {
-                    Some(obj) => {
-                        gql_objects.insert(fd_path_parent.clone(), Object::from(obj)
-                            .field(Field::new(
-                                fd_name_gql,
-                                fd_ty,
-                                make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                            ))
-                            .description(if let Some(ref c) = fd.comment {
-                                format!("{c}")
-                            } else {
-                                "".to_string()
-                            }),
-                        );
-                    }
-                    None => return Err(internal_error("Nested field should have parent object.")),
-                }
-            }
+            parse_field!(fd, types, cursor, tb_name, gql_objects, |fd| tb_ty_obj = tb_ty_obj
+                .field(fd));
         }
 
         // maybe move somewhere else??!?!?
@@ -518,7 +473,6 @@ pub async fn process_tbs(
 
         // Add additional orderBy fields here:
         define_order_input_types!(types, tb_name,);
-
 
         // =======================================================
         // Add single instance query
@@ -583,8 +537,8 @@ pub async fn process_tbs(
         let fds2 = fds.clone();
 
         if cursor {
-            cursor_pagination!(
-                query,
+            query = query.field(
+                cursor_pagination!(
                 types,
                 tb_name_query.to_plural(),
                 &tb_name_gql,
@@ -592,7 +546,7 @@ pub async fn process_tbs(
                 args: [
                     order_input!(&tb_name)
                 ]
-            );
+            ));
             define_page_info_type!(types);
         } else {
             query = query.field(
@@ -750,6 +704,7 @@ pub async fn process_tbs(
                 _ => false,
             }
         }) {
+            let rel_name = rel.name.to_string();
             // trace!("table: {:?}", tb.name.clone());
             trace!("relation: {:?}", rel);
 
@@ -775,110 +730,12 @@ pub async fn process_tbs(
                 match fd.name.to_string().as_str() {
                     "in" => false,
                     "out" => false,
-                    "id" => false,
+                    // "id" => false, // FIXME: prob not wanted
                     _ => true,
                 }
             }) {
-                trace!("relation_field: {:?}", fd);
-                let kind = match fd.kind.clone() {
-                    Some(k) => k,
-                    None => continue
-                };
-                let kind_non_optional = kind.non_optional().clone();
-
-                let parts: Vec<&Ident> = fd.name.0.iter().filter_map(|part| match part {
-                    Part::Field(ident) => Some(ident),
-                    _ => None
-                }).collect();
-
-                // Should always contain at least the field name
-                if parts.is_empty() { continue; }
-
-                let fd_name = parts.as_slice().last().unwrap().to_string();
-                let fd_name_gql = fd_name.to_camel_case();
-
-                let fd_path = fd.name.to_path()
-                    .replace("/", ".")
-                    .strip_prefix(".")
-                    .unwrap()
-                    .to_string();
-                let fd_path_parent = remove_last_segment(&*fd_path.as_str());
-
-                // Use table name for e.g., object uniqueness across multiple tables
-                let mut path = Vec::with_capacity(parts.len() + 1);
-                let table_ident = Ident::from(tb_name.clone());
-                path.push(&table_ident);
-                path.extend_from_slice(parts.as_slice());
-
-                let fd_ty = kind_to_type(kind.clone(), types, path.as_slice())?;
-
-                // object map used to add fields step by step to the objects
-                if kind_non_optional == Kind::Object {
-                    fd_map.insert(
-                        fd_path.clone(),
-                        Object::new(fd_ty.type_name())
-                            .description(if let Some(ref c) = fd.comment {
-                                format!("{c}")
-                            } else {
-                                "".to_string()
-                            }),
-                    );
-                }
-
-                if fd_path_parent.is_empty() { // top level field
-                    match kind_non_optional {
-                        // cursor connections only if specified in config
-                        Kind::Array(_, _) if cursor => {
-                            if let kind = kind.inner_kind().unwrap() {
-                                let ty_ref = kind_to_type(kind.clone(), types, path.as_slice())?;
-                                let ty_name = ty_ref.type_name();
-                                fd_vec.push(
-                                    cursor_pagination!(types, &fd_name_gql, ty_name, edges: []
-                                args: []) // maybe overload macro definition for non-edges/args
-                                );
-                            }
-                        }
-                        _ => {
-                            fd_vec.push(
-                                Field::new(
-                                    fd_name_gql,
-                                    fd_ty,
-                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                                ).description(if let Some(ref c) = fd.comment {
-                                    format!("{c}")
-                                } else {
-                                    "".to_string()
-                                })
-                            );
-                        }
-                    }
-                } else { // nested field
-                    // Array inner type is scalar, thus already set when adding the list field
-                    if fd_path.chars().last() == Some('*') { continue; }
-
-                    // expects the parent's `DefineFieldStatement` to come before its children as is
-                    // with `tx.all_tb_fields()`
-                    match fd_map.remove(&fd_path_parent) {
-                        Some(obj) => {
-                            fd_map.insert(fd_path_parent.clone(), Object::from(obj)
-                                .field(Field::new(
-                                    fd_name_gql,
-                                    fd_ty,
-                                    make_table_field_resolver(fd_path.as_str(), fd.kind.clone()),
-                                ))
-                                .description(if let Some(ref c) = fd.comment {
-                                    format!("{c}")
-                                } else {
-                                    "".to_string()
-                                }),
-                            );
-                        }
-                        None => return Err(internal_error("Nested field should have parent object.")),
-                    }
-                }
+                parse_field!(fd, types, cursor, rel_name, fd_map, |fd| fd_vec.push(fd));
             }
-
-            // kind_to_type(Kind::Object, types, &[])?;
 
             // Node type for the relation connection
             let node_ty_name = match outs.len() {
@@ -900,16 +757,16 @@ pub async fn process_tbs(
                 }
             };
 
-            cursor_pagination!(
-                tb_ty_obj,
+            tb_ty_obj = tb_ty_obj.field(
+                cursor_pagination!(
                 types,
-                rel.name.to_raw().to_camel_case().to_plural(), // fieldname
-                &node_ty_name,
+                rel.name.to_raw().to_camel_case().to_plural(),
+                &tb_name_gql,
                 edge_fields: fd_vec,
                 args: [
-                    order_input!(&rel.name)
+                    order_input!(&tb_name)
                 ]
-            );
+            ));
 
             define_order_input_types!(types, rel.name.to_raw(),);
 
