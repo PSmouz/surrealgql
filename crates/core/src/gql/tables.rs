@@ -761,7 +761,7 @@ pub async fn process_tbs(
                 cursor_pagination!(
                 types,
                 rel.name.to_raw().to_camel_case().to_plural(),
-                &tb_name_gql,
+                &node_ty_name,
                 edge_fields: fd_vec,
                 args: [
                     order_input!(&tb_name)
