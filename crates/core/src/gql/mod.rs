@@ -7,6 +7,7 @@ mod functions;
 pub mod schema;
 mod tables;
 mod utils;
+mod geometry;
 
 pub use error::GqlError;
 

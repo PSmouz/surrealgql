@@ -5590,6 +5590,7 @@ dependencies = [
 name = "surrealdb-core"
 version = "2.3.0"
 dependencies = [
+ "Inflector",
  "addr",
  "affinitypool",
  "ahash 0.8.11",

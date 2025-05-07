@@ -389,6 +389,25 @@ fn parse_define_user() {
 	}
 }
 
+// TODO(Psmouz): add more
+#[test]
+fn parse_define_config_graphql() {
+    let res = test_parse!(parse_stmt, "DEFINE CONFIG GRAPHQL AUTO CURSOR").unwrap();
+    assert_eq!(
+        res,
+        Statement::Define(DefineStatement::Config(DefineConfigStatement {
+            inner: ConfigInner::GraphQL(GraphQLConfig {
+                tables: TablesConfig::Auto,
+                functions: FunctionsConfig::Auto,
+                cursor: true,
+                ..Default::default()
+            }),
+            if_not_exists: false,
+            overwrite: false,
+        }))
+    );
+}
+
 // TODO(gguillemas): This test is kept in 2.0.0 for backward compatibility. Drop in 3.0.0.
 #[test]
 fn parse_define_token() {
