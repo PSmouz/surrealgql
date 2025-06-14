@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::mem;
@@ -13,6 +14,7 @@ use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
 use crate::gql::utils::{field_val_erase_owned, ErasedRecord, GQLTx, GqlValueUtils};
+use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
@@ -29,10 +31,12 @@ use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::dynamic::{InputValue, Union};
 use async_graphql::types::connection::{Connection, Edge, PageInfo};
+use async_graphql::Name;
 use async_graphql::Value as GqlValue;
-use async_graphql::{Name, Value};
+use base64::Engine;
 use inflector::Inflector;
 use log::trace;
+
 // macro_rules! order {
 // 	(asc, $field:expr) => {{
 // 		let mut tmp = sql::Order::default();
@@ -109,28 +113,39 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "hasNextPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                dummy_resolver("".to_string(), None),
+                make_field_value_resolver(|pi: &GqlPageInfo| pi.has_next_page),
                 ).description("When paginating forwards, are there more items?")
             )
             .field(
                 Field::new(
                 "hasPreviousPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                dummy_resolver("".to_string(), None),
+                make_field_value_resolver(|pi: &GqlPageInfo| pi.has_previous_page),
                 ).description("When paginating backwards, are there more items?")
             )
             .field(
                 Field::new(
                 "startCursor",
                 TypeRef::named(TypeRef::STRING),
-                dummy_resolver("".to_string(), None),
+                // asyncGQL Value doesnt implement from for Option<T>
+                make_field_value_resolver(|pi: &GqlPageInfo|
+                    match &pi.start_cursor {
+                        Some(s) => GqlValue::from(s.clone()),
+                        None => GqlValue::Null,
+                    }
+                ),
                 ).description("When paginating backwards, the cursor to continue.")
             )
             .field(
                 Field::new(
                 "endCursor",
                 TypeRef::named(TypeRef::STRING),
-                dummy_resolver("".to_string(), None),
+                make_field_value_resolver(|pi: &GqlPageInfo|
+                    match &pi.end_cursor {
+                        Some(s) => GqlValue::from(s.clone()),
+                        None => GqlValue::Null,
+                    }
+                ),
                 ).description("When paginating forwards, the cursor to continue.")
             )
             .description("Information about pagination in a connection.")
@@ -238,12 +253,12 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "pageInfo",
                     TypeRef::named_nn("PageInfo"),
-                    connection_page_info_resolver(),
+                    make_parent_object_resolver(|conn: &GqlConnection| conn.page_info.clone()),
                 ).description("Information to aid in pagination."))
                 .field(Field::new(
                     "totalCount",
                     TypeRef::named_nn(TypeRef::INT),
-                    dummy_resolver("".to_string(), None),
+                    make_field_value_resolver(|conn: &GqlConnection| conn.total_count),
                 ).description("Identifies the total count of items in the connection."))
                 .description(format!("The connection type for {}.", $node_ty_name));
 
@@ -266,22 +281,112 @@ macro_rules! cursor_pagination {
     };
 }
 
-fn connection_page_info_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+// #[derive(Clone, Debug)]
+// struct GqlEdge<'a> {
+//     node: Arc<ErasedRecord>,
+//     cursor: String,
+//     #[allow(dead_code)]
+//     additional_fields: IndexMap<Name, GqlValue>,
+// }
+
+#[derive(Clone, Debug, Default)]
+struct GqlPageInfo {
+    has_next_page: bool,
+    has_previous_page: bool,
+    start_cursor: Option<String>,
+    end_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GqlConnection {
+    // edges: Vec<GqlEdge<'a>>,
+    // nodes: Vec<Arc<ErasedRecord>>,
+    page_info: GqlPageInfo,
+    total_count: i64,
+}
+
+// impl<'a> From<GqlPageInfo> for FieldValue<'a> {
+//     fn from(val: GqlPageInfo) -> Self {
+//         FieldValue::owned_any(val)
+//     }
+// }
+
+fn encode_cursor(thing: &Thing) -> String {
+    BASE64.encode(thing.to_string().as_bytes())
+}
+
+// Helper to decode a cursor string back into a Thing ID
+fn decode_cursor(cursor: &str) -> Result<Thing, GqlError> {
+    let bytes = BASE64
+        .decode(cursor.as_bytes())
+        .map_err(|e| input_error(format!("Invalid cursor: failed to decode base64: {}", e)))?;
+    let s = String::from_utf8(bytes)
+        .map_err(|e| input_error(format!("Invalid cursor: failed to convert to utf8: {}", e)))?;
+    s.try_into()
+        .map_err(|se| input_error(format!("Invalid cursor content: {:?}", se)))
+}
+
+
+/// A generic resolver factory for fields that return a terminal GraphQL value (scalar, enum, etc.).
+///
+/// It extracts a field from a parent object `P`, converts it to a `Value`,
+/// and wraps it in a `FieldValue`. This works for primitives like `i64`, `bool`, `String`, etc.
+///
+/// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
+/// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
+fn make_field_value_resolver<P, F>(
+    extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
+) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
+where
+    P: Any + Send + Sync,
+    F: Into<GqlValue> + Send,
+{
     move |ctx: ResolverContext| {
+        let extractor = extractor.clone();
         FieldFuture::new(async move {
-            // The parent_value is already the GqlConnection wrapped in FieldValue::owned_any.
-            // The PageInfo field resolvers expect GqlConnection as the direct .as_any() type.
-            trace!(
-                    "Creating/Running resolver for Page Info with ctx: with parent: {:?}",
-                    // ctx,
-                    ctx.parent_value // Use the user-provided trace format
-                );
-            // Ok(ctx.parent_value.clone())
-            // Ok(Some(ctx.parent_value.clone()))
-            // Ok(Some())
-            // Ok(Some(FieldValue::value(Value::Null)));
-            return Ok(Some(FieldValue::value(Value::Null)));
-            // return Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))));
+            if let Some(parent) = ctx.parent_value.downcast_ref::<P>() {
+                let field_value = extractor(parent);
+                // Ok(Some(FieldValue::value(GqlValue::from(field_value))))
+                Ok(Some(FieldValue::value(field_value.into())))
+            } else {
+                let parent_type_name = std::any::type_name::<P>();
+                Err(internal_error(format!(
+                    "Internal Error: Expected parent of type '{}', but found something else.",
+                    parent_type_name
+                )).into())
+            }
+        })
+    }
+}
+
+/// A generic resolver factory for fields that are themselves parent objects.
+///
+/// It extracts a nested struct from a parent object `P` and passes it down,
+/// so it can be the parent for its own child resolvers.
+///
+/// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
+/// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
+fn make_parent_object_resolver<P, F>(
+    extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
+) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
+where
+    P: Any + Send + Sync,
+    F: Any + Clone + Send + Sync,
+{
+    move |ctx: ResolverContext| {
+        let extractor = extractor.clone();
+        FieldFuture::new(async move {
+            if let Some(parent) = ctx.parent_value.downcast_ref::<P>() {
+                let nested_object = extractor(parent);
+                // Wrap the nested struct so it can be a parent for its children.
+                Ok(Some(FieldValue::owned_any(nested_object)))
+            } else {
+                let parent_type_name = std::any::type_name::<P>();
+                Err(internal_error(format!(
+                    "Internal Error: Expected parent of type '{}', but found something else.",
+                    parent_type_name
+                )).into())
+            }
         })
     }
 }
@@ -1191,19 +1296,30 @@ fn make_connection_resolver(
 
             //FIXME: two cases possible: we have array of objects or things.
 
+            let total_count = match db_value_array {
+                SqlValue::Array(arr) => arr.0.len() as i64,
+                SqlValue::None | SqlValue::Null => 0,
+                other => {
+                    // If the schema expects a list but the DB returns something else, it's an inconsistency.
+                    return Err(internal_error(format!(
+                        "Expected an array from the database for connection field '{}', but got {:?}",
+                        query_source, other
+                    )).into());
+                }
+            };
 
-            // let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
-            // let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
-            // let after_cursor_str = args.get("after").and_then(GqlValueUtils::as_string);
-            // let before_cursor_str = args.get("before").and_then(GqlValueUtils::as_string);
-            // let order_by_arg = args.get("orderBy");
-            //
-            // if first.is_some() && last.is_some() {
-            //     return Err(input_error("Cannot use both `first` and `last`.").into());
-            // }
-            // if first.map_or(false, |f| f > 1000) || last.map_or(false, |l| l > 1000) { // Safety limit
-            //     return Err(input_error("Pagination limit too high (max 1000).").into());
-            // }
+            let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
+            let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
+            let after_cursor_str = args.get("after").and_then(GqlValueUtils::as_string);
+            let before_cursor_str = args.get("before").and_then(GqlValueUtils::as_string);
+            let order_by_arg = args.get("orderBy");
+
+            if first.is_some() && last.is_some() {
+                return Err(input_error("Cannot use both `first` and `last`.").into());
+            }
+            if first.map_or(false, |f| f > 1000) || last.map_or(false, |l| l > 1000) { // Safety limit
+                return Err(input_error("Pagination limit too high (max 1000).").into());
+            }
 
 
             // let mut limit_query: Option<usize> = None;
@@ -1427,12 +1543,23 @@ fn make_connection_resolver(
             //     page_info,
             //     total_count: total_count_val,
             // };
+            let page_info = GqlPageInfo {
+                has_next_page: false, // Set later if needed
+                has_previous_page: false, // Set later if needed
+                start_cursor: None,
+                end_cursor: None,
+            };
+            let connection_obj = GqlConnection {
+                total_count,
+                page_info,
+            };
+            trace!("Created connection object: {:?}", connection_obj);
 
-            // Ok(Some(FieldValue::owned_any(connection_obj)))
-            Ok(Some(FieldValue::owned_any(Value::Null)))
+            Ok(Some(FieldValue::owned_any(connection_obj)))
         })
     }
 }
+
 
 // let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
 //
