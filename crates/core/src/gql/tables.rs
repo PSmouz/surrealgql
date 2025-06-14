@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::mem;
@@ -14,11 +13,10 @@ use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
 use crate::gql::utils::{field_val_erase_owned, ErasedRecord, GQLTx, GqlValueUtils};
-use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Ident, Limit, Literal, Part, Start, Table, TableType};
+use crate::sql::{self, Ident, Literal, Part, Table, TableType};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
@@ -30,13 +28,11 @@ use async_graphql::dynamic::{EnumItem, FieldFuture};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::dynamic::{InputValue, Union};
-// use async_graphql::types::connection::{Connection, Edge, PageInfo};
-use async_graphql::Name;
+use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Value as GqlValue;
-use base64::Engine;
+use async_graphql::{Name, Value};
 use inflector::Inflector;
 use log::trace;
-
 // macro_rules! order {
 // 	(asc, $field:expr) => {{
 // 		let mut tmp = sql::Order::default();
@@ -113,28 +109,28 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "hasNextPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                page_info_field_resolver("hasNextPage"),
+                dummy_resolver("".to_string(), None),
                 ).description("When paginating forwards, are there more items?")
             )
             .field(
                 Field::new(
                 "hasPreviousPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                page_info_field_resolver("hasPreviousPage"),
+                dummy_resolver("".to_string(), None),
                 ).description("When paginating backwards, are there more items?")
             )
             .field(
                 Field::new(
                 "startCursor",
                 TypeRef::named(TypeRef::STRING),
-                page_info_field_resolver("startCursor"),
+                dummy_resolver("".to_string(), None),
                 ).description("When paginating backwards, the cursor to continue.")
             )
             .field(
                 Field::new(
                 "endCursor",
                 TypeRef::named(TypeRef::STRING),
-                page_info_field_resolver("endCursor"),
+                dummy_resolver("".to_string(), None),
                 ).description("When paginating forwards, the cursor to continue.")
             )
             .description("Information about pagination in a connection.")
@@ -204,8 +200,8 @@ macro_rules! cursor_pagination {
         $types:ident,
         $fd_name:expr,
         $node_ty_name:expr,
-        $connection_resolver:expr,      // The actual resolver for the connection field on $obj
-        edge_fields: $edge_fields_expr:expr, // Vec<Field> for custom fields on edge
+        $connection_resolver:expr, // The actual resolver for the connection field on $obj
+        edge_fields: $edge_fields_expr:expr,
         args: [ $( $extra_connection_arg:expr ),* $(,)? ]
     ) => {
         {
@@ -216,20 +212,14 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "cursor",
                     TypeRef::named_nn(TypeRef::STRING),
-                    edge_cursor_resolver(),
+                    dummy_resolver("".to_string(), None),
                 ).description("A cursor for use in pagination."))
                 .field(Field::new(
                     "node",
                     TypeRef::named($node_ty_name),
-                    edge_node_resolver(),
+                    dummy_resolver("".to_string(), None),
                 ).description("The item at the end of the edge."))
                 .description("An edge in a connection.");
-
-            // Add custom edge fields. Their resolvers must expect GqlEdge as parent
-            // and extract data from GqlEdge.additional_fields or GqlEdge.node (if appropriate).
-            // The current `fd_vec` from `parse_field!` uses `make_table_field_resolver` which expects ErasedRecord.
-            // This part will require adjustment if `edge_fields_expr` is non-empty and uses those resolvers.
-            // For now, this structure assumes resolvers in $edge_fields_expr are compatible.
             for fd in $edge_fields_expr {
                 edge = edge.field(fd);
             }
@@ -238,12 +228,12 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "edges",
                     TypeRef::named_list(&edge_type_name),
-                    connection_edges_resolver(),
+                    dummy_resolver("".to_string(), None),
                 ).description("A list of edges."))
                 .field(Field::new(
                     "nodes",
                     TypeRef::named_list($node_ty_name),
-                    connection_nodes_resolver(),
+                    dummy_resolver("".to_string(), None),
                 ).description("A list of nodes."))
                 .field(Field::new(
                     "pageInfo",
@@ -253,7 +243,7 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "totalCount",
                     TypeRef::named_nn(TypeRef::INT),
-                    connection_total_count_resolver(),
+                    dummy_resolver("".to_string(), None),
                 ).description("Identifies the total count of items in the connection."))
                 .description(format!("The connection type for {}.", $node_ty_name));
 
@@ -264,6 +254,7 @@ macro_rules! cursor_pagination {
                 $fd_name,
                 TypeRef::named_nn(&connection_type_name),
                 $connection_resolver,
+
             )
             .description(format!("The connection object for the table `{}`", $fd_name))
             .argument(after_input!())
@@ -273,6 +264,26 @@ macro_rules! cursor_pagination {
             $(.argument($extra_connection_arg))*
         }
     };
+}
+
+fn connection_page_info_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+    move |ctx: ResolverContext| {
+        FieldFuture::new(async move {
+            // The parent_value is already the GqlConnection wrapped in FieldValue::owned_any.
+            // The PageInfo field resolvers expect GqlConnection as the direct .as_any() type.
+            trace!(
+                    "Creating/Running resolver for Page Info with ctx: with parent: {:?}",
+                    // ctx,
+                    ctx.parent_value // Use the user-provided trace format
+                );
+            // Ok(ctx.parent_value.clone())
+            // Ok(Some(ctx.parent_value.clone()))
+            // Ok(Some())
+            // Ok(Some(FieldValue::value(Value::Null)));
+            return Ok(Some(FieldValue::value(Value::Null)));
+            // return Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))));
+        })
+    }
 }
 
 /// This macro is used to parse a field definition and add it to the object map.
@@ -549,7 +560,9 @@ pub async fn process_tbs(
                 types,
                 tb_name_query.to_plural(),
                 &tb_name_gql,
-                make_connection_resolver(tb_name_query.as_str(), Some(Kind::Record(vec![Table::from(tb_name.clone())]))),
+                // TODO
+                dummy_resolver("".to_string(), None),
+                // make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
                 edge_fields: [],
                 args: [
                     order_input!(&tb_name)
@@ -764,7 +777,9 @@ pub async fn process_tbs(
                 types,
                 rel.name.to_raw().to_camel_case().to_plural(),
                 &node_ty_name,
-                make_connection_resolver(rel.name.to_raw().as_str(), Some(Kind::Record(vec![Table::from(rel_name.clone())]))),
+                // make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
+                // TODO
+                dummy_resolver("".to_string(), None),
                 edge_fields: fd_vec,
                 args: [
                     order_input!(&tb_name)
@@ -794,6 +809,7 @@ pub async fn process_tbs(
 }
 
 //TODO: bug: type HomeTypeEnum enum is optional even though it shouldn't
+
 
 fn make_table_field_resolver(
     // fd_name: impl Into<String>,
@@ -1112,396 +1128,6 @@ fn make_table_field_resolver(
 }
 
 
-// fn make_connection_resolver(
-//     fd_path: impl Into<String>,
-//     kind: Option<Kind>,
-// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-//     let fd_path = fd_path.into();
-//     move |ctx: ResolverContext| {
-//         let fd_path = fd_path.clone();
-//         let field_kind = kind.clone();
-//         let path_for_resolver = fd_path.clone();
-//         let resolver_field_kind = kind.clone();
-//
-//         let args = ctx.args.as_index_map();
-//         let after = args.get("after").and_then(|v| v.as_string());
-//         let before = args.get("before").and_then(|v| v.as_string());
-//         let first = args.get("first").and_then(|v| v.as_i64());
-//         let last = args.get("last").and_then(|v| v.as_i64());
-//
-//         trace!("received request with args: {args:?}");
-//
-//         FieldFuture::new({
-//             let fd_path = fd_path.clone();
-//             let field_kind = kind.clone();
-//             async move {
-//                 trace!(
-//                     "Creating/Running resolver for DB path '{}' (Kind: {:?}) with parent: {:?}",
-//                     fd_path,
-//                     field_kind,
-//                     ctx.parent_value
-//                 );
-//
-//                 // TODO: improve error handling
-//                 if first.is_none() && last.is_none() {
-//                     return Err(internal_error("Either 'first' or 'last' argument must be provided for connection resolver").into());
-//                 }
-//                 if first.is_some() && last.is_some() {
-//                     return Err(internal_error("Only one of 'first' or 'last' argument can be provided for connection resolver").into());
-//                 }
-//                 if let Some(first) = first {
-//                     if first <= 0 {
-//                         return Err(internal_error("'first' argument must be greater than 0").into());
-//                     }
-//                 }
-//                 if let Some(last) = last {
-//                     if last <= 0 {
-//                         return Err(internal_error("'last' argument must be greater than 0").into());
-//                     }
-//                 }
-//
-//                 let v = match field_kind {
-//                     Some(Kind::Record([Table(_)])) => {
-//                         // case of new table being querried
-//                         ctx.
-//                     }
-//                 };
-//
-//                 let (ref gtx, ref rid) = ctx
-//                     .parent_value
-//                     .downcast_ref::<ErasedRecord>()
-//                     .ok_or_else(|| internal_error("failed to downcast"))?;
-//
-//                 // this is the array
-//                 let val = gtx.get_record_field(rid.clone(), &fd_path).await?;
-//                 trace!("Fetched DB value for '{}': {:?}", fd_path, val);
-//
-//                 match val {
-//                     SqlValue::Array(surreal_array) => {
-//                         let total_count = surreal_array.0.len() as i64;
-//                         let has_next_page = match first {
-//                             Some(first) => total_count > first,
-//                             None => false,
-//                         };
-//                         let has_previous_page = match last {
-//                             Some(last) => total_count > last,
-//                             None => false,
-//                         };
-//                         let start_cursor = "start_cursor_value"; // Placeholder for actual start cursor value
-//                         let end_cursor = "end_cursor";
-//
-//                         let page_info_content = vec![
-//                             (Name::new("hasNextPage"), FieldValue::value(has_next_page)),
-//                             (Name::new("hasPreviousPage"), FieldValue::value(has_previous_page)),
-//                             (Name::new("startCursor"), FieldValue::value(start_cursor)),
-//                             (Name::new("endCursor"), FieldValue::value(end_cursor)),
-//                         ];
-//
-//                         let connection_object_content = vec![
-//                             // (Name::new("edges"), FieldValue::list(edges_list)),
-//                             // (Name::new("nodes"), FieldValue::list(nodes_field_list)),
-//                             (Name::new("edges"), FieldValue::list(Vec::<FieldValue>::new())),
-//                             (Name::new("nodes"), FieldValue::list(Vec::<FieldValue>::new())),
-//                             // (Name::new("pageInfo"), field_val_erase_owned(page_info_content)),
-//                             (Name::new("pageInfo"), FieldValue::owned_any(page_info_content)),
-//                             (Name::new("totalCount"), FieldValue::value(total_count)),
-//                         ];
-//
-//                         Ok(Some(FieldValue::owned_any(connection_object_content)))
-//
-//                         // let mut gql_record_items = Vec::new();
-//                         // for item_sql_value in surreal_array.0 {
-//                         //     match item_sql_value {
-//                         //         SqlValue::Thing(thing_val) => {
-//                         //             // Wrap each Thing in ErasedRecord
-//                         //             let record_context: ErasedRecord = (gtx.clone(), thing_val);
-//                         //             gql_record_items.push(field_val_erase_owned(record_context));
-//                         //         }
-//                         //         SqlValue::Null | SqlValue::None => {
-//                         //             // Handle null items in the list if the inner type is nullable
-//                         //             gql_record_items.push(FieldValue::NULL);
-//                         //         }
-//                         //         _ => {
-//                         //             // This should ideally not happen if the DB schema matches GQL schema
-//                         //             return Err(internal_error(format!(
-//                         //                 "Expected Thing for Record array element at path '{}', got {:?}",
-//                         //                 path_for_resolver, item_sql_value
-//                         //             )).into());
-//                         //         }
-//                         //     }
-//                         // }
-//                         // return Ok(Some(FieldValue::list(gql_record_items)));
-//                         // return Ok(Some(FieldValue::list(vec![])));
-//                     }
-//                     SqlValue::Null | SqlValue::None => { // The whole array field is null
-//                         return Ok(None);
-//                     }
-//                     other => {
-//                         return Err(internal_error(format!(
-//                             "Expected Array from DB for array-of-records field path '{}', got {:?}",
-//                             path_for_resolver, other
-//                         )).into());
-//                     }
-//                 }
-//             }
-//         })
-//     }
-// }
-
-
-//     async fn execute_connection_query(
-//     gtx: &GQLTx,
-//     // parent_rid: &Thing, // If the connection is from a specific parent record
-//     // relation_name: &str, // If it's a graph edge like '->posts'
-//     target_table_name: &str, // The table for the nodes (e.g., "post")
-//     first: Option<i64>,
-//     last: Option<i64>,
-//     after_cursor: Option<String>, // Decoded cursor value
-//     before_cursor: Option<String>,// Decoded cursor value
-//     order_by: Option<YourOrderByStruct>, // Parsed orderBy argument
-//     // filter_by: Option<YourFilterStruct>, // Parsed filterBy argument
-// ) -> Result<(Vec<Thing>, bool, bool, i64), GqlError> { // (nodes, has_next, has_prev, total_count
-
-#[derive(Clone, Debug)]
-struct GqlEdge<'a> {
-    node: Arc<ErasedRecord>,
-    cursor: String,
-    #[allow(dead_code)]
-    additional_fields: IndexMap<Name, GqlValue>,
-}
-
-// Represents the PageInfo object
-#[derive(Clone, Debug, Default)]
-struct GqlPageInfo {
-    has_next_page: bool,
-    has_previous_page: bool,
-    start_cursor: Option<String>,
-    end_cursor: Option<String>,
-}
-
-// Represents the connection object
-#[derive(Clone, Debug)]
-struct GqlConnection<'a> {
-    edges: Vec<GqlEdge<'a>>,
-    nodes: Vec<Arc<ErasedRecord>>,
-    page_info: GqlPageInfo,
-    total_count: i64,
-}
-
-// Helper to encode/decode cursors
-// fn encode_cursor(id: &str) -> String {
-//     BASE64.encode(id.as_bytes())
-// }
-//
-// fn decode_cursor(cursor: &str) -> Result<String, GqlError> {
-//     BASE64.decode(cursor)
-//         .map_err(|_| input_error("Invalid cursor format"))?
-//         .into_iter()
-//         .map(|b| b as char)
-//         .collect::<String>()
-//         .parse()
-//         .map_err(|_| input_error("Invalid cursor content"))
-// }
-
-fn encode_cursor(thing: &Thing) -> String {
-    BASE64.encode(thing.to_string().as_bytes())
-}
-
-// Helper to decode a cursor string back into a Thing ID
-fn decode_cursor(cursor: &str) -> Result<Thing, GqlError> {
-    let bytes = BASE64
-        .decode(cursor.as_bytes())
-        .map_err(|e| input_error(format!("Invalid cursor: failed to decode base64: {}", e)))?;
-    let s = String::from_utf8(bytes)
-        .map_err(|e| input_error(format!("Invalid cursor: failed to convert to utf8: {}", e)))?;
-    s.try_into()
-        .map_err(|se| input_error(format!("Invalid cursor content: {}", se)))
-}
-
-fn page_info_field_resolver(
-    field_name: &'static str,
-) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        let field_name = field_name.to_string(); // Clone for async block
-        FieldFuture::new(async move {
-            // The parent value of a PageInfo field is the Connection object itself.
-            // We expect it to be our GqlConnection struct, wrapped in FieldValue.
-            let parent_val = ctx.parent_value;
-            if let Some(gql_conn) = parent_val.downcast_ref::<GqlConnection>() {
-                match field_name.as_str() {
-                    "hasNextPage" => Ok(Some(FieldValue::value(gql_conn.page_info.has_next_page))),
-                    "hasPreviousPage" => Ok(Some(FieldValue::value(gql_conn.page_info.has_previous_page))),
-                    "startCursor" => Ok(gql_conn.page_info.start_cursor.as_ref().map(|c| FieldValue::value(c.clone()))),
-                    "endCursor" => Ok(gql_conn.page_info.end_cursor.as_ref().map(|c| FieldValue::value(c.clone()))),
-                    _ => Err(resolver_error(format!("Unknown PageInfo field: {}", field_name))),
-                }
-            } else {
-                Err(resolver_error(format!(
-                    "PageInfo resolver: Parent is not GqlConnection. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-// Resolver for Edge.cursor
-fn edge_cursor_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            let parent_val = ctx.parent_value;
-            if let Some(gql_edge) = parent_val.downcast_ref::<GqlEdge>() {
-                Ok(Some(FieldValue::value(gql_edge.cursor.clone())))
-            } else {
-                Err(resolver_error(format!(
-                    "Edge.cursor resolver: Parent is not GqlEdge. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-// Resolver for Edge.node
-fn edge_node_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            let parent_val = ctx.parent_value;
-            if let Some(gql_edge) = parent_val.downcast_ref::<GqlEdge>() {
-                // gql_edge.node is already a FieldValue (wrapping ErasedRecord)
-                Ok(Some(gql_edge.node.clone()))
-            } else {
-                Err(resolver_error(format!(
-                    "Edge.node resolver: Parent is not GqlEdge. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-// Resolver for Connection.edges
-fn connection_edges_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            let parent_val = ctx.parent_value;
-            if let Some(gql_conn) = parent_val.downcast_ref::<GqlConnection>() {
-                let edges_field_values: Vec<FieldValue> = gql_conn
-                    .edges
-                    .iter()
-                    .map(|edge| FieldValue::owned_any(edge.clone())) // Wrap GqlEdge in FieldValue
-                    .collect();
-                Ok(Some(FieldValue::list(edges_field_values)))
-            } else {
-                Err(resolver_error(format!(
-                    "Connection.edges resolver: Parent is not GqlConnection. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-// Resolver for Connection.nodes
-fn connection_nodes_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            let parent_val = ctx.parent_value;
-            if let Some(gql_conn) = parent_val.downcast_ref::<GqlConnection>() {
-                // gql_conn.nodes already contains FieldValues
-                Ok(Some(FieldValue::list(gql_conn.nodes.clone())))
-            } else {
-                Err(resolver_error(format!(
-                    "Connection.nodes resolver: Parent is not GqlConnection. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-// Resolver for Connection.pageInfo
-// The parent (GqlConnection) is passed through, PageInfo fields resolve from it.
-fn connection_page_info_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            // The parent_value is already the GqlConnection wrapped in FieldValue::owned_any.
-            // The PageInfo field resolvers expect GqlConnection as the direct .as_any() type.
-            Ok(ctx.parent_value.clone().into_inner())
-        })
-    }
-}
-
-// Resolver for Connection.totalCount
-fn connection_total_count_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            let parent_val = ctx.parent_value;
-            if let Some(gql_conn) = parent_val.downcast_ref::<GqlConnection>() {
-                Ok(Some(FieldValue::value(gql_conn.total_count)))
-            } else {
-                Err(resolver_error(format!(
-                    "Connection.totalCount resolver: Parent is not GqlConnection. Type: {:?}",
-                    ctx.parent_value.type_name()
-                )))
-            }
-        })
-    }
-}
-
-
-#[derive(Debug, Clone, Copy)]
-enum OrderDirectionInput {
-    Asc,
-    Desc,
-}
-
-fn parse_order_by(
-    order_by_value: Option<&GqlValue>,
-    // base_name: &str, // Currently not used as only ID is supported
-) -> Result<Option<Ordering>, GqlError> {
-    let order_by_obj = match order_by_value {
-        Some(GqlValue::Object(obj)) => obj,
-        Some(_) => return Err(input_error("orderBy argument must be an object.")),
-        None => return Ok(None),
-    };
-
-    let field_val = order_by_obj
-        .get(&Name::new("field"))
-        .ok_or_else(|| input_error("orderBy.field is required."))?;
-    let direction_val = order_by_obj
-        .get(&Name::new("direction"))
-        .ok_or_else(|| input_error("orderBy.direction is required."))?;
-
-    let field_str = match field_val {
-        GqlValue::Enum(name) => name.as_str().to_string(),
-        _ => return Err(input_error("orderBy.field must be an enum.")),
-    };
-
-    let direction = match direction_val {
-        GqlValue::Enum(name) => match name.as_str() {
-            "ASC" => OrderDirectionInput::Asc,
-            "DESC" => OrderDirectionInput::Desc,
-            _ => return Err(input_error("Invalid orderBy.direction value.")),
-        },
-        _ => return Err(input_error("orderBy.direction must be an enum.")),
-    };
-
-    let sql_field_expr = if field_str == "ID" {
-        SqlValue::Idiom(Idiom::from("id"))
-    } else {
-        // Assumes enum value is SCREAMING_SNAKE_CASE of the DB field
-        SqlValue::Idiom(Idiom::from(field_str.to_snake_case()))
-    };
-
-    let sql_order = sql::Order {
-        value: sql_field_expr,
-        direction: matches!(direction, OrderDirectionInput::Asc), // true for ASC
-    };
-
-    Ok(Some(Ordering::Order(OrderList(vec![sql_order]))))
-}
-
 #[allow(clippy::too_many_lines)] // Due to detailed logic
 fn make_connection_resolver(
     // For table connections: table name (e.g., "user")
@@ -1523,644 +1149,290 @@ fn make_connection_resolver(
         // let item_kind_clone = _item_kind.clone();
 
         FieldFuture::new(async move {
+            // let (gtx, parent_rid_opt): (GQLTx, Option<Thing>) =
+            //     if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+            //         (er_gtx.clone(), Some(er_rid.clone()))
+            //     } else if let Ok(gql_tx) = ctx.data::<GQLTx>() {
+            //         (gql_tx.clone(), None)
+            //     } else {
+            //         return Err(internal_error(
+            //             "GQLTx not found in resolver context for connection resolver",
+            //         )
+            //             .into());
+            //     };
+            //
+            // trace!("GTX: {:?}, Parent RID: {:?}", gtx, parent_rid_opt);
+            //
+            let args = ctx.args.as_index_map();
+            //
             trace!(
                 "Connection resolver for source '{}', args: {:?}",
                 query_source,
-                ctx.args
+                args
             );
 
-            let (gtx, parent_rid_opt): (GQLTx, Option<Thing>) =
+            let db_value_array =
                 if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-                    (er_gtx.clone(), Some(er_rid.clone()))
-                } else if let Ok(gql_tx) = ctx.data::<GQLTx>() {
-                    (gql_tx.clone(), None)
+                    // Nested field query: get field from parent record
+                    trace!("Nested query: getting field '{}' from parent RID: {}", query_source, er_rid);
+                    er_gtx.get_record_field(er_rid.clone(), &query_source).await?
                 } else {
-                    return Err(internal_error(
-                        "GQLTx not found in resolver context for connection resolver",
-                    )
-                        .into());
+                    return Err(internal_error("GQLTx not found in resolver context").into());
                 };
 
-            let args = ctx.args.as_index_map();
+            // else if let Ok(gql_tx) = ctx.data::<GQLTx>() { //case for root level query
+            //     // Root table query: query table directly
+            //     trace!("Root query: querying table '{}' directly", query_source);
+            // } else {
+            //     return Err(internal_error("GQLTx not found in resolver context").into());
+            // };
 
-            let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
-            let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
-            let after_cursor_str = args.get("after").and_then(GqlValueUtils::as_string);
-            let before_cursor_str = args.get("before").and_then(GqlValueUtils::as_string);
-            let order_by_arg = args.get("orderBy");
+            trace!("db_value_array: {:?}", db_value_array);
 
-            if first.is_some() && last.is_some() {
-                return Err(input_error("Cannot use both `first` and `last`.").into());
-            }
-            if first.map_or(false, |f| f > 1000) || last.map_or(false, |l| l > 1000) { // Safety limit
-                return Err(input_error("Pagination limit too high (max 1000).").into());
-            }
+            //FIXME: two cases possible: we have array of objects or things.
 
 
-            let mut limit_query: Option<usize> = None;
-            let mut fetch_forwards = true;
-            let requested_count = match (first, last) {
-                (Some(f), None) => {
-                    limit_query = Some(f + 1);
-                    fetch_forwards = true;
-                    f
-                }
-                (None, Some(l)) => {
-                    limit_query = Some(l + 1);
-                    fetch_forwards = false;
-                    l
-                }
-                (None, None) => {
-                    limit_query = Some(20 + 1);
-                    fetch_forwards = true;
-                    20
-                } // Default page size
-                (Some(_), Some(_)) => unreachable!(), // Already checked
-            };
+            // let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
+            // let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
+            // let after_cursor_str = args.get("after").and_then(GqlValueUtils::as_string);
+            // let before_cursor_str = args.get("before").and_then(GqlValueUtils::as_string);
+            // let order_by_arg = args.get("orderBy");
+            //
+            // if first.is_some() && last.is_some() {
+            //     return Err(input_error("Cannot use both `first` and `last`.").into());
+            // }
+            // if first.map_or(false, |f| f > 1000) || last.map_or(false, |l| l > 1000) { // Safety limit
+            //     return Err(input_error("Pagination limit too high (max 1000).").into());
+            // }
 
 
-            let after_thing = after_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
-            let before_thing = before_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
+            // let mut limit_query: Option<usize> = None;
+            // let mut fetch_forwards = true;
+            // let requested_count = match (first, last) {
+            //     (Some(f), None) => {
+            //         limit_query = Some(f + 1);
+            //         fetch_forwards = true;
+            //         f
+            //     }
+            //     (None, Some(l)) => {
+            //         limit_query = Some(l + 1);
+            //         fetch_forwards = false;
+            //         l
+            //     }
+            //     (None, None) => {
+            //         limit_query = Some(20 + 1);
+            //         fetch_forwards = true;
+            //         20
+            //     } // Default page size
+            //     (Some(_), Some(_)) => unreachable!(), // Already checked
+            // };
+            //
+            //
+            // let after_thing = after_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
+            // let before_thing = before_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
 
-            let mut sql_ordering = parse_order_by(order_by_arg)?.unwrap_or_else(|| {
-                Ordering::Order(OrderList(vec![sql::Order {
-                    value: SqlValue::Idiom(Idiom::from("id")),
-                    direction: true, // ASC
-                }]))
-            });
+            // let mut sql_ordering = parse_order_by(order_by_arg)?.unwrap_or_else(|| {
+            //     Ordering::Order(OrderList(vec![sql::Order {
+            //         value: SqlValue::Idiom(Idiom::from("id")),
+            //         direction: true, // ASC
+            //     }]))
+            // });
 
-            if !fetch_forwards { // Paginating backwards (last/before)
-                if let Ordering::Order(OrderList(ref mut orders)) = sql_ordering {
-                    for order_item in orders.iter_mut() {
-                        order_item.direction = !order_item.direction; // Reverse query order
-                    }
-                }
-            }
+            // if !fetch_forwards { // Paginating backwards (last/before)
+            //     if let Ordering::Order(OrderList(ref mut orders)) = sql_ordering {
+            //         for order_item in orders.iter_mut() {
+            //             order_item.direction = !order_item.direction; // Reverse query order
+            //         }
+            //     }
+            // }
 
-            let mut query_cond: Option<Cond> = None;
-            let cursor_thing_opt = if fetch_forwards { after_thing.as_ref() } else { before_thing.as_ref() };
+            // let mut query_cond: Option<Cond> = None;
+            // let cursor_thing_opt = if fetch_forwards { after_thing.as_ref() } else { before_thing.as_ref() };
+            //
+            // if let Some(cursor_thing) = cursor_thing_opt {
+            //     if let Ordering::Order(OrderList(orders)) = &sql_ordering {
+            //         if let Some(primary_order) = orders.first() {
+            //             // Simplified: assumes cursor is the ID of the item, and ordering is on 'id'.
+            //             // For general cursor logic with arbitrary orderBy, the cursor must contain
+            //             // the sort values of the item it points to.
+            //             // Here, we assume primary_order.value is 'id' if a cursor is used.
+            //             if let SqlValue::Idiom(idiom) = &primary_order.value {
+            //                 if idiom.to_string() == "id" {
+            //                     let op_str = if fetch_forwards { // after
+            //                         if primary_order.direction { ">" } else { "<" } // ASC: id > cursor_id, DESC: id < cursor_id
+            //                     } else { // before (query order is already reversed)
+            //                         if primary_order.direction { ">" } else { "<" } // Reversed ASC (effectively DESC): id > cursor_id => original id < cursor_id
+            //                         // Reversed DESC (effectively ASC): id < cursor_id => original id > cursor_id
+            //                     };
+            //                     query_cond = Some(Cond(Expression::Binary {
+            //                         l: Box::new(SqlValue::Idiom(Idiom::from("id"))),
+            //                         o: sql::Operator::from_str(op_str).map_err(|_| internal_error("Invalid operator string"))?,
+            //                         r: Box::new(SqlValue::Thing(cursor_thing.clone())),
+            //                     }));
+            //                 } else {
+            //                     return Err(input_error("Cursor pagination is currently only supported with orderBy ID.").into());
+            //                 }
+            //             } else {
+            //                 return Err(input_error("Unsupported orderBy field type for cursor pagination.").into());
+            //             }
+            //         }
+            //     }
+            // }
+            //
+            // let mut select_stmt = SelectStatement {
+            //     what: Fields(vec![sql::Field::All], false), // SELECT *
+            //     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
+            //     order: Some(sql_ordering.clone()),
+            //     cond: query_cond.clone(),
+            //     limit: limit_query.map(|l| Limit(SqlValue::Number(sql::Number::from(l)))),
+            //     ..Default::default()
+            // };
+            //
+            // let is_relation_connection = parent_rid_opt.is_some();
+            // if let Some(parent_rid) = &parent_rid_opt {
+            //     // This is a nested connection, assumed to be a relation.
+            //     // `query_source` is the relation table name.
+            //     // Assume 'in' field links to parent, 'out' to target. This needs to be configurable or schema-aware.
+            //     // Example: User (parent_rid) -> Authored (query_source) -> Post (target)
+            //     // Query: SELECT * FROM Authored WHERE in = User.id
+            //     let relation_filter_cond = Cond(Expression::Binary {
+            //         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))), // Configurable: field linking to parent
+            //         o: sql::Operator::Equal,
+            //         r: Box::new(SqlValue::Thing(parent_rid.clone())),
+            //     });
+            //     select_stmt.cond = match select_stmt.cond.take() {
+            //         Some(existing_cond) => Some(Cond(Expression::Binary {
+            //             l: Box::new(Expression::Paren(Box::new(existing_cond.0))),
+            //             o: sql::Operator::And,
+            //             r: Box::new(relation_filter_cond.0),
+            //         })),
+            //         None => Some(relation_filter_cond),
+            //     };
+            // }
+            //
+            // let ast = Statement::Select(select_stmt.clone()); // Clone for total_count later
+            // trace!("Connection query AST: {:?}", ast);
+            //
+            // let query_result_values = match gtx.process_stmt(ast).await? {
+            //     SqlValue::Array(a) => a.0,
+            //     v => return Err(internal_error(format!("Expected array from DB, got {:?}", v)).into()),
+            // };
+            //
+            // let mut fetched_items = query_result_values;
+            // if !fetch_forwards { // If 'last', results were fetched in reverse query order, reverse them back
+            //     fetched_items.reverse();
+            // }
+            //
+            // let mut page_info = GqlPageInfo::default();
+            // let has_extra_item = fetched_items.len() > requested_count;
+            //
+            // if fetch_forwards {
+            //     page_info.has_next_page = has_extra_item;
+            //     if has_extra_item { fetched_items.truncate(requested_count); }
+            // } else { // Paginating backwards (last/before)
+            //     page_info.has_previous_page = has_extra_item;
+            //     if has_extra_item { fetched_items.drain(0..1); } // Remove extra from beginning
+            // }
+            //
+            // let mut gql_edges = Vec::new();
+            // let mut gql_nodes = Vec::new();
+            //
+            // for item_sql_val in fetched_items {
+            //     let record_thing = match item_sql_val { // This is either a data record or a relation record
+            //         SqlValue::Thing(t) => t,
+            //         _ => return Err(internal_error("Expected Thing in connection result items").into()),
+            //     };
+            //
+            //     let node_for_edge_erased: FieldValue;
+            //     let cursor_for_edge: String;
+            //
+            //     if is_relation_connection {
+            //         // `record_thing` is the relation record (e.g., from 'Authored' table)
+            //         cursor_for_edge = encode_cursor(&record_thing);
+            //
+            //         // Fetch the target node of the relation. Assume 'out' field.
+            //         // This needs to be schema-aware for robust relation handling.
+            //         let target_node_id_val = gtx.get_record_field(record_thing.clone(), "out").await?;
+            //         let target_node_thing = match target_node_id_val {
+            //             SqlValue::Thing(t) => t,
+            //             SqlValue::Null | SqlValue::None => {
+            //                 // If target can be null, GQL node type should be nullable.
+            //                 // For now, error if target is missing for a relation.
+            //                 return Err(internal_error(format!("Relation edge {} target ('out' field) is null or not a Thing", record_thing)).into());
+            //             }
+            //             other => return Err(internal_error(format!("Relation edge {} target ('out' field) is not a Thing: {:?}", record_thing, other)).into()),
+            //         };
+            //         let erased_target_node: ErasedRecord = (gtx.clone(), target_node_thing);
+            //         node_for_edge_erased = field_val_erase_owned(erased_target_node);
+            //     } else {
+            //         // `record_thing` is the data record itself (e.g., from 'User' table)
+            //         cursor_for_edge = encode_cursor(&record_thing);
+            //         let erased_node: ErasedRecord = (gtx.clone(), record_thing);
+            //         node_for_edge_erased = field_val_erase_owned(erased_node);
+            //     }
+            //
+            //     gql_nodes.push(node_for_edge_erased.clone());
+            //     gql_edges.push(GqlEdge {
+            //         node: node_for_edge_erased,
+            //         cursor: cursor_for_edge,
+            //         additional_fields: IndexMap::new(), // Populate if edge_fields are used
+            //     });
+            // }
+            //
+            // if let Some(first_edge) = gql_edges.first() {
+            //     page_info.start_cursor = Some(first_edge.cursor.clone());
+            // }
+            // if let Some(last_edge) = gql_edges.last() {
+            //     page_info.end_cursor = Some(last_edge.cursor.clone());
+            // }
+            //
+            // // --- Total Count ---
+            // // Query for total count without pagination cursors but with relation filters
+            // let mut count_select_stmt = SelectStatement {
+            //     what: Fields(vec![sql::Field::Single {
+            //         expr: SqlValue::Function(sql::Function::new_json("count", vec![])),
+            //         alias: Some(Ident::from("total")),
+            //     }], false),
+            //     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
+            //     cond: None, // Base condition for the set
+            //     group: Some(vec![SqlValue::Idiom(Idiom::from("all"))].into()),
+            //     ..Default::default()
+            // };
+            // if let Some(parent_rid) = &parent_rid_opt { // Re-apply relation filter for total count
+            //     let relation_filter_cond = Cond(Expression::Binary {
+            //         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))),
+            //         o: sql::Operator::Equal,
+            //         r: Box::new(SqlValue::Thing(parent_rid.clone())),
+            //     });
+            //     count_select_stmt.cond = Some(relation_filter_cond);
+            // }
+            //
+            // let total_count_val: i64 = match gtx.process_stmt(Statement::Select(count_select_stmt)).await {
+            //     Ok(SqlValue::Array(mut arr)) if !arr.0.is_empty() => {
+            //         if let Some(SqlValue::Object(obj)) = arr.0.pop() { // array is [{total: N}]
+            //             obj.get("total")
+            //                 .and_then(|v| v.try_as_int()) // Use helper from GqlValueUtils or similar
+            //                 .unwrap_or(0)
+            //         } else { 0 }
+            //     }
+            //     _ => {
+            //         trace!("Failed to get total count or unexpected result.");
+            //         0
+            //     }
+            // };
 
-            if let Some(cursor_thing) = cursor_thing_opt {
-                if let Ordering::Order(OrderList(orders)) = &sql_ordering {
-                    if let Some(primary_order) = orders.first() {
-                        // Simplified: assumes cursor is the ID of the item, and ordering is on 'id'.
-                        // For general cursor logic with arbitrary orderBy, the cursor must contain
-                        // the sort values of the item it points to.
-                        // Here, we assume primary_order.value is 'id' if a cursor is used.
-                        if let SqlValue::Idiom(idiom) = &primary_order.value {
-                            if idiom.to_string() == "id" {
-                                let op_str = if fetch_forwards { // after
-                                    if primary_order.direction { ">" } else { "<" } // ASC: id > cursor_id, DESC: id < cursor_id
-                                } else { // before (query order is already reversed)
-                                    if primary_order.direction { ">" } else { "<" } // Reversed ASC (effectively DESC): id > cursor_id => original id < cursor_id
-                                    // Reversed DESC (effectively ASC): id < cursor_id => original id > cursor_id
-                                };
-                                query_cond = Some(Cond(Expression::Binary {
-                                    l: Box::new(SqlValue::Idiom(Idiom::from("id"))),
-                                    o: sql::Operator::from_str(op_str).map_err(|_| internal_error("Invalid operator string"))?,
-                                    r: Box::new(SqlValue::Thing(cursor_thing.clone())),
-                                }));
-                            } else {
-                                return Err(input_error("Cursor pagination is currently only supported with orderBy ID.").into());
-                            }
-                        } else {
-                            return Err(input_error("Unsupported orderBy field type for cursor pagination.").into());
-                        }
-                    }
-                }
-            }
+            // let connection_obj = GqlConnection {
+            //     edges: gql_edges,
+            //     nodes: gql_nodes,
+            //     page_info,
+            //     total_count: total_count_val,
+            // };
 
-            let mut select_stmt = SelectStatement {
-                what: Fields(vec![sql::Field::All], false), // SELECT *
-                expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
-                order: Some(sql_ordering.clone()),
-                cond: query_cond.clone(),
-                limit: limit_query.map(|l| Limit(SqlValue::Number(sql::Number::from(l)))),
-                ..Default::default()
-            };
-
-            let is_relation_connection = parent_rid_opt.is_some();
-            if let Some(parent_rid) = &parent_rid_opt {
-                // This is a nested connection, assumed to be a relation.
-                // `query_source` is the relation table name.
-                // Assume 'in' field links to parent, 'out' to target. This needs to be configurable or schema-aware.
-                // Example: User (parent_rid) -> Authored (query_source) -> Post (target)
-                // Query: SELECT * FROM Authored WHERE in = User.id
-                let relation_filter_cond = Cond(Expression::Binary {
-                    l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))), // Configurable: field linking to parent
-                    o: sql::Operator::Equal,
-                    r: Box::new(SqlValue::Thing(parent_rid.clone())),
-                });
-                select_stmt.cond = match select_stmt.cond.take() {
-                    Some(existing_cond) => Some(Cond(Expression::Binary {
-                        l: Box::new(Expression::Paren(Box::new(existing_cond.0))),
-                        o: sql::Operator::And,
-                        r: Box::new(relation_filter_cond.0),
-                    })),
-                    None => Some(relation_filter_cond),
-                };
-            }
-
-            let ast = Statement::Select(select_stmt.clone()); // Clone for total_count later
-            trace!("Connection query AST: {:?}", ast);
-
-            let query_result_values = match gtx.process_stmt(ast).await? {
-                SqlValue::Array(a) => a.0,
-                v => return Err(internal_error(format!("Expected array from DB, got {:?}", v)).into()),
-            };
-
-            let mut fetched_items = query_result_values;
-            if !fetch_forwards { // If 'last', results were fetched in reverse query order, reverse them back
-                fetched_items.reverse();
-            }
-
-            let mut page_info = GqlPageInfo::default();
-            let has_extra_item = fetched_items.len() > requested_count;
-
-            if fetch_forwards {
-                page_info.has_next_page = has_extra_item;
-                if has_extra_item { fetched_items.truncate(requested_count); }
-            } else { // Paginating backwards (last/before)
-                page_info.has_previous_page = has_extra_item;
-                if has_extra_item { fetched_items.drain(0..1); } // Remove extra from beginning
-            }
-
-            let mut gql_edges = Vec::new();
-            let mut gql_nodes = Vec::new();
-
-            for item_sql_val in fetched_items {
-                let record_thing = match item_sql_val { // This is either a data record or a relation record
-                    SqlValue::Thing(t) => t,
-                    _ => return Err(internal_error("Expected Thing in connection result items").into()),
-                };
-
-                let node_for_edge_erased: FieldValue;
-                let cursor_for_edge: String;
-
-                if is_relation_connection {
-                    // `record_thing` is the relation record (e.g., from 'Authored' table)
-                    cursor_for_edge = encode_cursor(&record_thing);
-
-                    // Fetch the target node of the relation. Assume 'out' field.
-                    // This needs to be schema-aware for robust relation handling.
-                    let target_node_id_val = gtx.get_record_field(record_thing.clone(), "out").await?;
-                    let target_node_thing = match target_node_id_val {
-                        SqlValue::Thing(t) => t,
-                        SqlValue::Null | SqlValue::None => {
-                            // If target can be null, GQL node type should be nullable.
-                            // For now, error if target is missing for a relation.
-                            return Err(internal_error(format!("Relation edge {} target ('out' field) is null or not a Thing", record_thing)).into());
-                        }
-                        other => return Err(internal_error(format!("Relation edge {} target ('out' field) is not a Thing: {:?}", record_thing, other)).into()),
-                    };
-                    let erased_target_node: ErasedRecord = (gtx.clone(), target_node_thing);
-                    node_for_edge_erased = field_val_erase_owned(erased_target_node);
-                } else {
-                    // `record_thing` is the data record itself (e.g., from 'User' table)
-                    cursor_for_edge = encode_cursor(&record_thing);
-                    let erased_node: ErasedRecord = (gtx.clone(), record_thing);
-                    node_for_edge_erased = field_val_erase_owned(erased_node);
-                }
-
-                gql_nodes.push(node_for_edge_erased.clone());
-                gql_edges.push(GqlEdge {
-                    node: node_for_edge_erased,
-                    cursor: cursor_for_edge,
-                    additional_fields: IndexMap::new(), // Populate if edge_fields are used
-                });
-            }
-
-            if let Some(first_edge) = gql_edges.first() {
-                page_info.start_cursor = Some(first_edge.cursor.clone());
-            }
-            if let Some(last_edge) = gql_edges.last() {
-                page_info.end_cursor = Some(last_edge.cursor.clone());
-            }
-
-            // --- Total Count ---
-            // Query for total count without pagination cursors but with relation filters
-            let mut count_select_stmt = SelectStatement {
-                what: Fields(vec![sql::Field::Single {
-                    expr: SqlValue::Function(sql::Function::new_json("count", vec![])),
-                    alias: Some(Ident::from("total")),
-                }], false),
-                expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
-                cond: None, // Base condition for the set
-                group: Some(vec![SqlValue::Idiom(Idiom::from("all"))].into()),
-                ..Default::default()
-            };
-            if let Some(parent_rid) = &parent_rid_opt { // Re-apply relation filter for total count
-                let relation_filter_cond = Cond(Expression::Binary {
-                    l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))),
-                    o: sql::Operator::Equal,
-                    r: Box::new(SqlValue::Thing(parent_rid.clone())),
-                });
-                count_select_stmt.cond = Some(relation_filter_cond);
-            }
-
-            let total_count_val: i64 = match gtx.process_stmt(Statement::Select(count_select_stmt)).await {
-                Ok(SqlValue::Array(mut arr)) if !arr.0.is_empty() => {
-                    if let Some(SqlValue::Object(obj)) = arr.0.pop() { // array is [{total: N}]
-                        obj.get("total")
-                            .and_then(|v| v.try_as_int()) // Use helper from GqlValueUtils or similar
-                            .unwrap_or(0)
-                    } else { 0 }
-                }
-                _ => {
-                    trace!("Failed to get total count or unexpected result.");
-                    0
-                }
-            };
-
-            let connection_obj = GqlConnection {
-                edges: gql_edges,
-                nodes: gql_nodes,
-                page_info,
-                total_count: total_count_val,
-            };
-
-            Ok(Some(FieldValue::owned_any(connection_obj)))
+            // Ok(Some(FieldValue::owned_any(connection_obj)))
+            Ok(Some(FieldValue::owned_any(Value::Null)))
         })
     }
 }
-
-
-// ... (keep all your existing macros) ...
-//FIXME: maybe useful
-// fn make_connection_resolver(
-//     fd_path: impl Into<String>,
-//     kind: Option<Kind>,
-// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-//     let fd_path = fd_path.into();
-//     move |ctx: ResolverContext| {
-//         let fd_path = fd_path.clone();
-//         let field_kind = kind.clone();
-//
-//         let args = ctx.args.as_index_map();
-//         let after = args.get("after").and_then(|v| v.as_string());
-//         let before = args.get("before").and_then(|v| v.as_string());
-//         let first = args.get("first").and_then(|v| v.as_i64());
-//         let last = args.get("last").and_then(|v| v.as_i64());
-//
-//         trace!("Connection resolver for path '{}' with args: {:?}", fd_path, args);
-//
-//         FieldFuture::new({
-//             async move {
-//                 // Validate pagination arguments
-//                 if first.is_none() && last.is_none() {
-//                     return Err(input_error("Either 'first' or 'last' argument must be provided").into());
-//                 }
-//                 if first.is_some() && last.is_some() {
-//                     return Err(input_error("Only one of 'first' or 'last' argument can be provided").into());
-//                 }
-//                 if let Some(first) = first {
-//                     if first <= 0 {
-//                         return Err(input_error("'first' argument must be greater than 0").into());
-//                     }
-//                 }
-//                 if let Some(last) = last {
-//                     if last <= 0 {
-//                         return Err(input_error("'last' argument must be greater than 0").into());
-//                     }
-//                 }
-//
-//                 // Handle two cases: table-level query vs field-level query
-//                 match ctx.parent_value.downcast_ref::<ErasedRecord>() {
-//                     // Case 1: Field-level connection (e.g., home.amenities)
-//                     Some((gtx, rid)) => {
-//                         trace!("Field-level connection for path '{}' on record {}", fd_path, rid);
-//                         handle_field_connection(gtx, rid, &fd_path, first, last, after, before).await
-//                     }
-//                     // Case 2: Table-level connection (e.g., homes)
-//                     None => {
-//                         trace!("Table-level connection for table '{}'", fd_path);
-//
-//                         // Extract session and datastore from context
-//                         let session = ctx.data::<Session>()
-//                             .map_err(|_| internal_error("Session not found in context"))?;
-//                         let datastore = ctx.data::<Arc<Datastore>>()
-//                             .map_err(|_| internal_error("Datastore not found in context"))?;
-//
-//                         let gtx = GQLTx::new(datastore, session).await?;
-//                         handle_table_connection(&gtx, &fd_path, first, last, after, before).await
-//                     }
-//                 }
-//             }
-//         })
-//     }
-// }
-
-// async fn handle_field_connection<'a>(
-//     gtx: &'a GQLTx,
-//     rid: &'a Thing,
-//     fd_path: &'a str,
-//     first: Option<i64>,
-//     last: Option<i64>,
-//     after: Option<String>,
-//     before: Option<String>,
-// ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
-//     // Get the array field from the record
-//     let val = gtx.get_record_field(rid.clone(), fd_path).await?;
-//     trace!("Fetched DB value for field '{}': {:?}", fd_path, val);
-//
-//     match val {
-//         SqlValue::Array(surreal_array) => {
-//             let items = surreal_array.0;
-//             let total_count = items.len() as i64;
-//
-//             // Apply cursor-based filtering
-//             let mut filtered_items = items;
-//
-//             // Filter by 'after' cursor
-//             if let Some(after_cursor) = after {
-//                 let after_id = decode_cursor(&after_cursor)?;
-//                 if let Some(pos) = filtered_items.iter().position(|item| {
-//                     match item {
-//                         SqlValue::Thing(thing) => thing.id.to_string() == after_id,
-//                         _ => false,
-//                     }
-//                 }) {
-//                     filtered_items = filtered_items.into_iter().skip(pos + 1).collect();
-//                 }
-//             }
-//
-//             // Filter by 'before' cursor
-//             if let Some(before_cursor) = before {
-//                 let before_id = decode_cursor(&before_cursor)?;
-//                 if let Some(pos) = filtered_items.iter().position(|item| {
-//                     match item {
-//                         SqlValue::Thing(thing) => thing.id.to_string() == before_id,
-//                         _ => false,
-//                     }
-//                 }) {
-//                     filtered_items = filtered_items.into_iter().take(pos).collect();
-//                 }
-//             }
-//
-//             // Apply pagination
-//             let (paginated_items, pagination_info) = if let Some(first) = first {
-//                 let has_next = filtered_items.len() > first as usize;
-//                 let items: Vec<_> = filtered_items.into_iter().take(first as usize).collect();
-//                 let start_cursor = items.first().and_then(|item| match item {
-//                     SqlValue::Thing(thing) => Some(encode_cursor(&thing.id.to_string())),
-//                     _ => None,
-//                 });
-//                 let end_cursor = items.last().and_then(|item| match item {
-//                     SqlValue::Thing(thing) => Some(encode_cursor(&thing.id.to_string())),
-//                     _ => None,
-//                 });
-//
-//                 (items, PaginationInfo {
-//                     has_next_page: has_next,
-//                     has_previous_page: after.is_some(),
-//                     start_cursor,
-//                     end_cursor,
-//                     total_count,
-//                 })
-//             } else if let Some(last) = last {
-//                 let has_prev = filtered_items.len() > last as usize;
-//                 let skip_count = if filtered_items.len() > last as usize {
-//                     filtered_items.len() - last as usize
-//                 } else {
-//                     0
-//                 };
-//                 let items: Vec<_> = filtered_items.into_iter().skip(skip_count).collect();
-//                 let start_cursor = items.first().and_then(|item| match item {
-//                     SqlValue::Thing(thing) => Some(encode_cursor(&thing.id.to_string())),
-//                     _ => None,
-//                 });
-//                 let end_cursor = items.last().and_then(|item| match item {
-//                     SqlValue::Thing(thing) => Some(encode_cursor(&thing.id.to_string())),
-//                     _ => None,
-//                 });
-//
-//                 (items, PaginationInfo {
-//                     has_next_page: before.is_some(),
-//                     has_previous_page: has_prev,
-//                     start_cursor,
-//                     end_cursor,
-//                     total_count,
-//                 })
-//             } else {
-//                 return Err(internal_error("No pagination parameters provided").into());
-//             };
-//
-//             // Convert items to GraphQL format
-//             let mut edges = Vec::new();
-//             let mut nodes = Vec::new();
-//
-//             for item in paginated_items {
-//                 match item {
-//                     SqlValue::Thing(thing) => {
-//                         let cursor = encode_cursor(&thing.id.to_string());
-//                         let record_context: ErasedRecord = (gtx.clone(), thing.clone());
-//                         let node = field_val_erase_owned(record_context.clone());
-//
-//                         // Create edge
-//                         let edge_content = vec![
-//                             (Name::new("cursor"), FieldValue::value(cursor)),
-//                             (Name::new("node"), field_val_erase_owned(record_context)),
-//                         ];
-//                         edges.push(FieldValue::owned_any(edge_content));
-//                         nodes.push(node);
-//                     }
-//                     SqlValue::Null | SqlValue::None => {
-//                         edges.push(FieldValue::NULL);
-//                         nodes.push(FieldValue::NULL);
-//                     }
-//                     _ => {
-//                         return Err(internal_error(format!(
-//                             "Expected Thing for Record array element, got {:?}", item
-//                         )).into());
-//                     }
-//                 }
-//             }
-//
-//             // Create PageInfo
-//             let page_info_content = vec![
-//                 (Name::new("hasNextPage"), FieldValue::value(pagination_info.has_next_page)),
-//                 (Name::new("hasPreviousPage"), FieldValue::value(pagination_info.has_previous_page)),
-//                 (Name::new("startCursor"), FieldValue::value(pagination_info.start_cursor.unwrap_or_default())),
-//                 (Name::new("endCursor"), FieldValue::value(pagination_info.end_cursor.unwrap_or_default())),
-//             ];
-//
-//             // Create Connection
-//             let connection_content = vec![
-//                 (Name::new("edges"), FieldValue::list(edges)),
-//                 (Name::new("nodes"), FieldValue::list(nodes)),
-//                 (Name::new("pageInfo"), FieldValue::owned_any(page_info_content)),
-//                 (Name::new("totalCount"), FieldValue::value(pagination_info.total_count)),
-//             ];
-//
-//             Ok(Some(FieldValue::owned_any(connection_content)))
-//         }
-//         SqlValue::Null | SqlValue::None => {
-//             // Return empty connection
-//             let empty_page_info = vec![
-//                 (Name::new("hasNextPage"), FieldValue::value(false)),
-//                 (Name::new("hasPreviousPage"), FieldValue::value(false)),
-//                 (Name::new("startCursor"), FieldValue::value("")),
-//                 (Name::new("endCursor"), FieldValue::value("")),
-//             ];
-//
-//             let empty_connection = vec![
-//                 (Name::new("edges"), FieldValue::list(Vec::<FieldValue>::new())),
-//                 (Name::new("nodes"), FieldValue::list(Vec::<FieldValue>::new())),
-//                 (Name::new("pageInfo"), FieldValue::owned_any(empty_page_info)),
-//                 (Name::new("totalCount"), FieldValue::value(0i64)),
-//             ];
-//
-//             Ok(Some(FieldValue::owned_any(empty_connection)))
-//         }
-//         other => {
-//             Err(internal_error(format!(
-//                 "Expected Array from DB for connection field '{}', got {:?}",
-//                 fd_path, other
-//             )).into())
-//         }
-//     }
-// }
-
-// async fn handle_table_connection<'a>(
-//     gtx: &'a GQLTx,
-//     table_name: &'a str,
-//     first: Option<i64>,
-//     last: Option<i64>,
-//     after: Option<String>,
-//     before: Option<String>,
-// ) -> Result<Option<FieldValue<'a>>, async_graphql::Error> {
-//     // Build SELECT query for the table
-//     let mut select_stmt = SelectStatement {
-//         what: vec![SqlValue::Table(table_name.into())].into(),
-//         expr: Fields(
-//             vec![sql::Field::Single {
-//                 expr: SqlValue::Idiom(Idiom::from("id")),
-//                 alias: None,
-//             }],
-//             true, // VALUE keyword
-//         ),
-//         ..Default::default()
-//     };
-//
-//     // Add cursor-based WHERE conditions
-//     let mut conditions = Vec::new();
-//
-//     if let Some(after_cursor) = after {
-//         let after_id = decode_cursor(&after_cursor)?;
-//         // Add condition: id > after_id (simplified, you might want proper ordering)
-//         conditions.push(format!("id > '{}'", after_id));
-//     }
-//
-//     if let Some(before_cursor) = before {
-//         let before_id = decode_cursor(&before_cursor)?;
-//         // Add condition: id < before_id
-//         conditions.push(format!("id < '{}'", before_id));
-//     }
-//
-//     // Apply conditions to query (you'll need to implement proper SQL condition building)
-//     if !conditions.is_empty() {
-//         // This is simplified - you'll need to properly build SQL conditions
-//         // select_stmt.cond = Some(build_conditions(conditions));
-//     }
-//
-//     // Add LIMIT
-//     if let Some(limit) = first.or(last) {
-//         select_stmt.limit = Some(Limit(SqlValue::Number((limit + 1).into()))); // +1 to check for next page
-//     }
-//
-//     // Add ORDER BY for consistent pagination
-//     // You might want to add proper ordering here
-//
-//     let ast = Statement::Select(select_stmt);
-//     trace!("Generated table query: {:?}", ast);
-//
-//     let res = gtx.process_stmt(ast).await?;
-//     trace!("Table query result: {:?}", res);
-//
-//     let res_vec = match res {
-//         SqlValue::Array(a) => a,
-//         v => {
-//             return Err(internal_error(format!("Expected array result, got: {:?}", v)).into());
-//         }
-//     };
-//
-//     let items = res_vec.0;
-//     let total_count = items.len() as i64;
-//
-//     // Determine if there are more pages
-//     let (has_next_page, has_previous_page, actual_items) = if let Some(first) = first {
-//         let has_next = items.len() > first as usize;
-//         let actual_items = if has_next {
-//             items.into_iter().take(first as usize).collect()
-//         } else {
-//             items
-//         };
-//         (has_next, after.is_some(), actual_items)
-//     } else if let Some(last) = last {
-//         let has_prev = items.len() > last as usize;
-//         let actual_items = if has_prev {
-//             items.into_iter().skip(1).collect() // Skip first item if we have previous
-//         } else {
-//             items
-//         };
-//         (before.is_some(), has_prev, actual_items)
-//     } else {
-//         (false, false, items)
-//     };
-//
-//     // Convert to GraphQL format
-//     let mut edges = Vec::new();
-//     let mut nodes = Vec::new();
-//
-//     for item in actual_items {
-//         match item.try_as_thing() {
-//             Ok(thing) => {
-//                 let cursor = encode_cursor(&thing.id.to_string());
-//                 let record_context: ErasedRecord = (gtx.clone(), thing.clone());
-//                 let node = field_val_erase_owned(record_context.clone());
-//
-//                 let edge_content = vec![
-//                     (Name::new("cursor"), FieldValue::value(cursor)),
-//                     (Name::new("node"), field_val_erase_owned(record_context)),
-//                 ];
-//                 edges.push(FieldValue::owned_any(edge_content));
-//                 nodes.push(node);
-//             }
-//             Err(_) => {
-//                 return Err(internal_error(format!("Expected Thing, got: {:?}", item)).into());
-//             }
-//         }
-//     }
-//
-//     // Create PageInfo
-//     let start_cursor = edges.first().and_then(|edge| {
-//         // Extract cursor from first edge - this is simplified
-//         Some("start_cursor".to_string()) // You'll need to extract the actual cursor
-//     }).unwrap_or_default();
-//
-//     let end_cursor = edges.last().and_then(|edge| {
-//         // Extract cursor from last edge - this is simplified
-//         Some("end_cursor".to_string()) // You'll need to extract the actual cursor
-//     }).unwrap_or_default();
-//
-//     let page_info_content = vec![
-//         (Name::new("hasNextPage"), FieldValue::value(has_next_page)),
-//         (Name::new("hasPreviousPage"), FieldValue::value(has_previous_page)),
-//         (Name::new("startCursor"), FieldValue::value(start_cursor)),
-//         (Name::new("endCursor"), FieldValue::value(end_cursor)),
-//     ];
-//
-//     // Create Connection
-//     let connection_content = vec![
-//         (Name::new("edges"), FieldValue::list(edges)),
-//         (Name::new("nodes"), FieldValue::list(nodes)),
-//         (Name::new("pageInfo"), FieldValue::owned_any(page_info_content)),
-//         (Name::new("totalCount"), FieldValue::value(total_count)),
-//     ];
-//
-//     Ok(Some(FieldValue::owned_any(connection_content)))
-// }
-
 
 // let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
 //
@@ -2432,7 +1704,7 @@ macro_rules! filter_impl {
 }
 
 //FIXME: implement
-fn page_info_resolver(
+fn dummy_resolver(
     db_name: String, // DB name (e.g., "created_at", "size")
     kind: Option<Kind>,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
