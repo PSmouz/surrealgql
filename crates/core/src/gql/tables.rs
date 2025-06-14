@@ -33,9 +33,11 @@ use async_graphql::dynamic::{InputValue, Union};
 use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
+use base64::engine::general_purpose;
 use base64::Engine;
 use inflector::Inflector;
 use log::trace;
+use sha2::{Digest, Sha256};
 
 // macro_rules! order {
 // 	(asc, $field:expr) => {{
@@ -248,7 +250,9 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "nodes",
                     TypeRef::named_list($node_ty_name),
-                    dummy_resolver("".to_string(), None),
+                    // connection_nodes_resolver(),
+dummy_resolver("".to_string(), None),
+                    // make_parent_object_resolver(|conn: &GqlConnection| conn.nodes),
                 ).description("A list of nodes."))
                 .field(Field::new(
                     "pageInfo",
@@ -281,13 +285,16 @@ macro_rules! cursor_pagination {
     };
 }
 
-// #[derive(Clone, Debug)]
-// struct GqlEdge<'a> {
-//     node: Arc<ErasedRecord>,
-//     cursor: String,
-//     #[allow(dead_code)]
-//     additional_fields: IndexMap<Name, GqlValue>,
-// }
+#[derive(Debug)]
+struct GqlEdge {
+    //     node: Arc<ErasedRecord>,
+    cursor: String,
+    // The actual data item (node). This is a `FieldValue` so it can be resolved
+    // by async-graphql. It will typically wrap an `ErasedRecord` or a simple value.
+    node: FieldValue<'static>,
+    //     #[allow(dead_code)]
+    //     additional_fields: IndexMap<Name, GqlValue>,
+}
 
 #[derive(Clone, Debug, Default)]
 struct GqlPageInfo {
@@ -297,10 +304,12 @@ struct GqlPageInfo {
     end_cursor: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GqlConnection {
     // edges: Vec<GqlEdge<'a>>,
     // nodes: Vec<Arc<ErasedRecord>>,
+    // edges: Vec<GqlEdge>,
+    // nodes: FieldValue<'static>,
     page_info: GqlPageInfo,
     total_count: i64,
 }
@@ -324,6 +333,16 @@ fn decode_cursor(cursor: &str) -> Result<Thing, GqlError> {
         .map_err(|e| input_error(format!("Invalid cursor: failed to convert to utf8: {}", e)))?;
     s.try_into()
         .map_err(|se| input_error(format!("Invalid cursor content: {:?}", se)))
+}
+
+/// Generates a stable, content-addressable cursor for any given item in a list.
+///
+/// This function creates a consistent hash of the item's content, making the
+/// cursor independent of the item's position in the list.
+fn encode_cursor_for_item(item: &SqlValue) -> String {
+    // The index is no longer needed for encoding, but we keep it in the
+    // signature to maintain compatibility with the calling function.
+    hash_sql_value(item)
 }
 
 
@@ -390,6 +409,115 @@ where
         })
     }
 }
+
+
+// fn connection_nodes_re
+
+/// Finds the index of an item in the full list that corresponds to a given cursor.
+///
+/// This function works by iterating through the list and generating a cursor for each item,
+/// comparing it to the target cursor. This allows it to find the correct index regardless
+//  of whether the cursor was generated from a Thing or an index.
+fn find_index_for_cursor(
+    all_edges: &[SqlValue],
+    cursor: &str,
+) -> Option<usize> {
+    all_edges.iter().enumerate().find_map(|(i, item)| {
+        if encode_cursor_for_item(item) == cursor {
+            Some(i)
+        } else {
+            None
+        }
+    })
+}
+
+/// Implements the spec's `ApplyCursorsToEdges` logic.
+///
+/// This function takes the full set of edges and returns a slice of that set
+/// between the `after` and `before` cursors.
+fn apply_cursors_to_edges(
+    all_edges: &[SqlValue],
+    before: Option<String>,
+    after: Option<String>,
+) -> &[SqlValue] {
+    let mut start_index = 0;
+    let mut end_index = all_edges.len();
+
+    if let Some(after_cursor) = after {
+        if let Some(after_idx) = find_index_for_cursor(all_edges, &after_cursor)
+        {
+            start_index = after_idx + 1;
+        } else {
+            return &[]; // Invalid `after` cursor
+        }
+    }
+
+    if let Some(before_cursor) = before {
+        if let Some(before_idx) =
+            find_index_for_cursor(all_edges, &before_cursor)
+        {
+            end_index = before_idx;
+        } else {
+            return &[]; // Invalid `before` cursor
+        }
+    }
+
+    if start_index >= end_index {
+        return &[];
+    }
+
+    &all_edges[start_index..end_index]
+}
+
+/// Calculates `hasNextPage` according to the GraphQL Cursor Connections spec.
+pub fn has_next_page(
+    edges: &[SqlValue],
+    before: Option<&str>,
+    first: Option<usize>,
+) -> bool {
+    if let Some(first_val) = first {
+        return edges.len() > first_val;
+    }
+
+    if let Some(before_cursor) = before {
+        // If the server can efficiently determine that elements exist following before, return true.
+        if let Some(index) = find_index_for_cursor(edges, before_cursor) {
+            return index < edges.len() - 1;
+        }
+    }
+
+    false
+}
+
+/// Calculates `hasPreviousPage` according to the GraphQL Cursor Connections spec.
+pub fn has_previous_page(
+    edges: &[SqlValue],
+    after: Option<&str>,
+    last: Option<usize>,
+) -> bool {
+    if let Some(last_val) = last {
+        return edges.len() > last_val;
+    }
+
+    if let Some(after_cursor) = after {
+        // If the server can efficiently determine that elements exist prior to after, return true.
+        if let Some(index) = find_index_for_cursor(edges, after_cursor) {
+            return index > 0;
+        }
+    }
+
+    false
+}
+
+
+
+
+
+
+
+
+
+
 
 /// This macro is used to parse a field definition and add it to the object map.
 /// It handles different kinds of fields, including nested fields and array fields.
@@ -1292,21 +1420,9 @@ fn make_connection_resolver(
             //     return Err(internal_error("GQLTx not found in resolver context").into());
             // };
 
-            trace!("db_value_array: {:?}", db_value_array);
+            trace!("db_value_array: {:?}", db_value_array.clone());
 
             //FIXME: two cases possible: we have array of objects or things.
-
-            let total_count = match db_value_array {
-                SqlValue::Array(arr) => arr.0.len() as i64,
-                SqlValue::None | SqlValue::Null => 0,
-                other => {
-                    // If the schema expects a list but the DB returns something else, it's an inconsistency.
-                    return Err(internal_error(format!(
-                        "Expected an array from the database for connection field '{}', but got {:?}",
-                        query_source, other
-                    )).into());
-                }
-            };
 
             let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
             let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
@@ -1321,6 +1437,45 @@ fn make_connection_resolver(
                 return Err(input_error("Pagination limit too high (max 1000).").into());
             }
 
+            // ---------Process the edges--------
+
+            let all_edges: &[SqlValue] = match &db_value_array {
+                SqlValue::Array(arr) => arr,
+                _ => &[],
+            };
+            trace!("Edges slice: {:?}", all_edges);
+
+            let total_count = all_edges.len() as i64;
+            trace!("Total items found: {}", total_count);
+            // if all_edges.is_empty() {
+            //     trace!("No items to paginate.");
+            //     return;
+            // }
+
+            let edges = apply_cursors_to_edges(
+                all_edges, after_cursor_str.clone(), before_cursor_str.clone());
+
+            let mut limited_edges = edges;
+            if let Some(first_val) = first {
+                limited_edges = &limited_edges[..first_val.min(limited_edges.len())];
+            } else if let Some(last_val) = last {
+                let start = limited_edges.len().saturating_sub(last_val);
+                limited_edges = &limited_edges[start..];
+            }
+
+            let has_next = has_next_page(
+                edges,
+                before_cursor_str.as_deref(),
+                first,
+            );
+            let has_prev = has_previous_page(
+                edges,
+                after_cursor_str.as_deref(),
+                last,
+            );
+
+            let start_cursor = limited_edges.first().map(encode_cursor_for_item);
+            let end_cursor = limited_edges.last().map(encode_cursor_for_item);
 
             // let mut limit_query: Option<usize> = None;
             // let mut fetch_forwards = true;
@@ -1542,14 +1697,27 @@ fn make_connection_resolver(
             //     nodes: gql_nodes,
             //     page_info,
             //     total_count: total_count_val,
-            // };
+            let gql_values: Vec<GqlValue> = limited_edges.iter().map(|v| sql_value_to_gql_value(v
+                .clone())
+                .unwrap())
+                .collect();
+            let gql_val_lim = FieldValue::list(gql_values);
+            trace!("Converted SQL values lim to GQL values: {:?}", gql_val_lim);
+
+            let gql_val = sql_value_to_gql_value(db_value_array)?;
+            // return Ok(Some(FieldValue::value(gql_val)));
+            trace!("Converted SQL value to GQL value: {:?}", gql_val);
+
             let page_info = GqlPageInfo {
-                has_next_page: false, // Set later if needed
-                has_previous_page: false, // Set later if needed
-                start_cursor: None,
-                end_cursor: None,
+                has_next_page: has_next,
+                has_previous_page: has_prev,
+                start_cursor,
+                end_cursor,
             };
             let connection_obj = GqlConnection {
+                // edges: vec![],
+                // nodes: FieldValue::value(gql_val),
+                // nodes:  vec![],
                 total_count,
                 page_info,
             };
@@ -2118,3 +2286,55 @@ fn parse_order_input(order: Option<&GqlValue>) -> Result<Option<Vec<sql::Order>>
 // 2025-04-22T19:32:25.885172Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:688: Field at path 'size.location.`info`' is scalar/id/terminal, fetching value via get_record_field     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
 // 2025-04-22T19:32:25.885188Z TRACE request: surrealdb::core::dbs: crates/core/src/dbs/iterator.rs:354: Iterating statement statement=SELECT * FROM image:ppli74w1kj8biujquu43 otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
 // 2025-04-22T19:32:25.885258Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:695: Fetched value for path 'size.location.`info`': None     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
+
+
+/// Recursively serializes an `SqlValue` into a canonical, stable string format.
+/// This is essential for generating consistent hashes.
+fn canonicalize_sql_value(value: &SqlValue) -> String {
+    match value {
+        // For objects, iterate over the already-sorted keys of the BTreeMap.
+        SqlValue::Object(obj) => {
+            let pairs: String = obj
+                .iter()
+                .map(|(k, v)| {
+                    // Recursively canonicalize the value.
+                    format!("\"{}\":{}", k, canonicalize_sql_value(v))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{}}}", pairs)
+        }
+        // For arrays, iterate in order and canonicalize each element.
+        SqlValue::Array(arr) => {
+            let items: String = arr
+                .0
+                .iter()
+                .map(canonicalize_sql_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{}]", items)
+        }
+        // Ensure scalars have a consistent representation.
+        SqlValue::Strand(s) => format!("\"{}\"", s), // Quote strings
+        SqlValue::Thing(t) => format!("\"{}\"", t),   // Quote things
+        SqlValue::Number(n) => n.to_string(),
+        SqlValue::Bool(b) => b.to_string(),
+        SqlValue::None | SqlValue::Null => "null".to_string(),
+        // Add other types as needed, ensuring a stable string format.
+        other => format!("\"{}\"", other.to_string()), // Fallback with quotes
+    }
+}
+
+/// Hashes a canonicalized SqlValue to create a stable, content-addressable cursor.
+fn hash_sql_value(value: &SqlValue) -> String {
+    // 1. Get the canonical string representation of the value.
+    let canonical_string = canonicalize_sql_value(value);
+
+    // 2. Hash the string using a stable algorithm like SHA-256.
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_string.as_bytes());
+    let hash_result = hasher.finalize();
+
+    // 3. Base64-encode the raw hash bytes to create a clean cursor string.
+    general_purpose::URL_SAFE_NO_PAD.encode(hash_result)
+}
