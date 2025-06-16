@@ -651,17 +651,34 @@ macro_rules! parse_field {
             // with `tx.all_tb_fields()`
             match $map.remove(&fd_path_parent) {
                 Some(obj) => {
+                    let new_field = match kind_non_optional {
+                        Kind::Array(_, _) if $cursor => {
+                            if let kind = kind.inner_kind().unwrap() {
+                                let ty_ref = kind_to_type(kind.clone(), $types, path.as_slice())?;
+                                let ty_name = ty_ref.type_name();
+
+                                cursor_pagination!($types, &fd_name_gql, ty_name,
+                                    make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
+                                    edge_fields: [], args: [])
+                            } else {
+                                // Fallback for safety, though inner_kind should always exist for an array
+                                Field::new(fd_name_gql, fd_ty, make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()))
+                            }
+                        }
+                        _ => {
+                            Field::new(
+                                fd_name_gql,
+                                fd_ty,
+                                make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                            )
+                        }
+                    };
                     $map.insert(fd_path_parent.clone(), Object::from(obj)
-                        .field(Field::new(
-                            fd_name_gql,
-                            fd_ty,
-                            make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
-                        ))
-                        .description(if let Some(ref c) = $fd.comment {
+                        .field(new_field.description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
                         } else {
                             "".to_string()
-                        }),
+                        }))
                     );
                 }
                 None => return Err(internal_error("Nested field should have parent object.")),
