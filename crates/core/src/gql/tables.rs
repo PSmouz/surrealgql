@@ -250,8 +250,8 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "nodes",
                     TypeRef::named_list($node_ty_name),
-                    // connection_nodes_resolver(),
-dummy_resolver("".to_string(), None),
+                    connection_nodes_resolver(),
+// dummy_resolver("".to_string(), None),
                     // make_parent_object_resolver(|conn: &GqlConnection| conn.nodes),
                 ).description("A list of nodes."))
                 .field(Field::new(
@@ -309,7 +309,9 @@ struct GqlConnection {
     // edges: Vec<GqlEdge<'a>>,
     // nodes: Vec<Arc<ErasedRecord>>,
     // edges: Vec<GqlEdge>,
-    // nodes: FieldValue<'static>,
+    // nodes: GqlValue::List(),
+    // nodes: GqlValue,
+    nodes: Vec<SqlValue>,
     page_info: GqlPageInfo,
     total_count: i64,
 }
@@ -410,8 +412,33 @@ where
     }
 }
 
+fn connection_nodes_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+    move |ctx: ResolverContext| {
+        FieldFuture::new(async move {
+            if let Some(conn) = ctx.parent_value.downcast_ref::<GqlConnection>() {
+                // 1. Clone the Vec<SqlValue>. This is cheap if SqlValue is cheap to clone.
+                let nodes_sql = conn.nodes.clone();
 
-// fn connection_nodes_re
+                // 2. Convert the owned Vec<SqlValue> to a Vec<GqlValue>.
+                let nodes_gql: Vec<GqlValue> = nodes_sql
+                    .into_iter()
+                    .map(|v| sql_value_to_gql_value(v))
+                    .collect::<Result<_, _>>()?;
+
+                // 3. Create the final GqlValue::List and pass it to FieldValue::value.
+                Ok(Some(FieldValue::value(GqlValue::List(nodes_gql))))
+                // Ok(Some(FieldValue::value(&conn.nodes)))
+                // Ok(Some(&conn.nodes))
+                // Ok(Some(FieldValue::list((&conn.nodes).into())))
+            } else {
+                Err(internal_error(
+                    "Internal Error: Expected parent of type '{}', but found something else."
+                ).into())
+            }
+        })
+    }
+}
+
 
 /// Finds the index of an item in the full list that corresponds to a given cursor.
 ///
@@ -1692,21 +1719,22 @@ fn make_connection_resolver(
             //     }
             // };
 
-            // let connection_obj = GqlConnection {
-            //     edges: gql_edges,
-            //     nodes: gql_nodes,
-            //     page_info,
-            //     total_count: total_count_val,
-            let gql_values: Vec<GqlValue> = limited_edges.iter().map(|v| sql_value_to_gql_value(v
-                .clone())
-                .unwrap())
-                .collect();
-            let gql_val_lim = FieldValue::list(gql_values);
-            trace!("Converted SQL values lim to GQL values: {:?}", gql_val_lim);
+            // let gql_values: Vec<GqlValue> = limited_edges.iter().map(|v| sql_value_to_gql_value(v
+            //     .clone())
+            //     .unwrap())
+            //     .collect();
+            // let gql_val_lim = FieldValue::list(gql_values);
+            // trace!("gql_val_lim: {:?}", gql_val_lim);
+            //
+            // let gql_val = sql_value_to_gql_value(db_value_array)?;
+            // // return Ok(Some(FieldValue::value(gql_val)));
+            // trace!("gql_val: {:?}", gql_val);
 
-            let gql_val = sql_value_to_gql_value(db_value_array)?;
-            // return Ok(Some(FieldValue::value(gql_val)));
-            trace!("Converted SQL value to GQL value: {:?}", gql_val);
+            let gql_nodes: Vec<GqlValue> = limited_edges
+                .iter()
+                .map(|v| sql_value_to_gql_value(v.clone()))
+                .collect::<Result<_, _>>()?;
+            trace!("gql_nodes: {:?}", gql_nodes);
 
             let page_info = GqlPageInfo {
                 has_next_page: has_next,
@@ -1716,8 +1744,9 @@ fn make_connection_resolver(
             };
             let connection_obj = GqlConnection {
                 // edges: vec![],
-                // nodes: FieldValue::value(gql_val),
-                // nodes:  vec![],
+                nodes: limited_edges.to_vec(),
+                // nodes: GqlValue::List(gql_nodes),
+                // nodes: gql_val,
                 total_count,
                 page_info,
             };
