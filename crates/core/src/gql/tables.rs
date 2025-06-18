@@ -10,6 +10,8 @@ use super::ext::IntoExt;
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
 use crate::dbs::Session;
 use crate::fnc::time::format;
+use crate::gql::cursor;
+use crate::gql::cursor::{GqlConnection, GqlEdge, GqlPageInfo};
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
@@ -18,7 +20,7 @@ use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Ident, Literal, Part, Table, TableType};
+use crate::sql::{self, Ident, Literal, Operator, Part, Table, TableType};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
@@ -115,14 +117,14 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "hasNextPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &GqlPageInfo| pi.has_next_page),
+                cursor::make_field_value_resolver(|pi: &GqlPageInfo| pi.has_next_page),
                 ).description("When paginating forwards, are there more items?")
             )
             .field(
                 Field::new(
                 "hasPreviousPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &GqlPageInfo| pi.has_previous_page),
+                cursor::make_field_value_resolver(|pi: &GqlPageInfo| pi.has_previous_page),
                 ).description("When paginating backwards, are there more items?")
             )
             .field(
@@ -130,7 +132,7 @@ macro_rules! define_page_info_type {
                 "startCursor",
                 TypeRef::named(TypeRef::STRING),
                 // asyncGQL Value doesnt implement from for Option<T>
-                make_field_value_resolver(|pi: &GqlPageInfo|
+                cursor::make_field_value_resolver(|pi: &GqlPageInfo|
                     match &pi.start_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,
@@ -142,7 +144,7 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "endCursor",
                 TypeRef::named(TypeRef::STRING),
-                make_field_value_resolver(|pi: &GqlPageInfo|
+                cursor::make_field_value_resolver(|pi: &GqlPageInfo|
                     match &pi.end_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,
@@ -229,12 +231,12 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "cursor",
                     TypeRef::named_nn(TypeRef::STRING),
-                    dummy_resolver("".to_string(), None),
+                    cursor::make_field_value_resolver(|e: &GqlEdge| e.cursor),
                 ).description("A cursor for use in pagination."))
                 .field(Field::new(
                     "node",
                     TypeRef::named($node_ty_name),
-                    dummy_resolver("".to_string(), None),
+                    cursor::edge_node_resolver(),
                 ).description("The item at the end of the edge."))
                 .description("An edge in a connection.");
             for fd in $edge_fields_expr {
@@ -245,24 +247,23 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "edges",
                     TypeRef::named_list(&edge_type_name),
-                    dummy_resolver("".to_string(), None),
+                    cursor::connection_edges_resolver(),
                 ).description("A list of edges."))
                 .field(Field::new(
                     "nodes",
                     TypeRef::named_list($node_ty_name),
-                    connection_nodes_resolver(),
-// dummy_resolver("".to_string(), None),
+                    cursor::connection_nodes_resolver(),
                     // make_parent_object_resolver(|conn: &GqlConnection| conn.nodes),
                 ).description("A list of nodes."))
                 .field(Field::new(
                     "pageInfo",
                     TypeRef::named_nn("PageInfo"),
-                    make_parent_object_resolver(|conn: &GqlConnection| conn.page_info.clone()),
+                    cursor::make_parent_object_resolver(|conn: &GqlConnection| conn.page_info.clone()),
                 ).description("Information to aid in pagination."))
                 .field(Field::new(
                     "totalCount",
                     TypeRef::named_nn(TypeRef::INT),
-                    make_field_value_resolver(|conn: &GqlConnection| conn.total_count),
+                    cursor::make_field_value_resolver(|conn: &GqlConnection| conn.total_count),
                 ).description("Identifies the total count of items in the connection."))
                 .description(format!("The connection type for {}.", $node_ty_name));
 
@@ -285,266 +286,11 @@ macro_rules! cursor_pagination {
     };
 }
 
-#[derive(Debug)]
-struct GqlEdge {
-    //     node: Arc<ErasedRecord>,
-    cursor: String,
-    // The actual data item (node). This is a `FieldValue` so it can be resolved
-    // by async-graphql. It will typically wrap an `ErasedRecord` or a simple value.
-    node: FieldValue<'static>,
-    //     #[allow(dead_code)]
-    //     additional_fields: IndexMap<Name, GqlValue>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct GqlPageInfo {
-    has_next_page: bool,
-    has_previous_page: bool,
-    start_cursor: Option<String>,
-    end_cursor: Option<String>,
-}
-
-#[derive(Debug)]
-struct GqlConnection {
-    // edges: Vec<GqlEdge<'a>>,
-    // nodes: Vec<Arc<ErasedRecord>>,
-    // edges: Vec<GqlEdge>,
-    // nodes: GqlValue::List(),
-    // nodes: GqlValue,
-    nodes: Vec<SqlValue>,
-    page_info: GqlPageInfo,
-    total_count: i64,
-}
-
 // impl<'a> From<GqlPageInfo> for FieldValue<'a> {
 //     fn from(val: GqlPageInfo) -> Self {
 //         FieldValue::owned_any(val)
 //     }
 // }
-
-fn encode_cursor(thing: &Thing) -> String {
-    BASE64.encode(thing.to_string().as_bytes())
-}
-
-// Helper to decode a cursor string back into a Thing ID
-fn decode_cursor(cursor: &str) -> Result<Thing, GqlError> {
-    let bytes = BASE64
-        .decode(cursor.as_bytes())
-        .map_err(|e| input_error(format!("Invalid cursor: failed to decode base64: {}", e)))?;
-    let s = String::from_utf8(bytes)
-        .map_err(|e| input_error(format!("Invalid cursor: failed to convert to utf8: {}", e)))?;
-    s.try_into()
-        .map_err(|se| input_error(format!("Invalid cursor content: {:?}", se)))
-}
-
-/// Generates a stable, content-addressable cursor for any given item in a list.
-///
-/// This function creates a consistent hash of the item's content, making the
-/// cursor independent of the item's position in the list.
-fn encode_cursor_for_item(item: &SqlValue) -> String {
-    // The index is no longer needed for encoding, but we keep it in the
-    // signature to maintain compatibility with the calling function.
-    hash_sql_value(item)
-}
-
-
-/// A generic resolver factory for fields that return a terminal GraphQL value (scalar, enum, etc.).
-///
-/// It extracts a field from a parent object `P`, converts it to a `Value`,
-/// and wraps it in a `FieldValue`. This works for primitives like `i64`, `bool`, `String`, etc.
-///
-/// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
-/// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
-fn make_field_value_resolver<P, F>(
-    extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
-) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
-where
-    P: Any + Send + Sync,
-    F: Into<GqlValue> + Send,
-{
-    move |ctx: ResolverContext| {
-        let extractor = extractor.clone();
-        FieldFuture::new(async move {
-            if let Some(parent) = ctx.parent_value.downcast_ref::<P>() {
-                let field_value = extractor(parent);
-                // Ok(Some(FieldValue::value(GqlValue::from(field_value))))
-                Ok(Some(FieldValue::value(field_value.into())))
-            } else {
-                let parent_type_name = std::any::type_name::<P>();
-                Err(internal_error(format!(
-                    "Internal Error: Expected parent of type '{}', but found something else.",
-                    parent_type_name
-                )).into())
-            }
-        })
-    }
-}
-
-/// A generic resolver factory for fields that are themselves parent objects.
-///
-/// It extracts a nested struct from a parent object `P` and passes it down,
-/// so it can be the parent for its own child resolvers.
-///
-/// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
-/// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
-fn make_parent_object_resolver<P, F>(
-    extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
-) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
-where
-    P: Any + Send + Sync,
-    F: Any + Clone + Send + Sync,
-{
-    move |ctx: ResolverContext| {
-        let extractor = extractor.clone();
-        FieldFuture::new(async move {
-            if let Some(parent) = ctx.parent_value.downcast_ref::<P>() {
-                let nested_object = extractor(parent);
-                // Wrap the nested struct so it can be a parent for its children.
-                Ok(Some(FieldValue::owned_any(nested_object)))
-            } else {
-                let parent_type_name = std::any::type_name::<P>();
-                Err(internal_error(format!(
-                    "Internal Error: Expected parent of type '{}', but found something else.",
-                    parent_type_name
-                )).into())
-            }
-        })
-    }
-}
-
-fn connection_nodes_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            if let Some(conn) = ctx.parent_value.downcast_ref::<GqlConnection>() {
-                // 1. Clone the Vec<SqlValue>. This is cheap if SqlValue is cheap to clone.
-                let nodes_sql = conn.nodes.clone();
-
-                // 2. Convert the owned Vec<SqlValue> to a Vec<GqlValue>.
-                let nodes_gql: Vec<GqlValue> = nodes_sql
-                    .into_iter()
-                    .map(|v| sql_value_to_gql_value(v))
-                    .collect::<Result<_, _>>()?;
-
-                // 3. Create the final GqlValue::List and pass it to FieldValue::value.
-                Ok(Some(FieldValue::value(GqlValue::List(nodes_gql))))
-                // Ok(Some(FieldValue::value(&conn.nodes)))
-                // Ok(Some(&conn.nodes))
-                // Ok(Some(FieldValue::list((&conn.nodes).into())))
-            } else {
-                Err(internal_error(
-                    "Internal Error: Expected parent of type '{}', but found something else."
-                ).into())
-            }
-        })
-    }
-}
-
-
-/// Finds the index of an item in the full list that corresponds to a given cursor.
-///
-/// This function works by iterating through the list and generating a cursor for each item,
-/// comparing it to the target cursor. This allows it to find the correct index regardless
-//  of whether the cursor was generated from a Thing or an index.
-fn find_index_for_cursor(
-    all_edges: &[SqlValue],
-    cursor: &str,
-) -> Option<usize> {
-    all_edges.iter().enumerate().find_map(|(i, item)| {
-        if encode_cursor_for_item(item) == cursor {
-            Some(i)
-        } else {
-            None
-        }
-    })
-}
-
-/// Implements the spec's `ApplyCursorsToEdges` logic.
-///
-/// This function takes the full set of edges and returns a slice of that set
-/// between the `after` and `before` cursors.
-fn apply_cursors_to_edges(
-    all_edges: &[SqlValue],
-    before: Option<String>,
-    after: Option<String>,
-) -> &[SqlValue] {
-    let mut start_index = 0;
-    let mut end_index = all_edges.len();
-
-    if let Some(after_cursor) = after {
-        if let Some(after_idx) = find_index_for_cursor(all_edges, &after_cursor)
-        {
-            start_index = after_idx + 1;
-        } else {
-            return &[]; // Invalid `after` cursor
-        }
-    }
-
-    if let Some(before_cursor) = before {
-        if let Some(before_idx) =
-            find_index_for_cursor(all_edges, &before_cursor)
-        {
-            end_index = before_idx;
-        } else {
-            return &[]; // Invalid `before` cursor
-        }
-    }
-
-    if start_index >= end_index {
-        return &[];
-    }
-
-    &all_edges[start_index..end_index]
-}
-
-/// Calculates `hasNextPage` according to the GraphQL Cursor Connections spec.
-pub fn has_next_page(
-    edges: &[SqlValue],
-    before: Option<&str>,
-    first: Option<usize>,
-) -> bool {
-    if let Some(first_val) = first {
-        return edges.len() > first_val;
-    }
-
-    if let Some(before_cursor) = before {
-        // If the server can efficiently determine that elements exist following before, return true.
-        if let Some(index) = find_index_for_cursor(edges, before_cursor) {
-            return index < edges.len() - 1;
-        }
-    }
-
-    false
-}
-
-/// Calculates `hasPreviousPage` according to the GraphQL Cursor Connections spec.
-pub fn has_previous_page(
-    edges: &[SqlValue],
-    after: Option<&str>,
-    last: Option<usize>,
-) -> bool {
-    if let Some(last_val) = last {
-        return edges.len() > last_val;
-    }
-
-    if let Some(after_cursor) = after {
-        // If the server can efficiently determine that elements exist prior to after, return true.
-        if let Some(index) = find_index_for_cursor(edges, after_cursor) {
-            return index > 0;
-        }
-    }
-
-    false
-}
-
-
-
-
-
-
-
-
-
-
 
 /// This macro is used to parse a field definition and add it to the object map.
 /// It handles different kinds of fields, including nested fields and array fields.
@@ -622,7 +368,7 @@ macro_rules! parse_field {
                         let ty_name = ty_ref.type_name();
 
                         let $field_ident = cursor_pagination!($types, &fd_name_gql, ty_name,
-                        make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
+                        make_connection_resolver(fd_path.as_str(), false), //$fd.kind.clone()
                         edge_fields: [], args: []);
                         $($action_tokens)*;
                     }
@@ -634,6 +380,7 @@ macro_rules! parse_field {
                             make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
                          // hier der resolver muss handlen koennen simple fields and
                          // arbitrary nested objects
+                         //fixme: hier muss der resolver klar kommen mit edge context in connection
                         )
                         .description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
@@ -658,7 +405,8 @@ macro_rules! parse_field {
                                 let ty_name = ty_ref.type_name();
 
                                 cursor_pagination!($types, &fd_name_gql, ty_name,
-                                    make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
+                                    make_connection_resolver(fd_path.as_str(), false), //$fd.kind
+                                // .clone()
                                     edge_fields: [], args: [])
                             } else {
                                 // Fallback for safety, though inner_kind should always exist for an array
@@ -687,12 +435,10 @@ macro_rules! parse_field {
     };
 }
 
-
 fn filter_name_from_table(tb_name: impl Display) -> String {
     // format!("Filter{}", tb_name.to_string().to_sentence_case())
     format!("{}FilterInput", tb_name.to_string().to_pascal_case())
 }
-
 
 fn remove_last_segment(input: &str) -> String {
     let mut parts = input.rsplitn(2, '.'); // Split from the right, limit to 2 parts
@@ -837,7 +583,7 @@ pub async fn process_tbs(
                 types,
                 tb_name_query.to_plural(),
                 &tb_name_gql,
-                // TODO
+                // TODO: instead of boolean, resolver must handle type table, parent and relation.
                 dummy_resolver("".to_string(), None),
                 // make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
                 edge_fields: [],
@@ -1019,14 +765,18 @@ pub async fn process_tbs(
 
             //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
             // possible performance improvements by skipping fields for prev relations
-            for fd in fds.iter().filter(|fd| {
-                match fd.name.to_string().as_str() {
-                    "in" => false,
-                    "out" => false,
-                    // "id" => false, // FIXME: prob not wanted
-                    _ => true,
-                }
-            }) {
+            for fd in fds.iter().filter(|fd|
+                                            !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
+                                        // {
+                                        // match fd.name.to_string().as_str() {
+                                        //     "in" => false,
+                                        //     "out" => false,
+                                        //     // "id" => false, // FIXME: prob not wanted
+                                        //     _ => true,
+                                        // }
+
+                                        // }
+            ) {
                 parse_field!(fd, types, cursor, rel_name, fd_map, |fd| fd_vec.push(fd));
             }
 
@@ -1054,9 +804,8 @@ pub async fn process_tbs(
                 types,
                 rel.name.to_raw().to_camel_case().to_plural(),
                 &node_ty_name,
-                // make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
-                // TODO
-                dummy_resolver("".to_string(), None),
+                make_connection_resolver(rel.name.to_raw(), true),
+                    // Option::from(Kind::Record(vec![Table::from(tb_name.clone())])) TODO:remove
                 edge_fields: fd_vec,
                 args: [
                     order_input!(&tb_name)
@@ -1087,7 +836,6 @@ pub async fn process_tbs(
 
 //TODO: bug: type HomeTypeEnum enum is optional even though it shouldn't
 
-
 fn make_table_field_resolver(
     // fd_name: impl Into<String>,
     fd_path: impl Into<String>,
@@ -1100,6 +848,12 @@ fn make_table_field_resolver(
         let path_for_resolver = fd_path.clone();
         let resolver_field_kind = kind.clone();
 
+        // --- Default behavior for non-array-of-records or if not ErasedRecord parent ---
+        // This includes:
+        // 1. Scalar fields on an ErasedRecord parent.
+        // 2. Object fields on an ErasedRecord parent (passing down ErasedRecord).
+        // 3. Array of SCALARS/Simple Objects on an ErasedRecord parent.
+        // 4. 'id' field.
         FieldFuture::new({
             async move {
                 trace!(
@@ -1114,8 +868,8 @@ fn make_table_field_resolver(
                     trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
 
                     // Check if THIS field is an array of Records
-                    if let Some(Kind::Array(ref inner_kind_box, _)) = resolver_field_kind.as_ref
-                    ().map(|k| k.non_optional()) {
+                    if let Some(Kind::Array(ref inner_kind_box, _)) = resolver_field_kind.as_ref()
+                        .map(|k| k.non_optional()) {
                         if let Kind::Record(_) = inner_kind_box.as_ref().non_optional() {
                             trace!("Field '{}' is an Array of Records. Fetching and wrapping items.", path_for_resolver);
                             let db_value_array = gtx.get_record_field(rid.clone(), &path_for_resolver).await?;
@@ -1158,20 +912,13 @@ fn make_table_field_resolver(
                         }
                     }
 
-                    // --- Default behavior for non-array-of-records or if not ErasedRecord parent ---
-                    // This includes:
-                    // 1. Scalar fields on an ErasedRecord parent.
-                    // 2. Object fields on an ErasedRecord parent (passing down ErasedRecord).
-                    // 3. Array of SCALARS/Simple Objects on an ErasedRecord parent.
-                    // 4. 'id' field.
-
-                    match resolver_field_kind.as_ref().map(|k| k.non_optional()) {
+                    return match resolver_field_kind.as_ref().map(|k| k.non_optional()) {
                         Some(Kind::Object) | Some(Kind::Record(_)) if path_for_resolver != "id" => {
                             // For Object or Record link fields, pass down the current ErasedRecord context.
                             // The next resolver will use this parent_rid and this fd_path (e.g., "profile")
                             // as a segment to fetch further or will resolve fields on this record.
                             trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", path_for_resolver);
-                            return Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))));
+                            Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
                         }
                         _ => {
                             // For scalars, 'id', or arrays of non-records.
@@ -1182,9 +929,9 @@ fn make_table_field_resolver(
                             // Use the simple converter for these cases.
                             // `sql_value_to_gql_value` will handle nested arrays of scalars/simple objects.
                             let gql_val = sql_value_to_gql_value(sql_value)?;
-                            return Ok(Some(FieldValue::value(gql_val)));
+                            Ok(Some(FieldValue::value(gql_val)))
                         }
-                    }
+                    };
 
 
                     match field_kind {
@@ -1202,6 +949,18 @@ fn make_table_field_resolver(
                             trace!("GQL value: {:?}", gql_val);
                             Ok(Some(FieldValue::value(gql_val)))
                         }
+                    }
+                } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<GqlEdge>() {
+                    // CASE 2: Parent is a connection edge. Resolve from pre-fetched data.
+                    trace!("Parent is GqlEdgeContext, resolving path '{}' from edge_data", fd_path);
+                    let field_name = fd_path.split('.').last().unwrap_or(&fd_path);
+                    if let SqlValue::Object(obj) = &edge_ctx.edge {
+                        // Find the field and clone it. If not found, it's None.
+                        let sql_value = obj.get(field_name).cloned().unwrap_or(SqlValue::None);
+                        Ok(Some(FieldValue::value(sql_value_to_gql_value(sql_value)?)))
+                    } else {
+                        // The edge data wasn't an object, so the field can't exist.
+                        Ok(Some(FieldValue::NULL))
                     }
                 }
                 // Handle the array element case where we receive a raw object instead of ErasedRecord
@@ -1413,17 +1172,20 @@ fn make_connection_resolver(
     // Kind of items being paginated (e.g., Kind::Record for users or relation records)
     // We'll use this to understand if it's a relation and to get table/relation schema if needed.
     // For now, we primarily use name_for_query_source and parent_rid to infer.
-    _item_kind: Option<Kind>,
+    // item_kind: Option<Kind>,
     // We need the schema definition of the relation if this is a relation connection
     // to correctly determine 'in'/'out' fields and target node type.
     // This is a simplification for now: assumes 'in' links to parent, 'out' to target.
     // relation_def: Option<Arc<DefineTableStatement>>, // TODO: Pass this if needed
+    is_relation: bool,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
     let query_source_name = name_for_query_source.into();
 
     move |ctx: ResolverContext| {
         let query_source = query_source_name.clone();
         // let item_kind_clone = _item_kind.clone();
+        // let item_kind_clone = item_kind.clone();
+        let is_relation_clone = is_relation;
 
         FieldFuture::new(async move {
             // let (gtx, parent_rid_opt): (GQLTx, Option<Thing>) =
@@ -1448,21 +1210,60 @@ fn make_connection_resolver(
                 args
             );
 
-            let db_value_array =
-                if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-                    // Nested field query: get field from parent record
-                    trace!("Nested query: getting field '{}' from parent RID: {}", query_source, er_rid);
-                    er_gtx.get_record_field(er_rid.clone(), &query_source).await?
-                } else {
-                    return Err(internal_error("GQLTx not found in resolver context").into());
-                };
+            // let db_value_array =
+            //     if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+            //         // Nested field query: get field from parent record
+            //         trace!("Nested query: getting field '{}' from parent RID: {}", query_source, er_rid);
+            //         er_gtx.get_record_field(er_rid.clone(), &query_source).await?
+            //     } else {
+            //         return Err(internal_error("GQLTx not found in resolver context").into());
+            //     };
 
-            // else if let Ok(gql_tx) = ctx.data::<GQLTx>() { //case for root level query
-            //     // Root table query: query table directly
-            //     trace!("Root query: querying table '{}' directly", query_source);
-            // } else {
-            //     return Err(internal_error("GQLTx not found in resolver context").into());
-            // };
+            // Get the GQLTx from the correct source (either parent ErasedRecord or root context).
+            let gtx = if let Some((er_gtx, _)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+                er_gtx.clone()
+            } else {
+                // Replace with error?!?
+                ctx.data::<GQLTx>()?.clone()
+            };
+
+            let db_value_array = if let Some((_, er_rid)) =
+                ctx.parent_value.downcast_ref::<ErasedRecord>()
+            {
+                if is_relation_clone { // CASE 1: It's a RELATION TABLE.
+                    trace!(
+                            "Fetching relation table '{}' where in = {}",
+                            query_source,
+                            er_rid
+                        );
+                    let ast = Statement::Select(SelectStatement {
+                        expr: Fields::all(),
+                        what: vec![SqlValue::Table(query_source.intox())].into(),
+                        cond: Some(Cond(SqlValue::from(Expression::Binary {
+                            l: SqlValue::Idiom(Idiom(vec![Part::Field("in".into())])),
+                            o: Operator::Equal,
+                            r: SqlValue::Thing(er_rid.clone()),
+                        }))),
+                        ..Default::default()
+                    });
+                    gtx.process_stmt(ast).await?
+                } else { // CASE 2: It's an EMBEDDED ARRAY or other field.
+                    trace!(
+                            "Fetching embedded field '{}' from parent {}",
+                            query_source,
+                            er_rid
+                        );
+                    gtx.get_record_field(er_rid.clone(), &query_source)
+                        .await?
+                }
+            } else {
+                // FIXME: when is this used?
+                let ast = Statement::Select(SelectStatement {
+                    what: vec![SqlValue::Table(query_source.intox())].into(),
+                    ..Default::default()
+                });
+                gtx.process_stmt(ast).await?
+            };
 
             trace!("db_value_array: {:?}", db_value_array.clone());
 
@@ -1491,12 +1292,8 @@ fn make_connection_resolver(
 
             let total_count = all_edges.len() as i64;
             trace!("Total items found: {}", total_count);
-            // if all_edges.is_empty() {
-            //     trace!("No items to paginate.");
-            //     return;
-            // }
 
-            let edges = apply_cursors_to_edges(
+            let edges = cursor::apply_cursors_to_edges(
                 all_edges, after_cursor_str.clone(), before_cursor_str.clone());
 
             let mut limited_edges = edges;
@@ -1507,234 +1304,9 @@ fn make_connection_resolver(
                 limited_edges = &limited_edges[start..];
             }
 
-            let has_next = has_next_page(
-                edges,
-                before_cursor_str.as_deref(),
-                first,
-            );
-            let has_prev = has_previous_page(
-                edges,
-                after_cursor_str.as_deref(),
-                last,
-            );
+            let start_cursor = limited_edges.first().map(cursor::encode_cursor_for_item);
+            let end_cursor = limited_edges.last().map(cursor::encode_cursor_for_item);
 
-            let start_cursor = limited_edges.first().map(encode_cursor_for_item);
-            let end_cursor = limited_edges.last().map(encode_cursor_for_item);
-
-            // let mut limit_query: Option<usize> = None;
-            // let mut fetch_forwards = true;
-            // let requested_count = match (first, last) {
-            //     (Some(f), None) => {
-            //         limit_query = Some(f + 1);
-            //         fetch_forwards = true;
-            //         f
-            //     }
-            //     (None, Some(l)) => {
-            //         limit_query = Some(l + 1);
-            //         fetch_forwards = false;
-            //         l
-            //     }
-            //     (None, None) => {
-            //         limit_query = Some(20 + 1);
-            //         fetch_forwards = true;
-            //         20
-            //     } // Default page size
-            //     (Some(_), Some(_)) => unreachable!(), // Already checked
-            // };
-            //
-            //
-            // let after_thing = after_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
-            // let before_thing = before_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
-
-            // let mut sql_ordering = parse_order_by(order_by_arg)?.unwrap_or_else(|| {
-            //     Ordering::Order(OrderList(vec![sql::Order {
-            //         value: SqlValue::Idiom(Idiom::from("id")),
-            //         direction: true, // ASC
-            //     }]))
-            // });
-
-            // if !fetch_forwards { // Paginating backwards (last/before)
-            //     if let Ordering::Order(OrderList(ref mut orders)) = sql_ordering {
-            //         for order_item in orders.iter_mut() {
-            //             order_item.direction = !order_item.direction; // Reverse query order
-            //         }
-            //     }
-            // }
-
-            // let mut query_cond: Option<Cond> = None;
-            // let cursor_thing_opt = if fetch_forwards { after_thing.as_ref() } else { before_thing.as_ref() };
-            //
-            // if let Some(cursor_thing) = cursor_thing_opt {
-            //     if let Ordering::Order(OrderList(orders)) = &sql_ordering {
-            //         if let Some(primary_order) = orders.first() {
-            //             // Simplified: assumes cursor is the ID of the item, and ordering is on 'id'.
-            //             // For general cursor logic with arbitrary orderBy, the cursor must contain
-            //             // the sort values of the item it points to.
-            //             // Here, we assume primary_order.value is 'id' if a cursor is used.
-            //             if let SqlValue::Idiom(idiom) = &primary_order.value {
-            //                 if idiom.to_string() == "id" {
-            //                     let op_str = if fetch_forwards { // after
-            //                         if primary_order.direction { ">" } else { "<" } // ASC: id > cursor_id, DESC: id < cursor_id
-            //                     } else { // before (query order is already reversed)
-            //                         if primary_order.direction { ">" } else { "<" } // Reversed ASC (effectively DESC): id > cursor_id => original id < cursor_id
-            //                         // Reversed DESC (effectively ASC): id < cursor_id => original id > cursor_id
-            //                     };
-            //                     query_cond = Some(Cond(Expression::Binary {
-            //                         l: Box::new(SqlValue::Idiom(Idiom::from("id"))),
-            //                         o: sql::Operator::from_str(op_str).map_err(|_| internal_error("Invalid operator string"))?,
-            //                         r: Box::new(SqlValue::Thing(cursor_thing.clone())),
-            //                     }));
-            //                 } else {
-            //                     return Err(input_error("Cursor pagination is currently only supported with orderBy ID.").into());
-            //                 }
-            //             } else {
-            //                 return Err(input_error("Unsupported orderBy field type for cursor pagination.").into());
-            //             }
-            //         }
-            //     }
-            // }
-            //
-            // let mut select_stmt = SelectStatement {
-            //     what: Fields(vec![sql::Field::All], false), // SELECT *
-            //     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
-            //     order: Some(sql_ordering.clone()),
-            //     cond: query_cond.clone(),
-            //     limit: limit_query.map(|l| Limit(SqlValue::Number(sql::Number::from(l)))),
-            //     ..Default::default()
-            // };
-            //
-            // let is_relation_connection = parent_rid_opt.is_some();
-            // if let Some(parent_rid) = &parent_rid_opt {
-            //     // This is a nested connection, assumed to be a relation.
-            //     // `query_source` is the relation table name.
-            //     // Assume 'in' field links to parent, 'out' to target. This needs to be configurable or schema-aware.
-            //     // Example: User (parent_rid) -> Authored (query_source) -> Post (target)
-            //     // Query: SELECT * FROM Authored WHERE in = User.id
-            //     let relation_filter_cond = Cond(Expression::Binary {
-            //         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))), // Configurable: field linking to parent
-            //         o: sql::Operator::Equal,
-            //         r: Box::new(SqlValue::Thing(parent_rid.clone())),
-            //     });
-            //     select_stmt.cond = match select_stmt.cond.take() {
-            //         Some(existing_cond) => Some(Cond(Expression::Binary {
-            //             l: Box::new(Expression::Paren(Box::new(existing_cond.0))),
-            //             o: sql::Operator::And,
-            //             r: Box::new(relation_filter_cond.0),
-            //         })),
-            //         None => Some(relation_filter_cond),
-            //     };
-            // }
-            //
-            // let ast = Statement::Select(select_stmt.clone()); // Clone for total_count later
-            // trace!("Connection query AST: {:?}", ast);
-            //
-            // let query_result_values = match gtx.process_stmt(ast).await? {
-            //     SqlValue::Array(a) => a.0,
-            //     v => return Err(internal_error(format!("Expected array from DB, got {:?}", v)).into()),
-            // };
-            //
-            // let mut fetched_items = query_result_values;
-            // if !fetch_forwards { // If 'last', results were fetched in reverse query order, reverse them back
-            //     fetched_items.reverse();
-            // }
-            //
-            // let mut page_info = GqlPageInfo::default();
-            // let has_extra_item = fetched_items.len() > requested_count;
-            //
-            // if fetch_forwards {
-            //     page_info.has_next_page = has_extra_item;
-            //     if has_extra_item { fetched_items.truncate(requested_count); }
-            // } else { // Paginating backwards (last/before)
-            //     page_info.has_previous_page = has_extra_item;
-            //     if has_extra_item { fetched_items.drain(0..1); } // Remove extra from beginning
-            // }
-            //
-            // let mut gql_edges = Vec::new();
-            // let mut gql_nodes = Vec::new();
-            //
-            // for item_sql_val in fetched_items {
-            //     let record_thing = match item_sql_val { // This is either a data record or a relation record
-            //         SqlValue::Thing(t) => t,
-            //         _ => return Err(internal_error("Expected Thing in connection result items").into()),
-            //     };
-            //
-            //     let node_for_edge_erased: FieldValue;
-            //     let cursor_for_edge: String;
-            //
-            //     if is_relation_connection {
-            //         // `record_thing` is the relation record (e.g., from 'Authored' table)
-            //         cursor_for_edge = encode_cursor(&record_thing);
-            //
-            //         // Fetch the target node of the relation. Assume 'out' field.
-            //         // This needs to be schema-aware for robust relation handling.
-            //         let target_node_id_val = gtx.get_record_field(record_thing.clone(), "out").await?;
-            //         let target_node_thing = match target_node_id_val {
-            //             SqlValue::Thing(t) => t,
-            //             SqlValue::Null | SqlValue::None => {
-            //                 // If target can be null, GQL node type should be nullable.
-            //                 // For now, error if target is missing for a relation.
-            //                 return Err(internal_error(format!("Relation edge {} target ('out' field) is null or not a Thing", record_thing)).into());
-            //             }
-            //             other => return Err(internal_error(format!("Relation edge {} target ('out' field) is not a Thing: {:?}", record_thing, other)).into()),
-            //         };
-            //         let erased_target_node: ErasedRecord = (gtx.clone(), target_node_thing);
-            //         node_for_edge_erased = field_val_erase_owned(erased_target_node);
-            //     } else {
-            //         // `record_thing` is the data record itself (e.g., from 'User' table)
-            //         cursor_for_edge = encode_cursor(&record_thing);
-            //         let erased_node: ErasedRecord = (gtx.clone(), record_thing);
-            //         node_for_edge_erased = field_val_erase_owned(erased_node);
-            //     }
-            //
-            //     gql_nodes.push(node_for_edge_erased.clone());
-            //     gql_edges.push(GqlEdge {
-            //         node: node_for_edge_erased,
-            //         cursor: cursor_for_edge,
-            //         additional_fields: IndexMap::new(), // Populate if edge_fields are used
-            //     });
-            // }
-            //
-            // if let Some(first_edge) = gql_edges.first() {
-            //     page_info.start_cursor = Some(first_edge.cursor.clone());
-            // }
-            // if let Some(last_edge) = gql_edges.last() {
-            //     page_info.end_cursor = Some(last_edge.cursor.clone());
-            // }
-            //
-            // // --- Total Count ---
-            // // Query for total count without pagination cursors but with relation filters
-            // let mut count_select_stmt = SelectStatement {
-            //     what: Fields(vec![sql::Field::Single {
-            //         expr: SqlValue::Function(sql::Function::new_json("count", vec![])),
-            //         alias: Some(Ident::from("total")),
-            //     }], false),
-            //     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
-            //     cond: None, // Base condition for the set
-            //     group: Some(vec![SqlValue::Idiom(Idiom::from("all"))].into()),
-            //     ..Default::default()
-            // };
-            // if let Some(parent_rid) = &parent_rid_opt { // Re-apply relation filter for total count
-            //     let relation_filter_cond = Cond(Expression::Binary {
-            //         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))),
-            //         o: sql::Operator::Equal,
-            //         r: Box::new(SqlValue::Thing(parent_rid.clone())),
-            //     });
-            //     count_select_stmt.cond = Some(relation_filter_cond);
-            // }
-            //
-            // let total_count_val: i64 = match gtx.process_stmt(Statement::Select(count_select_stmt)).await {
-            //     Ok(SqlValue::Array(mut arr)) if !arr.0.is_empty() => {
-            //         if let Some(SqlValue::Object(obj)) = arr.0.pop() { // array is [{total: N}]
-            //             obj.get("total")
-            //                 .and_then(|v| v.try_as_int()) // Use helper from GqlValueUtils or similar
-            //                 .unwrap_or(0)
-            //         } else { 0 }
-            //     }
-            //     _ => {
-            //         trace!("Failed to get total count or unexpected result.");
-            //         0
-            //     }
-            // };
 
             // let gql_values: Vec<GqlValue> = limited_edges.iter().map(|v| sql_value_to_gql_value(v
             //     .clone())
@@ -1747,21 +1319,71 @@ fn make_connection_resolver(
             // // return Ok(Some(FieldValue::value(gql_val)));
             // trace!("gql_val: {:?}", gql_val);
 
-            let gql_nodes: Vec<GqlValue> = limited_edges
+            // let gql_nodes: Vec<GqlValue> = limited_edges
+            //     .iter()
+            //     .map(|v| sql_value_to_gql_value(v.clone()))
+            //     .collect::<Result<_, _>>()?;
+
+            // ========================================================
+            // START: THE FIX
+            // ========================================================
+
+            // Create a new Vec containing only the actual node data by transforming the limited_slice.
+            let nodes_for_connection: Vec<SqlValue> = limited_edges
                 .iter()
-                .map(|v| sql_value_to_gql_value(v.clone()))
-                .collect::<Result<_, _>>()?;
-            trace!("gql_nodes: {:?}", gql_nodes);
+                .map(|item| {
+                    // If this is a relation, the node is the `out` field of the edge record.
+                    if is_relation_clone {
+                        if let SqlValue::Object(obj) = item {
+                            // Extract the `out` field. Default to the item itself if 'out' is missing.
+                            return obj.get("out").unwrap_or(item).clone();
+                        }
+                    }
+                    // Otherwise (for embedded arrays), the item itself is the node.
+                    item.clone()
+                })
+                .collect();
+            trace!("nodes_for_connection: {:?}", nodes_for_connection);
+            // ========================================================
+            // END: THE FIX
+            // ========================================================
+
+            let edge_contexts: Vec<GqlEdge> = limited_edges
+                .iter()
+                .map(|item| {
+                    // FIXME: rewrite
+                    let node = if is_relation_clone {
+                        if let SqlValue::Object(obj) = item {
+                            obj.get("out").unwrap_or(item).clone()
+                        } else {
+                            item.clone()
+                        }
+                    } else {
+                        item.clone()
+                    };
+
+                    GqlEdge {
+                        gtx: gtx.clone(),
+                        cursor: cursor::encode_cursor_for_item(item),
+                        edge: item.clone(),
+                        node,
+                    }
+                })
+                .collect();
+
 
             let page_info = GqlPageInfo {
-                has_next_page: has_next,
-                has_previous_page: has_prev,
+                has_next_page: cursor::has_next_page(edges, before_cursor_str.as_deref(), first),
+                has_previous_page: cursor::has_previous_page(edges, after_cursor_str.as_deref(), last),
                 start_cursor,
                 end_cursor,
             };
             let connection_obj = GqlConnection {
+                gtx,
                 // edges: vec![],
-                nodes: limited_edges.to_vec(),
+                // nodes: limited_edges.to_vec(),
+                edges: edge_contexts,
+                nodes: nodes_for_connection,
                 // nodes: GqlValue::List(gql_nodes),
                 // nodes: gql_val,
                 total_count,
@@ -1773,270 +1395,6 @@ fn make_connection_resolver(
         })
     }
 }
-
-
-// let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
-//
-// let out = match val {
-//     SqlValue::Thing(rid) if fd_name != "id" => {
-//         let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
-//         match field_kind {
-//             Some(Kind::Record(ts)) if ts.len() != 1 => {
-//                 tmp = tmp.with_type(rid.tb.clone())
-//             }
-//             _ => {}
-//         }
-//         Ok(Some(tmp))
-//     }
-//     SqlValue::None | SqlValue::Null => Ok(None),
-//     //TODO: Dig here to fix: internal: invalid item for enum \"StatusEnum\"
-//     v => {
-//         match field_kind {
-//             Some(Kind::Either(ks)) if ks.len() != 1 => {}
-//             _ => {}
-//         }
-//         let out = sql_value_to_gql_value(v.to_owned())
-//             .map_err(|_| "SQL to GQL translation failed")?;
-//         Ok(Some(FieldValue::value(out)))
-//     }
-// };
-// out
-
-// // --- Try Case 1: Parent is the top-level ErasedRecord ---
-// if let Some((gtx, rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-//
-//     // Fetch the field value directly from the database usiag the record ID
-//     let val: SqlValue = gtx
-//         .get_record_field(rid.clone(), fd_name.as_str())II
-//         .await?; // Handle SurrealError appropriately
-//
-//
-//     // Process the fetched value
-//     match val {
-//         SqlValue::Thing(nested_rid) if fd_name != "id" => {
-//             trace!("Field is a Thing (Record Link) for field {} with nested ID \
-//             {}", fd_name, nested_rid);
-//             // Wrap the linked record's context for further resolution
-//             let erased_nested = (gtx.clone(), nested_rid.clone()); // Clone GQLTx if needed
-//             let mut field_value = field_val_erase_owned(erased_nested);
-//
-//             // Add type hint if it's a union/interface based on Kind::Record
-//             match field_kind {
-//                 Some(Kind::Record(ref ts)) if ts.len() != 1 => {
-//                     field_value = field_value.with_type(nested_rid.tb.clone());
-//                 }
-//                 Some(Kind::Either(ref _ks)) if matches!(field_kind, Some(Kind::Record(_))) => {
-//                     // Handle potential unions defined via Kind::Either containing Kind::Record types?
-//                     // This logic might need refinement based on how unions are defined.
-//                     // For now, assume Kind::Record handles the primary case.
-//                     field_value = field_value.with_type(nested_rid.tb.clone());
-//                 }
-//                 _ => {}
-//             }
-//             Ok(Some(field_value))
-//         }
-//         SqlValue::None | SqlValue::Null => Ok(None),
-//         v => {
-//             // Convert any other SQL value (Scalar, Object, Array) to GraphQL Value
-//             // This includes converting nested SqlValue::Object to GqlValue::Object
-//             trace!("Converting fetched scalar/object/array to GQL Value {} for \
-//             field {}", v, fd_name);
-//             let gql_val = sql_value_to_gql_value(v) // sql_value_to_gql_value MUST handle Objects/Arrays
-//                 .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for field '{}': {}", fd_name, e)))?;
-//             // GqlError::new(format!("SQL to GQL conversion error for field '{}': {}", fd_name, e))
-//             trace!("Conversion successful! Returning GQL Value {} for field {}", gql_val, fd_name);
-//             Ok(Some(FieldValue::value(gql_val))) // Return the converted GQL Value
-//         }
-//     }
-// }
-// // --- Try Case 2: Parent is already a resolved GQL Value (for nested fields) ---
-// else if let Some(parent_gql_value) = ctx.parent_value.downcast_ref::<GqlValue>() {
-//     trace!("Parent is GqlValue (nested) {:?} for field {}", parent_gql_value, fd_name);
-//     match parent_gql_value {
-//         GqlValue::Object(parent_map) => {
-//             // Find the field within the parent GQL object's map
-//             // Use the simple field name (e.g., "height") which was passed to this resolver instance
-//             let gql_field_name = Name::new(&fd_name); // Use async_graphql::Name for lookup
-//
-//             if let Some(nested_gql_value) = parent_map.get(&gql_field_name) {
-//                 trace!("Found field {} in parent GQL object for field {:?}",
-//                     nested_gql_value,
-//                     fd_name);
-//                 // The value is already a GQL value, just clone and return it
-//                 Ok(Some(FieldValue::value(nested_gql_value.clone())))
-//             } else {
-//                 // Field not found in the parent GQL object map
-//                 trace!("Field {} not found in parent GQL \
-//                 object", fd_name);
-//                 // Return null if the field doesn't exist in the parent map
-//                 // (GraphQL handles nullability based on schema type)
-//                 Ok(None)
-//             }
-//         }
-//         // Handle if parent is List? Might not occur if lists always resolve fully.
-//         // GqlValue::List(_) => { ... }
-//         _ => {
-//             // Parent was a GqlValue, but not an Object. This indicates a schema mismatch or unexpected state.
-//             Err(internal_error(format!(
-//                 "Parent value for nested field '{}' was an unexpected GqlValue type: {:?}. Expected Object.",
-//                 fd_name, parent_gql_value
-//             )).into()) // Ensure error implements Into<async_graphql::Error>
-//         }
-//     }
-// }
-// // --- Error Case: Unknown parent type ---
-// else {
-//     Err(internal_error(format!(
-//         "Failed to downcast parent value for field '{}'. Unexpected parent type ID: {:?}",
-//         fd_name,
-//         ctx.parent_value
-//     )).into()) // Ensure error implements Into<async_graphql::Error>
-// }
-
-
-// fn make_nested_field_resolver(
-//     base_db_name: String, // e.g., "size"
-//     sub_db_name: String,  // e.g., "width"
-//     kind: Kind,           // SQL Kind of the sub-field
-// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-//     let full_db_path = format!("{}.{}", base_db_name, sub_db_name); // e.g. "size.width"
-//     move |ctx: ResolverContext| {
-//         let path = full_db_path.clone();
-//         let field_kind = kind.clone(); // Kind of the sub-field itself
-//         FieldFuture::new(async move {
-//             // Parent value should be the ErasedRecord of the CONTAINER object (e.g., Image)
-//             let (ref gtx, ref parent_rid) = ctx
-//                 .parent_value
-//                 .downcast_ref::<ErasedRecord>()
-//                 .ok_or_else(|| internal_error(format!("failed to downcast parent for nested field {}", path)))?;
-//
-//             // Fetch using the full path
-//             let val = gtx.get_record_field(parent_rid.clone(), &path).await?;
-//
-//             // Use the SAME conversion logic as make_table_field_resolver's final match arm
-//             // (including the Enum fix)
-//             let out = match val {
-//                 SqlValue::None | SqlValue::Null => Ok(None),
-//                 // Nested fields shouldn't typically be Things unless it's object<record<...>>
-//                 SqlValue::Thing(_) => Err(internal_error(format!("Unexpected Thing found for nested field {}", path))),
-//                 v => { // Handle scalars and potential Enums
-//                     // Use the kind of the *sub-field* here
-//                     let is_dynamic_enum = match &field_kind {
-//                         Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
-//                         Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
-//                         _ => false,
-//                     };
-//
-//                     if is_dynamic_enum {
-//                         // match v.to_string_lossy() { // Adjust based on SqlValue string access
-//                         //     Some(db_string) => {
-//                         //         let gql_enum_value_str = db_string.to_screaming_snake_case();
-//                         //         let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str));
-//                         //         Ok(Some(FieldValue::value(gql_enum_value)))
-//                         //     }
-//                         //     None => Ok(None), // Or error
-//                         // }
-//                         match v {
-//                             SqlValue::Strand(s) => {
-//                                 let db_string = s.as_str();
-//                                 let gql_enum_value_str = db_string.to_screaming_snake_case();
-//
-//                                 // Use Name::new (panics on invalid GraphQL name chars, unlikely here)
-//                                 // Or implement a validation check if needed before calling new()
-//                                 let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str)); // FIX: Use Name::new
-//
-//                                 Ok(Some(FieldValue::value(gql_enum_value)))
-//                             }
-//                             // Add other SqlValue variants if they can represent your enum strings
-//                             _ => {
-//                                 // FIX: Use the correct variable name for the error message
-//                                 error!("Expected a Strand from DB for dynamic enum field '{}', but got different value: {:?}", db_name, v); // Use db_name (from resolver args) or path (from nested resolver args)
-//                                 Ok(None)
-//                             }
-//                         }
-//                     } else {
-//                         // Generic conversion
-//                         let gql_value = sql_value_to_gql_value(v) // Pass owned v if needed
-//                             .map_err(|e| format!("SQL to GQL translation failed for nested field '{}': {}", path, e))?;
-//                         Ok(Some(FieldValue::value(gql_value)))
-//                     }
-//                 }
-//             };
-//             out
-//         })
-//     }
-// }
-//
-// fn make_table_field_resolver(
-//     db_name: String, // DB name (e.g., "created_at", "size")
-//     kind: Option<Kind>,
-// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-//     move |ctx: ResolverContext| {
-//         let fd_name = db_name.clone(); // Use db_name passed in
-//         let field_kind = kind.clone();
-//         FieldFuture::new({
-//             async move {
-//                 let (ref gtx, ref rid) = ctx
-//                     .parent_value
-//                     .downcast_ref::<ErasedRecord>()
-//                     .ok_or_else(|| internal_error(format!("failed to downcast parent for field {}", fd_name)))?;
-//
-//                 // If this field represents the BASE of a nested object (e.g. "size"),
-//                 // we don't fetch its value directly. Instead, we just pass the parent's
-//                 // ErasedRecord down, so the nested field resolvers can use it.
-//                 if matches!(field_kind, Some(Kind::Object)) {
-//                     // Check if it actually has nested structure defined via dot notation
-//                     // (This check might need refinement based on how Kind::Object is populated)
-//                     // For now, assume if kind is Object, we pass parent context down.
-//                     let parent_erased_record = (gtx.clone(), rid.clone());
-//                     // Wrap it so async-graphql knows how to handle it as the parent for sub-fields
-//                     return Ok(Some(field_val_erase_owned(parent_erased_record)));
-//                 }
-//
-//                 // Otherwise, fetch the field value as before
-//                 let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
-//
-//                 let out = match val {
-//                     SqlValue::Thing(related_rid) if fd_name != "id" => { // Handle relations
-//                         let mut tmp = field_val_erase_owned((gtx.clone(), related_rid.clone()));
-//                         match &field_kind {
-//                             Some(Kind::Record(ts)) if ts.len() != 1 => {
-//                                 tmp = tmp.with_type(related_rid.tb.clone())
-//                             }
-//                             _ => {}
-//                         }
-//                         Ok(Some(tmp))
-//                     }
-//                     SqlValue::None | SqlValue::Null => Ok(None),
-//                     v => { // Handle scalars and Enums
-//                         let is_dynamic_enum = match &field_kind {
-//                             Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
-//                             Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
-//                             _ => false,
-//                         };
-//
-//                         if is_dynamic_enum {
-//                             match v.to_string_lossy() { // Adjust string access as needed
-//                                 Some(db_string) => {
-//                                     let gql_enum_value_str = db_string.to_screaming_snake_case();
-//                                     let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str));
-//                                     Ok(Some(FieldValue::value(gql_enum_value)))
-//                                 }
-//                                 None => Ok(None), // Or error
-//                             }
-//                         } else {
-//                             // Generic conversion
-//                             let gql_value = sql_value_to_gql_value(v) // Pass owned v if needed
-//                                 .map_err(|e| format!("SQL to GQL translation failed for field '{}': {}", fd_name, e))?;
-//                             Ok(Some(FieldValue::value(gql_value)))
-//                         }
-//                     }
-//                 };
-//                 out
-//             }
-//         })
-//     }
-// }
 
 macro_rules! filter_impl {
 	($filter:ident, $ty:ident, $name:expr) => {
@@ -2334,53 +1692,480 @@ fn parse_order_input(order: Option<&GqlValue>) -> Result<Option<Vec<sql::Order>>
 // 2025-04-22T19:32:25.885258Z TRACE request: surrealdb_core::gql::tables: /Volumes/Development/Dev/RustroverProjects/surrealdb/crates/core/src/gql/tables.rs:695: Fetched value for path 'size.location.`info`': None     otel.kind="server" http.request.method="POST" url.path="/graphql" network.protocol.name="http" network.protocol.version="1.1" http.request.body.size="244" user_agent.original="PostmanClient/11.36.1 (AppId=90094569-b9aa-467a-902b-a9c21e5e66af)" otel.name="POST /graphql" http.route="/graphql" http.request.id="ff04a2ef-5af1-48dd-a50d-4d1ad73bd444" client.address="127.0.0.1"
 
 
-/// Recursively serializes an `SqlValue` into a canonical, stable string format.
-/// This is essential for generating consistent hashes.
-fn canonicalize_sql_value(value: &SqlValue) -> String {
-    match value {
-        // For objects, iterate over the already-sorted keys of the BTreeMap.
-        SqlValue::Object(obj) => {
-            let pairs: String = obj
-                .iter()
-                .map(|(k, v)| {
-                    // Recursively canonicalize the value.
-                    format!("\"{}\":{}", k, canonicalize_sql_value(v))
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("{{{}}}", pairs)
-        }
-        // For arrays, iterate in order and canonicalize each element.
-        SqlValue::Array(arr) => {
-            let items: String = arr
-                .0
-                .iter()
-                .map(canonicalize_sql_value)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{}]", items)
-        }
-        // Ensure scalars have a consistent representation.
-        SqlValue::Strand(s) => format!("\"{}\"", s), // Quote strings
-        SqlValue::Thing(t) => format!("\"{}\"", t),   // Quote things
-        SqlValue::Number(n) => n.to_string(),
-        SqlValue::Bool(b) => b.to_string(),
-        SqlValue::None | SqlValue::Null => "null".to_string(),
-        // Add other types as needed, ensuring a stable string format.
-        other => format!("\"{}\"", other.to_string()), // Fallback with quotes
-    }
-}
+// let mut limit_query: Option<usize> = None;
+// let mut fetch_forwards = true;
+// let requested_count = match (first, last) {
+//     (Some(f), None) => {
+//         limit_query = Some(f + 1);
+//         fetch_forwards = true;
+//         f
+//     }
+//     (None, Some(l)) => {
+//         limit_query = Some(l + 1);
+//         fetch_forwards = false;
+//         l
+//     }
+//     (None, None) => {
+//         limit_query = Some(20 + 1);
+//         fetch_forwards = true;
+//         20
+//     } // Default page size
+//     (Some(_), Some(_)) => unreachable!(), // Already checked
+// };
+//
+//
+// let after_thing = after_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
+// let before_thing = before_cursor_str.map(|c| decode_cursor(&c)).transpose()?;
 
-/// Hashes a canonicalized SqlValue to create a stable, content-addressable cursor.
-fn hash_sql_value(value: &SqlValue) -> String {
-    // 1. Get the canonical string representation of the value.
-    let canonical_string = canonicalize_sql_value(value);
+// let mut sql_ordering = parse_order_by(order_by_arg)?.unwrap_or_else(|| {
+//     Ordering::Order(OrderList(vec![sql::Order {
+//         value: SqlValue::Idiom(Idiom::from("id")),
+//         direction: true, // ASC
+//     }]))
+// });
 
-    // 2. Hash the string using a stable algorithm like SHA-256.
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_string.as_bytes());
-    let hash_result = hasher.finalize();
+// if !fetch_forwards { // Paginating backwards (last/before)
+//     if let Ordering::Order(OrderList(ref mut orders)) = sql_ordering {
+//         for order_item in orders.iter_mut() {
+//             order_item.direction = !order_item.direction; // Reverse query order
+//         }
+//     }
+// }
 
-    // 3. Base64-encode the raw hash bytes to create a clean cursor string.
-    general_purpose::URL_SAFE_NO_PAD.encode(hash_result)
-}
+// let mut query_cond: Option<Cond> = None;
+// let cursor_thing_opt = if fetch_forwards { after_thing.as_ref() } else { before_thing.as_ref() };
+//
+// if let Some(cursor_thing) = cursor_thing_opt {
+//     if let Ordering::Order(OrderList(orders)) = &sql_ordering {
+//         if let Some(primary_order) = orders.first() {
+//             // Simplified: assumes cursor is the ID of the item, and ordering is on 'id'.
+//             // For general cursor logic with arbitrary orderBy, the cursor must contain
+//             // the sort values of the item it points to.
+//             // Here, we assume primary_order.value is 'id' if a cursor is used.
+//             if let SqlValue::Idiom(idiom) = &primary_order.value {
+//                 if idiom.to_string() == "id" {
+//                     let op_str = if fetch_forwards { // after
+//                         if primary_order.direction { ">" } else { "<" } // ASC: id > cursor_id, DESC: id < cursor_id
+//                     } else { // before (query order is already reversed)
+//                         if primary_order.direction { ">" } else { "<" } // Reversed ASC (effectively DESC): id > cursor_id => original id < cursor_id
+//                         // Reversed DESC (effectively ASC): id < cursor_id => original id > cursor_id
+//                     };
+//                     query_cond = Some(Cond(Expression::Binary {
+//                         l: Box::new(SqlValue::Idiom(Idiom::from("id"))),
+//                         o: sql::Operator::from_str(op_str).map_err(|_| internal_error("Invalid operator string"))?,
+//                         r: Box::new(SqlValue::Thing(cursor_thing.clone())),
+//                     }));
+//                 } else {
+//                     return Err(input_error("Cursor pagination is currently only supported with orderBy ID.").into());
+//                 }
+//             } else {
+//                 return Err(input_error("Unsupported orderBy field type for cursor pagination.").into());
+//             }
+//         }
+//     }
+// }
+//
+// let mut select_stmt = SelectStatement {
+//     what: Fields(vec![sql::Field::All], false), // SELECT *
+//     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
+//     order: Some(sql_ordering.clone()),
+//     cond: query_cond.clone(),
+//     limit: limit_query.map(|l| Limit(SqlValue::Number(sql::Number::from(l)))),
+//     ..Default::default()
+// };
+//
+// let is_relation_connection = parent_rid_opt.is_some();
+// if let Some(parent_rid) = &parent_rid_opt {
+//     // This is a nested connection, assumed to be a relation.
+//     // `query_source` is the relation table name.
+//     // Assume 'in' field links to parent, 'out' to target. This needs to be configurable or schema-aware.
+//     // Example: User (parent_rid) -> Authored (query_source) -> Post (target)
+//     // Query: SELECT * FROM Authored WHERE in = User.id
+//     let relation_filter_cond = Cond(Expression::Binary {
+//         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))), // Configurable: field linking to parent
+//         o: sql::Operator::Equal,
+//         r: Box::new(SqlValue::Thing(parent_rid.clone())),
+//     });
+//     select_stmt.cond = match select_stmt.cond.take() {
+//         Some(existing_cond) => Some(Cond(Expression::Binary {
+//             l: Box::new(Expression::Paren(Box::new(existing_cond.0))),
+//             o: sql::Operator::And,
+//             r: Box::new(relation_filter_cond.0),
+//         })),
+//         None => Some(relation_filter_cond),
+//     };
+// }
+//
+// let ast = Statement::Select(select_stmt.clone()); // Clone for total_count later
+// trace!("Connection query AST: {:?}", ast);
+//
+// let query_result_values = match gtx.process_stmt(ast).await? {
+//     SqlValue::Array(a) => a.0,
+//     v => return Err(internal_error(format!("Expected array from DB, got {:?}", v)).into()),
+// };
+//
+// let mut fetched_items = query_result_values;
+// if !fetch_forwards { // If 'last', results were fetched in reverse query order, reverse them back
+//     fetched_items.reverse();
+// }
+//
+// let mut page_info = GqlPageInfo::default();
+// let has_extra_item = fetched_items.len() > requested_count;
+//
+// if fetch_forwards {
+//     page_info.has_next_page = has_extra_item;
+//     if has_extra_item { fetched_items.truncate(requested_count); }
+// } else { // Paginating backwards (last/before)
+//     page_info.has_previous_page = has_extra_item;
+//     if has_extra_item { fetched_items.drain(0..1); } // Remove extra from beginning
+// }
+//
+// let mut gql_edges = Vec::new();
+// let mut gql_nodes = Vec::new();
+//
+// for item_sql_val in fetched_items {
+//     let record_thing = match item_sql_val { // This is either a data record or a relation record
+//         SqlValue::Thing(t) => t,
+//         _ => return Err(internal_error("Expected Thing in connection result items").into()),
+//     };
+//
+//     let node_for_edge_erased: FieldValue;
+//     let cursor_for_edge: String;
+//
+//     if is_relation_connection {
+//         // `record_thing` is the relation record (e.g., from 'Authored' table)
+//         cursor_for_edge = encode_cursor(&record_thing);
+//
+//         // Fetch the target node of the relation. Assume 'out' field.
+//         // This needs to be schema-aware for robust relation handling.
+//         let target_node_id_val = gtx.get_record_field(record_thing.clone(), "out").await?;
+//         let target_node_thing = match target_node_id_val {
+//             SqlValue::Thing(t) => t,
+//             SqlValue::Null | SqlValue::None => {
+//                 // If target can be null, GQL node type should be nullable.
+//                 // For now, error if target is missing for a relation.
+//                 return Err(internal_error(format!("Relation edge {} target ('out' field) is null or not a Thing", record_thing)).into());
+//             }
+//             other => return Err(internal_error(format!("Relation edge {} target ('out' field) is not a Thing: {:?}", record_thing, other)).into()),
+//         };
+//         let erased_target_node: ErasedRecord = (gtx.clone(), target_node_thing);
+//         node_for_edge_erased = field_val_erase_owned(erased_target_node);
+//     } else {
+//         // `record_thing` is the data record itself (e.g., from 'User' table)
+//         cursor_for_edge = encode_cursor(&record_thing);
+//         let erased_node: ErasedRecord = (gtx.clone(), record_thing);
+//         node_for_edge_erased = field_val_erase_owned(erased_node);
+//     }
+//
+//     gql_nodes.push(node_for_edge_erased.clone());
+//     gql_edges.push(GqlEdge {
+//         node: node_for_edge_erased,
+//         cursor: cursor_for_edge,
+//         additional_fields: IndexMap::new(), // Populate if edge_fields are used
+//     });
+// }
+//
+// if let Some(first_edge) = gql_edges.first() {
+//     page_info.start_cursor = Some(first_edge.cursor.clone());
+// }
+// if let Some(last_edge) = gql_edges.last() {
+//     page_info.end_cursor = Some(last_edge.cursor.clone());
+// }
+//
+// // --- Total Count ---
+// // Query for total count without pagination cursors but with relation filters
+// let mut count_select_stmt = SelectStatement {
+//     what: Fields(vec![sql::Field::Single {
+//         expr: SqlValue::Function(sql::Function::new_json("count", vec![])),
+//         alias: Some(Ident::from("total")),
+//     }], false),
+//     expr: vec![SqlValue::Table(Table::from(query_source.clone()))].into(),
+//     cond: None, // Base condition for the set
+//     group: Some(vec![SqlValue::Idiom(Idiom::from("all"))].into()),
+//     ..Default::default()
+// };
+// if let Some(parent_rid) = &parent_rid_opt { // Re-apply relation filter for total count
+//     let relation_filter_cond = Cond(Expression::Binary {
+//         l: Box::new(SqlValue::Idiom(Idiom(vec![Part::Field("in".into())]))),
+//         o: sql::Operator::Equal,
+//         r: Box::new(SqlValue::Thing(parent_rid.clone())),
+//     });
+//     count_select_stmt.cond = Some(relation_filter_cond);
+// }
+//
+// let total_count_val: i64 = match gtx.process_stmt(Statement::Select(count_select_stmt)).await {
+//     Ok(SqlValue::Array(mut arr)) if !arr.0.is_empty() => {
+//         if let Some(SqlValue::Object(obj)) = arr.0.pop() { // array is [{total: N}]
+//             obj.get("total")
+//                 .and_then(|v| v.try_as_int()) // Use helper from GqlValueUtils or similar
+//                 .unwrap_or(0)
+//         } else { 0 }
+//     }
+//     _ => {
+//         trace!("Failed to get total count or unexpected result.");
+//         0
+//     }
+// };
+
+// let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
+//
+// let out = match val {
+//     SqlValue::Thing(rid) if fd_name != "id" => {
+//         let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
+//         match field_kind {
+//             Some(Kind::Record(ts)) if ts.len() != 1 => {
+//                 tmp = tmp.with_type(rid.tb.clone())
+//             }
+//             _ => {}
+//         }
+//         Ok(Some(tmp))
+//     }
+//     SqlValue::None | SqlValue::Null => Ok(None),
+//     //TODO: Dig here to fix: internal: invalid item for enum \"StatusEnum\"
+//     v => {
+//         match field_kind {
+//             Some(Kind::Either(ks)) if ks.len() != 1 => {}
+//             _ => {}
+//         }
+//         let out = sql_value_to_gql_value(v.to_owned())
+//             .map_err(|_| "SQL to GQL translation failed")?;
+//         Ok(Some(FieldValue::value(out)))
+//     }
+// };
+// out
+
+// // --- Try Case 1: Parent is the top-level ErasedRecord ---
+// if let Some((gtx, rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+//
+//     // Fetch the field value directly from the database usiag the record ID
+//     let val: SqlValue = gtx
+//         .get_record_field(rid.clone(), fd_name.as_str())II
+//         .await?; // Handle SurrealError appropriately
+//
+//
+//     // Process the fetched value
+//     match val {
+//         SqlValue::Thing(nested_rid) if fd_name != "id" => {
+//             trace!("Field is a Thing (Record Link) for field {} with nested ID \
+//             {}", fd_name, nested_rid);
+//             // Wrap the linked record's context for further resolution
+//             let erased_nested = (gtx.clone(), nested_rid.clone()); // Clone GQLTx if needed
+//             let mut field_value = field_val_erase_owned(erased_nested);
+//
+//             // Add type hint if it's a union/interface based on Kind::Record
+//             match field_kind {
+//                 Some(Kind::Record(ref ts)) if ts.len() != 1 => {
+//                     field_value = field_value.with_type(nested_rid.tb.clone());
+//                 }
+//                 Some(Kind::Either(ref _ks)) if matches!(field_kind, Some(Kind::Record(_))) => {
+//                     // Handle potential unions defined via Kind::Either containing Kind::Record types?
+//                     // This logic might need refinement based on how unions are defined.
+//                     // For now, assume Kind::Record handles the primary case.
+//                     field_value = field_value.with_type(nested_rid.tb.clone());
+//                 }
+//                 _ => {}
+//             }
+//             Ok(Some(field_value))
+//         }
+//         SqlValue::None | SqlValue::Null => Ok(None),
+//         v => {
+//             // Convert any other SQL value (Scalar, Object, Array) to GraphQL Value
+//             // This includes converting nested SqlValue::Object to GqlValue::Object
+//             trace!("Converting fetched scalar/object/array to GQL Value {} for \
+//             field {}", v, fd_name);
+//             let gql_val = sql_value_to_gql_value(v) // sql_value_to_gql_value MUST handle Objects/Arrays
+//                 .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for field '{}': {}", fd_name, e)))?;
+//             // GqlError::new(format!("SQL to GQL conversion error for field '{}': {}", fd_name, e))
+//             trace!("Conversion successful! Returning GQL Value {} for field {}", gql_val, fd_name);
+//             Ok(Some(FieldValue::value(gql_val))) // Return the converted GQL Value
+//         }
+//     }
+// }
+// // --- Try Case 2: Parent is already a resolved GQL Value (for nested fields) ---
+// else if let Some(parent_gql_value) = ctx.parent_value.downcast_ref::<GqlValue>() {
+//     trace!("Parent is GqlValue (nested) {:?} for field {}", parent_gql_value, fd_name);
+//     match parent_gql_value {
+//         GqlValue::Object(parent_map) => {
+//             // Find the field within the parent GQL object's map
+//             // Use the simple field name (e.g., "height") which was passed to this resolver instance
+//             let gql_field_name = Name::new(&fd_name); // Use async_graphql::Name for lookup
+//
+//             if let Some(nested_gql_value) = parent_map.get(&gql_field_name) {
+//                 trace!("Found field {} in parent GQL object for field {:?}",
+//                     nested_gql_value,
+//                     fd_name);
+//                 // The value is already a GQL value, just clone and return it
+//                 Ok(Some(FieldValue::value(nested_gql_value.clone())))
+//             } else {
+//                 // Field not found in the parent GQL object map
+//                 trace!("Field {} not found in parent GQL \
+//                 object", fd_name);
+//                 // Return null if the field doesn't exist in the parent map
+//                 // (GraphQL handles nullability based on schema type)
+//                 Ok(None)
+//             }
+//         }
+//         // Handle if parent is List? Might not occur if lists always resolve fully.
+//         // GqlValue::List(_) => { ... }
+//         _ => {
+//             // Parent was a GqlValue, but not an Object. This indicates a schema mismatch or unexpected state.
+//             Err(internal_error(format!(
+//                 "Parent value for nested field '{}' was an unexpected GqlValue type: {:?}. Expected Object.",
+//                 fd_name, parent_gql_value
+//             )).into()) // Ensure error implements Into<async_graphql::Error>
+//         }
+//     }
+// }
+// // --- Error Case: Unknown parent type ---
+// else {
+//     Err(internal_error(format!(
+//         "Failed to downcast parent value for field '{}'. Unexpected parent type ID: {:?}",
+//         fd_name,
+//         ctx.parent_value
+//     )).into()) // Ensure error implements Into<async_graphql::Error>
+// }
+
+
+// fn make_nested_field_resolver(
+//     base_db_name: String, // e.g., "size"
+//     sub_db_name: String,  // e.g., "width"
+//     kind: Kind,           // SQL Kind of the sub-field
+// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     let full_db_path = format!("{}.{}", base_db_name, sub_db_name); // e.g. "size.width"
+//     move |ctx: ResolverContext| {
+//         let path = full_db_path.clone();
+//         let field_kind = kind.clone(); // Kind of the sub-field itself
+//         FieldFuture::new(async move {
+//             // Parent value should be the ErasedRecord of the CONTAINER object (e.g., Image)
+//             let (ref gtx, ref parent_rid) = ctx
+//                 .parent_value
+//                 .downcast_ref::<ErasedRecord>()
+//                 .ok_or_else(|| internal_error(format!("failed to downcast parent for nested field {}", path)))?;
+//
+//             // Fetch using the full path
+//             let val = gtx.get_record_field(parent_rid.clone(), &path).await?;
+//
+//             // Use the SAME conversion logic as make_table_field_resolver's final match arm
+//             // (including the Enum fix)
+//             let out = match val {
+//                 SqlValue::None | SqlValue::Null => Ok(None),
+//                 // Nested fields shouldn't typically be Things unless it's object<record<...>>
+//                 SqlValue::Thing(_) => Err(internal_error(format!("Unexpected Thing found for nested field {}", path))),
+//                 v => { // Handle scalars and potential Enums
+//                     // Use the kind of the *sub-field* here
+//                     let is_dynamic_enum = match &field_kind {
+//                         Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
+//                         Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
+//                         _ => false,
+//                     };
+//
+//                     if is_dynamic_enum {
+//                         // match v.to_string_lossy() { // Adjust based on SqlValue string access
+//                         //     Some(db_string) => {
+//                         //         let gql_enum_value_str = db_string.to_screaming_snake_case();
+//                         //         let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str));
+//                         //         Ok(Some(FieldValue::value(gql_enum_value)))
+//                         //     }
+//                         //     None => Ok(None), // Or error
+//                         // }
+//                         match v {
+//                             SqlValue::Strand(s) => {
+//                                 let db_string = s.as_str();
+//                                 let gql_enum_value_str = db_string.to_screaming_snake_case();
+//
+//                                 // Use Name::new (panics on invalid GraphQL name chars, unlikely here)
+//                                 // Or implement a validation check if needed before calling new()
+//                                 let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str)); // FIX: Use Name::new
+//
+//                                 Ok(Some(FieldValue::value(gql_enum_value)))
+//                             }
+//                             // Add other SqlValue variants if they can represent your enum strings
+//                             _ => {
+//                                 // FIX: Use the correct variable name for the error message
+//                                 error!("Expected a Strand from DB for dynamic enum field '{}', but got different value: {:?}", db_name, v); // Use db_name (from resolver args) or path (from nested resolver args)
+//                                 Ok(None)
+//                             }
+//                         }
+//                     } else {
+//                         // Generic conversion
+//                         let gql_value = sql_value_to_gql_value(v) // Pass owned v if needed
+//                             .map_err(|e| format!("SQL to GQL translation failed for nested field '{}': {}", path, e))?;
+//                         Ok(Some(FieldValue::value(gql_value)))
+//                     }
+//                 }
+//             };
+//             out
+//         })
+//     }
+// }
+//
+// fn make_table_field_resolver(
+//     db_name: String, // DB name (e.g., "created_at", "size")
+//     kind: Option<Kind>,
+// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     move |ctx: ResolverContext| {
+//         let fd_name = db_name.clone(); // Use db_name passed in
+//         let field_kind = kind.clone();
+//         FieldFuture::new({
+//             async move {
+//                 let (ref gtx, ref rid) = ctx
+//                     .parent_value
+//                     .downcast_ref::<ErasedRecord>()
+//                     .ok_or_else(|| internal_error(format!("failed to downcast parent for field {}", fd_name)))?;
+//
+//                 // If this field represents the BASE of a nested object (e.g. "size"),
+//                 // we don't fetch its value directly. Instead, we just pass the parent's
+//                 // ErasedRecord down, so the nested field resolvers can use it.
+//                 if matches!(field_kind, Some(Kind::Object)) {
+//                     // Check if it actually has nested structure defined via dot notation
+//                     // (This check might need refinement based on how Kind::Object is populated)
+//                     // For now, assume if kind is Object, we pass parent context down.
+//                     let parent_erased_record = (gtx.clone(), rid.clone());
+//                     // Wrap it so async-graphql knows how to handle it as the parent for sub-fields
+//                     return Ok(Some(field_val_erase_owned(parent_erased_record)));
+//                 }
+//
+//                 // Otherwise, fetch the field value as before
+//                 let val = gtx.get_record_field(rid.clone(), fd_name.as_str()).await?;
+//
+//                 let out = match val {
+//                     SqlValue::Thing(related_rid) if fd_name != "id" => { // Handle relations
+//                         let mut tmp = field_val_erase_owned((gtx.clone(), related_rid.clone()));
+//                         match &field_kind {
+//                             Some(Kind::Record(ts)) if ts.len() != 1 => {
+//                                 tmp = tmp.with_type(related_rid.tb.clone())
+//                             }
+//                             _ => {}
+//                         }
+//                         Ok(Some(tmp))
+//                     }
+//                     SqlValue::None | SqlValue::Null => Ok(None),
+//                     v => { // Handle scalars and Enums
+//                         let is_dynamic_enum = match &field_kind {
+//                             Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
+//                             Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
+//                             _ => false,
+//                         };
+//
+//                         if is_dynamic_enum {
+//                             match v.to_string_lossy() { // Adjust string access as needed
+//                                 Some(db_string) => {
+//                                     let gql_enum_value_str = db_string.to_screaming_snake_case();
+//                                     let gql_enum_value = GqlValue::Enum(Name::new(gql_enum_value_str));
+//                                     Ok(Some(FieldValue::value(gql_enum_value)))
+//                                 }
+//                                 None => Ok(None), // Or error
+//                             }
+//                         } else {
+//                             // Generic conversion
+//                             let gql_value = sql_value_to_gql_value(v) // Pass owned v if needed
+//                                 .map_err(|e| format!("SQL to GQL translation failed for field '{}': {}", fd_name, e))?;
+//                             Ok(Some(FieldValue::value(gql_value)))
+//                         }
+//                     }
+//                 };
+//                 out
+//             }
+//         })
+//     }
+// }
