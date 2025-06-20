@@ -1,6 +1,5 @@
 use crate::gql::error::{input_error, internal_error};
-use crate::gql::schema::sql_value_to_gql_value;
-use crate::gql::utils::{field_val_erase_owned, hash_sql_value, ErasedRecord, GQLTx};
+use crate::gql::utils::hash_sql_value;
 use crate::gql::GqlError;
 use crate::iam::base::BASE64;
 use crate::sql::{Thing, Value as SqlValue};
@@ -9,20 +8,17 @@ use async_graphql::Value as GqlValue;
 use base64::Engine;
 use std::any::Any;
 
-// FIXME: use async graphql structs for these types
+// We cant use the async_graphql versions as they are generic and require
+// static types at compile time, which conflicts with our dynamic schema design.
 #[derive(Clone, Debug)]
-pub struct GqlEdge {
-    pub gtx: GQLTx,
+pub struct EdgeContext {
     pub cursor: String,
-    // The actual data item (node). This is a `FieldValue` so it can be resolved
-    // by async-graphql. It will typically wrap an `ErasedRecord` or a simple value.
-    // node: FieldValue<'static>,
-    pub edge: SqlValue,
-    pub node: SqlValue,
+    pub edge: SqlValue, // Only the additional edge fields, not the node itself.
+    pub node: SqlValue, // The node data for nodes and the node of an edge.
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct GqlPageInfo {
+pub struct PageInfo {
     pub has_next_page: bool,
     pub has_previous_page: bool,
     pub start_cursor: Option<String>,
@@ -30,12 +26,17 @@ pub struct GqlPageInfo {
 }
 
 #[derive(Clone, Debug)]
-pub struct GqlConnection {
-    pub gtx: GQLTx,
-    pub edges: Vec<GqlEdge>,
-    pub nodes: Vec<SqlValue>,
-    pub page_info: GqlPageInfo,
-    pub total_count: i64,
+pub struct ConnectionContext {
+    pub edges: Vec<EdgeContext>,
+    pub page_info: PageInfo,
+    pub total_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub enum ConnectionKind {
+    Field, // Connection is a nested field and has a parent table
+    Table, // Connection is the root table
+    Relation, // Connection is a relation of a table
 }
 
 fn encode_cursor(thing: &Thing) -> String {
@@ -101,7 +102,7 @@ where
 ///
 /// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
 /// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
-pub fn make_parent_object_resolver<P, F>(
+pub fn make_object_resolver<P, F>(
     extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
 where
@@ -125,104 +126,32 @@ where
     }
 }
 
-pub fn connection_nodes_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+/// A generic resolver factory for fields that return a list of objects.
+///
+/// It takes a closure that extracts a `Vec<T>` from the parent `P`. It then
+/// correctly maps this into a `FieldValue::list`, where each item `T` is
+/// wrapped in `FieldValue::owned_any` to become a parent for its own resolvers.
+/// This is the correct way to resolve fields like `edges` and `nodes`.
+pub fn make_list_resolver<P, F>(
+    extractor: F,
+) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
+where
+    P: Any + Send + Sync,
+    F: Fn(&P) -> Result<Vec<FieldValue<'static>>, GqlError> + Clone + Send + Sync + 'static,
+{
     move |ctx: ResolverContext| {
+        let extractor = extractor.clone();
         FieldFuture::new(async move {
-            if let Some(conn) = ctx.parent_value.downcast_ref::<GqlConnection>() {
-                // 1. Clone the Vec<SqlValue>. This is cheap if SqlValue is cheap to clone.
-                let nodes_sql = conn.nodes.clone();
-                let gtx = &conn.gtx;
-
-                // 2. Convert the owned Vec<SqlValue> to a Vec<GqlValue>.
-                // let nodes_gql: Vec<GqlValue> = nodes_sql
-                //     .into_iter()
-                //     .map(|v| sql_value_to_gql_value(v))
-                //     .collect::<Result<_, _>>()?;
-
-                let nodes_erased: Result<Vec<FieldValue>, GqlError> = nodes_sql
-                    .into_iter()
-                    .map(|v| match v {
-                        SqlValue::Thing(t) => {
-                            // Create the context tuple (GQLTx, Thing)
-                            let erased: ErasedRecord = (gtx.clone(), t);
-                            // Wrap it in a FieldValue that downstream resolvers can downcast.
-                            Ok(field_val_erase_owned(erased))
-                        }
-                        // Handle cases where a node might not be a record link.
-                        _ => {
-                            let gql_val = sql_value_to_gql_value(v.clone())?;
-                            Ok(FieldValue::value(gql_val))
-                        }
-                    })
-                    .collect();
-
-                // 3. Create the final GqlValue::List and pass it to FieldValue::value.
-                // Ok(Some(FieldValue::value(GqlValue::List(nodes_gql))))
-                Ok(Some(FieldValue::list(nodes_erased?)))
+            if let Some(parent) = ctx.parent_value.downcast_ref::<P>() {
+                let list_of_field_values = extractor(parent)?;
+                Ok(Some(FieldValue::list(list_of_field_values)))
             } else {
-                Err(internal_error(
-                    "Internal Error: Expected parent of type '{}', but found something else."
-                ).into())
-            }
-        })
-    }
-}
-
-/// Resolver for the `edges` field on a Connection type.
-pub fn connection_edges_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            if let Some(conn) = ctx.parent_value.downcast_ref::<GqlConnection>() {
-                // Wrap each GqlEdgeContext so it can be the parent for the Edge resolvers.
-                let edges: Vec<FieldValue> = conn
-                    .edges
-                    .iter()
-                    .map(|edge_ctx| FieldValue::owned_any(edge_ctx.clone()))
-                    .collect();
-                Ok(Some(FieldValue::list(edges)))
-            } else {
-                Err(internal_error("Parent of Connection.edges must be GqlConnection").into())
-            }
-        })
-    }
-}
-
-/// Resolver for the `node` field on an Edge type.
-pub fn edge_node_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<GqlEdge>() {
-                // Use the pre-extracted node_data and gtx from the edge context.
-                let gtx = &edge_ctx.gtx;
-                let node_sql = &edge_ctx.node;
-
-                // Convert the node's SqlValue to the appropriate FieldValue.
-                match node_sql {
-                    SqlValue::Thing(t) => {
-                        let erased: ErasedRecord = (gtx.clone(), t.clone());
-                        Ok(Some(field_val_erase_owned(erased)))
-                    }
-                    _ => {
-                        let gql_val = sql_value_to_gql_value(node_sql.clone())?;
-                        Ok(Some(FieldValue::value(gql_val)))
-                    }
-                }
-            } else {
-                Err(internal_error("Parent of Edge.node must be GqlEdgeContext").into())
-            }
-        })
-    }
-}
-
-/// Resolver for the `cursor` field on an Edge type.
-pub fn edge_cursor_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
-    move |ctx: ResolverContext| {
-        FieldFuture::new(async move {
-            if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<GqlEdge>() {
-                // The cursor is pre-computed, just return it.
-                Ok(Some(FieldValue::value(edge_ctx.cursor.clone())))
-            } else {
-                Err(internal_error("Parent of Edge.cursor must be GqlEdgeContext").into())
+                let parent_type_name = std::any::type_name::<P>();
+                Err(internal_error(format!(
+                    "Internal Error: Expected parent of type '{}', but found something else.",
+                    parent_type_name
+                ))
+                    .into())
             }
         })
     }
@@ -323,3 +252,92 @@ pub fn has_previous_page(
 
     false
 }
+
+//
+// pub fn connection_nodes_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     move |ctx: ResolverContext| {
+//         FieldFuture::new(async move {
+//             if let Some(conn) = ctx.parent_value.downcast_ref::<ConnectionContext>() {
+//                 // 1. Clone the Vec<SqlValue>. This is cheap if SqlValue is cheap to clone.
+//                 let nodes_sql = conn.nodes.clone();
+//                 // let gtx = &conn.gtx;
+//
+//                 // 2. Convert the owned Vec<SqlValue> to a Vec<GqlValue>.
+//                 let nodes_gql: Vec<GqlValue> = nodes_sql
+//                     .into_iter()
+//                     .map(|v| sql_value_to_gql_value(v))
+//                     .collect::<Result<_, _>>()?;
+//
+//                 let nodes_erased: Result<Vec<FieldValue>, GqlError> = nodes_sql
+//                     .into_iter()
+//                     .map(|v| match v {
+//                         SqlValue::Thing(t) => {
+//                             // Create the context tuple (GQLTx, Thing)
+//                             let erased: ErasedRecord = (gtx.clone(), t);
+//                             // Wrap it in a FieldValue that downstream resolvers can downcast.
+//                             Ok(field_val_erase_owned(erased))
+//                         }
+//                         // Handle cases where a node might not be a record link.
+//                         _ => {
+//                             let gql_val = sql_value_to_gql_value(v.clone())?;
+//                             Ok(FieldValue::value(gql_val))
+//                         }
+//                     })
+//                     .collect();
+//
+//                 // 3. Create the final GqlValue::List and pass it to FieldValue::value.
+//                 // Ok(Some(FieldValue::value(GqlValue::List(nodes_gql))))
+//                 Ok(Some(FieldValue::list(nodes_erased?)))
+//             } else {
+//                 Err(internal_error(
+//                     "Internal Error: Expected parent of type '{}', but found something else."
+//                 ).into())
+//             }
+//         })
+//     }
+// }
+//
+// /// Resolver for the `edges` field on a Connection type.
+// pub fn connection_edges_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     move |ctx: ResolverContext| {
+//         FieldFuture::new(async move {
+//             if let Some(conn) = ctx.parent_value.downcast_ref::<ConnectionContext>() {
+//                 // Wrap each GqlEdgeContext so it can be the parent for the Edge resolvers.
+//                 let edges: Vec<FieldValue> = conn
+//                     .edges
+//                     .iter()
+//                     .map(|edge_ctx| FieldValue::owned_any(edge_ctx.clone()))
+//                     .collect();
+//                 Ok(Some(FieldValue::list(edges)))
+//             } else {
+//                 Err(internal_error("Parent of Connection.edges must be GqlConnection").into())
+//             }
+//         })
+//     }
+// }
+//
+// pub fn edge_node_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     move |ctx: ResolverContext| {
+//         FieldFuture::new(async move {
+//             if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<EdgeContext>() {
+//                 // Use the pre-extracted node_data and gtx from the edge context.
+//                 let gtx = &edge_ctx.gtx;
+//                 let node_sql = &edge_ctx.node;
+//
+//                 // Convert the node's SqlValue to the appropriate FieldValue.
+//                 match node_sql {
+//                     SqlValue::Thing(t) => {
+//                         let erased: ErasedRecord = (gtx.clone(), t.clone());
+//                         Ok(Some(field_val_erase_owned(erased)))
+//                     }
+//                     _ => {
+//                         let gql_val = sql_value_to_gql_value(node_sql.clone())?;
+//                         Ok(Some(FieldValue::value(gql_val)))
+//                     }
+//                 }
+//             } else {
+//                 Err(internal_error("Parent of Edge.node must be GqlEdgeContext").into())
+//             }
+//         })
+//     }
+// }

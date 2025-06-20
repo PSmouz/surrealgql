@@ -32,7 +32,7 @@ use super::ext::ValidatorExt;
 use crate::gql::error::{internal_error, schema_error, type_error};
 use crate::gql::ext::{NamedContainer, TryFromExt, TryIntoExt};
 use crate::gql::geometry;
-use crate::gql::utils::GqlValueUtils;
+use crate::gql::utils::{GQLTx, GqlValueUtils};
 use crate::kvs::LockType;
 use crate::kvs::TransactionType;
 use crate::sql::Value as SqlValue;
@@ -45,6 +45,7 @@ pub async fn generate_schema(
     let tx = kvs.transaction(TransactionType::Read, LockType::Optimistic).await?;
     let ns = session.ns.as_ref().ok_or(GqlError::UnspecifiedNamespace)?;
     let db = session.db.as_ref().ok_or(GqlError::UnspecifiedDatabase)?;
+    let gtx = GQLTx::new(datastore, session).await?;
 
     let cg = tx.get_db_config(ns, db, "graphql").await.map_err(|e| match e {
         crate::err::Error::CgNotFound {
@@ -123,6 +124,7 @@ pub async fn generate_schema(
     // Custom Scalar types
     // =======================================================
 
+    #[macro_export]
     macro_rules! scalar_debug_validated {
 		($schema:ident, $name:expr, $kind:expr) => {
 			scalar_debug_validated!(
@@ -310,6 +312,7 @@ pub async fn generate_schema(
 
 
     schema
+        .data(gtx)
         .finish()
         .map_err(|e| schema_error(format!("there was an error generating schema: {e:?}")))
 }

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::cmp::PartialEq;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::mem;
@@ -8,10 +9,12 @@ use std::sync::{Arc, LazyLock};
 use super::error::{input_error, resolver_error, schema_error, GqlError};
 use super::ext::IntoExt;
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
+use crate::dbs::capabilities::RouteTarget::Sql;
 use crate::dbs::Session;
 use crate::fnc::time::format;
 use crate::gql::cursor;
-use crate::gql::cursor::{GqlConnection, GqlEdge, GqlPageInfo};
+use crate::gql::cursor::{make_field_value_resolver, make_list_resolver, make_object_resolver, ConnectionContext,
+                         ConnectionKind, EdgeContext, PageInfo};
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
@@ -20,7 +23,7 @@ use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Ident, Literal, Operator, Part, Table, TableType};
+use crate::sql::{self, Ident, Literal, Operator, Part, Table, TableType, Values};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
@@ -32,7 +35,7 @@ use async_graphql::dynamic::{EnumItem, FieldFuture};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::dynamic::{InputValue, Union};
-use async_graphql::types::connection::{Connection, Edge, PageInfo};
+// use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use base64::engine::general_purpose;
@@ -117,14 +120,14 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "hasNextPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                cursor::make_field_value_resolver(|pi: &GqlPageInfo| pi.has_next_page),
+                make_field_value_resolver(|pi: &PageInfo| pi.has_next_page),
                 ).description("When paginating forwards, are there more items?")
             )
             .field(
                 Field::new(
                 "hasPreviousPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                cursor::make_field_value_resolver(|pi: &GqlPageInfo| pi.has_previous_page),
+                make_field_value_resolver(|pi: &PageInfo| pi.has_previous_page),
                 ).description("When paginating backwards, are there more items?")
             )
             .field(
@@ -132,7 +135,7 @@ macro_rules! define_page_info_type {
                 "startCursor",
                 TypeRef::named(TypeRef::STRING),
                 // asyncGQL Value doesnt implement from for Option<T>
-                cursor::make_field_value_resolver(|pi: &GqlPageInfo|
+                make_field_value_resolver(|pi: &PageInfo|
                     match &pi.start_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,
@@ -144,7 +147,7 @@ macro_rules! define_page_info_type {
                 Field::new(
                 "endCursor",
                 TypeRef::named(TypeRef::STRING),
-                cursor::make_field_value_resolver(|pi: &GqlPageInfo|
+                make_field_value_resolver(|pi: &PageInfo|
                     match &pi.end_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,
@@ -231,12 +234,13 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "cursor",
                     TypeRef::named_nn(TypeRef::STRING),
-                    cursor::make_field_value_resolver(|e: &GqlEdge| e.cursor),
+                    make_field_value_resolver(|e: &EdgeContext| e.cursor.clone()),
                 ).description("A cursor for use in pagination."))
                 .field(Field::new(
                     "node",
                     TypeRef::named($node_ty_name),
-                    cursor::edge_node_resolver(),
+                    make_field_value_resolver(|e: &EdgeContext| sql_value_to_gql_value(e
+                    .node.clone()).unwrap()),
                 ).description("The item at the end of the edge."))
                 .description("An edge in a connection.");
             for fd in $edge_fields_expr {
@@ -247,23 +251,36 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "edges",
                     TypeRef::named_list(&edge_type_name),
-                    cursor::connection_edges_resolver(),
+                    make_list_resolver(|conn: &ConnectionContext| {
+                        Ok(conn
+                            .edges
+                            .iter()
+                            .map(|ctx| FieldValue::owned_any(ctx.clone()))
+                            .collect())
+                    }),
                 ).description("A list of edges."))
                 .field(Field::new(
                     "nodes",
                     TypeRef::named_list($node_ty_name),
-                    cursor::connection_nodes_resolver(),
-                    // make_parent_object_resolver(|conn: &GqlConnection| conn.nodes),
+                    make_list_resolver(|conn: &ConnectionContext| {
+                        conn.edges
+                            .iter()
+                            .map(|e| {
+                                let gql_val = sql_value_to_gql_value(e.node.clone())?;
+                                Ok(FieldValue::value(gql_val))
+                            })
+                            .collect() // This collects into a Result<Vec<FieldValue>, _>
+                    }),
                 ).description("A list of nodes."))
                 .field(Field::new(
                     "pageInfo",
                     TypeRef::named_nn("PageInfo"),
-                    cursor::make_parent_object_resolver(|conn: &GqlConnection| conn.page_info.clone()),
+                    make_object_resolver(|conn: &ConnectionContext| conn.page_info.clone()),
                 ).description("Information to aid in pagination."))
                 .field(Field::new(
                     "totalCount",
                     TypeRef::named_nn(TypeRef::INT),
-                    cursor::make_field_value_resolver(|conn: &GqlConnection| conn.total_count),
+                    make_field_value_resolver(|conn: &ConnectionContext| conn.total_count),
                 ).description("Identifies the total count of items in the connection."))
                 .description(format!("The connection type for {}.", $node_ty_name));
 
@@ -285,12 +302,6 @@ macro_rules! cursor_pagination {
         }
     };
 }
-
-// impl<'a> From<GqlPageInfo> for FieldValue<'a> {
-//     fn from(val: GqlPageInfo) -> Self {
-//         FieldValue::owned_any(val)
-//     }
-// }
 
 /// This macro is used to parse a field definition and add it to the object map.
 /// It handles different kinds of fields, including nested fields and array fields.
@@ -368,7 +379,7 @@ macro_rules! parse_field {
                         let ty_name = ty_ref.type_name();
 
                         let $field_ident = cursor_pagination!($types, &fd_name_gql, ty_name,
-                        make_connection_resolver(fd_path.as_str(), false), //$fd.kind.clone()
+                        make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
                         edge_fields: [], args: []);
                         $($action_tokens)*;
                     }
@@ -378,9 +389,6 @@ macro_rules! parse_field {
                             fd_name_gql,
                             fd_ty,
                             make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
-                         // hier der resolver muss handlen koennen simple fields and
-                         // arbitrary nested objects
-                         //fixme: hier muss der resolver klar kommen mit edge context in connection
                         )
                         .description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
@@ -405,8 +413,7 @@ macro_rules! parse_field {
                                 let ty_name = ty_ref.type_name();
 
                                 cursor_pagination!($types, &fd_name_gql, ty_name,
-                                    make_connection_resolver(fd_path.as_str(), false), //$fd.kind
-                                // .clone()
+                                    make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
                                     edge_fields: [], args: [])
                             } else {
                                 // Fallback for safety, though inner_kind should always exist for an array
@@ -583,9 +590,7 @@ pub async fn process_tbs(
                 types,
                 tb_name_query.to_plural(),
                 &tb_name_gql,
-                // TODO: instead of boolean, resolver must handle type table, parent and relation.
-                dummy_resolver("".to_string(), None),
-                // make_connection_resolver(fd_path.as_str(), $fd.kind.clone()),
+                make_connection_resolver(tb_name_query.to_plural(), ConnectionKind::Table),
                 edge_fields: [],
                 args: [
                     order_input!(&tb_name)
@@ -804,7 +809,7 @@ pub async fn process_tbs(
                 types,
                 rel.name.to_raw().to_camel_case().to_plural(),
                 &node_ty_name,
-                make_connection_resolver(rel.name.to_raw(), true),
+                make_connection_resolver(rel.name.to_raw(), ConnectionKind::Relation),
                     // Option::from(Kind::Record(vec![Table::from(tb_name.clone())])) TODO:remove
                 edge_fields: fd_vec,
                 args: [
@@ -950,7 +955,7 @@ fn make_table_field_resolver(
                             Ok(Some(FieldValue::value(gql_val)))
                         }
                     }
-                } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<GqlEdge>() {
+                } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<EdgeContext>() {
                     // CASE 2: Parent is a connection edge. Resolve from pre-fetched data.
                     trace!("Parent is GqlEdgeContext, resolving path '{}' from edge_data", fd_path);
                     let field_name = fd_path.split('.').last().unwrap_or(&fd_path);
@@ -1163,7 +1168,6 @@ fn make_table_field_resolver(
     }
 }
 
-
 #[allow(clippy::too_many_lines)] // Due to detailed logic
 fn make_connection_resolver(
     // For table connections: table name (e.g., "user")
@@ -1177,60 +1181,31 @@ fn make_connection_resolver(
     // to correctly determine 'in'/'out' fields and target node type.
     // This is a simplification for now: assumes 'in' links to parent, 'out' to target.
     // relation_def: Option<Arc<DefineTableStatement>>, // TODO: Pass this if needed
-    is_relation: bool,
+    // is_relation: bool,
+    kind: ConnectionKind,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
     let query_source_name = name_for_query_source.into();
 
     move |ctx: ResolverContext| {
         let query_source = query_source_name.clone();
-        // let item_kind_clone = _item_kind.clone();
-        // let item_kind_clone = item_kind.clone();
-        let is_relation_clone = is_relation;
+        let kind_clone = kind.clone();
 
         FieldFuture::new(async move {
-            // let (gtx, parent_rid_opt): (GQLTx, Option<Thing>) =
-            //     if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-            //         (er_gtx.clone(), Some(er_rid.clone()))
-            //     } else if let Ok(gql_tx) = ctx.data::<GQLTx>() {
-            //         (gql_tx.clone(), None)
-            //     } else {
-            //         return Err(internal_error(
-            //             "GQLTx not found in resolver context for connection resolver",
-            //         )
-            //             .into());
-            //     };
-            //
-            // trace!("GTX: {:?}, Parent RID: {:?}", gtx, parent_rid_opt);
-            //
             let args = ctx.args.as_index_map();
-            //
             trace!(
                 "Connection resolver for source '{}', args: {:?}",
                 query_source,
                 args
             );
+            let is_relation = matches!(kind_clone, ConnectionKind::Relation);
 
-            // let db_value_array =
-            //     if let Some((er_gtx, er_rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-            //         // Nested field query: get field from parent record
-            //         trace!("Nested query: getting field '{}' from parent RID: {}", query_source, er_rid);
-            //         er_gtx.get_record_field(er_rid.clone(), &query_source).await?
-            //     } else {
-            //         return Err(internal_error("GQLTx not found in resolver context").into());
-            //     };
-
-            // Get the GQLTx from the correct source (either parent ErasedRecord or root context).
-            let gtx = if let Some((er_gtx, _)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-                er_gtx.clone()
-            } else {
-                // Replace with error?!?
-                ctx.data::<GQLTx>()?.clone()
-            };
+            let gtx = ctx.data::<GQLTx>()?.clone();
 
             let db_value_array = if let Some((_, er_rid)) =
                 ctx.parent_value.downcast_ref::<ErasedRecord>()
             {
-                if is_relation_clone { // CASE 1: It's a RELATION TABLE.
+                if is_relation {
+                    // Fetch from a relation table
                     trace!(
                             "Fetching relation table '{}' where in = {}",
                             query_source,
@@ -1247,7 +1222,8 @@ fn make_connection_resolver(
                         ..Default::default()
                     });
                     gtx.process_stmt(ast).await?
-                } else { // CASE 2: It's an EMBEDDED ARRAY or other field.
+                } else {
+                    // Fetch an embedded array field
                     trace!(
                             "Fetching embedded field '{}' from parent {}",
                             query_source,
@@ -1257,17 +1233,16 @@ fn make_connection_resolver(
                         .await?
                 }
             } else {
-                // FIXME: when is this used?
+                // Fetch a root-level table
                 let ast = Statement::Select(SelectStatement {
                     what: vec![SqlValue::Table(query_source.intox())].into(),
+                    expr: Fields::all(),
                     ..Default::default()
                 });
                 gtx.process_stmt(ast).await?
             };
 
-            trace!("db_value_array: {:?}", db_value_array.clone());
-
-            //FIXME: two cases possible: we have array of objects or things.
+            // trace!("db_value_array: {:?}", db_value_array.clone());
 
             let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
             let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
@@ -1290,7 +1265,7 @@ fn make_connection_resolver(
             };
             trace!("Edges slice: {:?}", all_edges);
 
-            let total_count = all_edges.len() as i64;
+            let total_count = all_edges.len() as u64;
             trace!("Total items found: {}", total_count);
 
             let edges = cursor::apply_cursors_to_edges(
@@ -1307,91 +1282,129 @@ fn make_connection_resolver(
             let start_cursor = limited_edges.first().map(cursor::encode_cursor_for_item);
             let end_cursor = limited_edges.last().map(cursor::encode_cursor_for_item);
 
-
-            // let gql_values: Vec<GqlValue> = limited_edges.iter().map(|v| sql_value_to_gql_value(v
-            //     .clone())
-            //     .unwrap())
-            //     .collect();
-            // let gql_val_lim = FieldValue::list(gql_values);
-            // trace!("gql_val_lim: {:?}", gql_val_lim);
-            //
-            // let gql_val = sql_value_to_gql_value(db_value_array)?;
-            // // return Ok(Some(FieldValue::value(gql_val)));
-            // trace!("gql_val: {:?}", gql_val);
-
-            // let gql_nodes: Vec<GqlValue> = limited_edges
-            //     .iter()
-            //     .map(|v| sql_value_to_gql_value(v.clone()))
-            //     .collect::<Result<_, _>>()?;
-
-            // ========================================================
-            // START: THE FIX
-            // ========================================================
-
-            // Create a new Vec containing only the actual node data by transforming the limited_slice.
-            let nodes_for_connection: Vec<SqlValue> = limited_edges
+            let ids_to_fetch: Vec<SqlValue> = limited_edges
                 .iter()
-                .map(|item| {
-                    // If this is a relation, the node is the `out` field of the edge record.
-                    if is_relation_clone {
-                        if let SqlValue::Object(obj) = item {
-                            // Extract the `out` field. Default to the item itself if 'out' is missing.
-                            return obj.get("out").unwrap_or(item).clone();
+                .filter_map(|edge| {
+                    match edge {
+                        SqlValue::Thing(_) => Option::from(edge.clone()),
+                        SqlValue::Object(obj) => {
+                            if let Some(SqlValue::Thing(thing)) = obj.get("out") {
+                                Some(SqlValue::Thing(thing.clone()))
+                            } else {
+                                None
+                            }
                         }
+                        _ => None,
                     }
-                    // Otherwise (for embedded arrays), the item itself is the node.
-                    item.clone()
                 })
                 .collect();
-            trace!("nodes_for_connection: {:?}", nodes_for_connection);
-            // ========================================================
-            // END: THE FIX
-            // ========================================================
 
-            let edge_contexts: Vec<GqlEdge> = limited_edges
+            // N+1
+            let fetched_nodes: HashMap<Thing, SqlValue> = if !ids_to_fetch.is_empty() {
+                let ast = Statement::Select(SelectStatement {
+                    what: Values(ids_to_fetch),
+                    expr: Fields::all(),
+                    ..Default::default()
+                });
+                let res = gtx.process_stmt(ast).await?;
+
+                if let SqlValue::Array(arr) = res {
+                    arr.0.into_iter().filter_map(|val| {
+                        if let SqlValue::Object(obj) = &val {
+                            if let Some(SqlValue::Thing(id)) = obj.get("id") {
+                                return Some((id.clone(), val));
+                            }
+                        }
+                        None
+                    }).collect()
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            };
+            trace!("fetched_nodes: {:?}", fetched_nodes);
+
+            // FIXME: simplify this logic
+            let edge_contexts: Vec<EdgeContext> = limited_edges
                 .iter()
                 .map(|item| {
-                    // FIXME: rewrite
-                    let node = if is_relation_clone {
+                    let node = match item {
+                        // Case 1: Array item is a Thing (e.g., Record link)
+                        SqlValue::Thing(thing) => {
+                            fetched_nodes.get(thing).unwrap()
+                        }
+                        // Case 2: Array item is an Object
+                        SqlValue::Object(obj) => {
+                            // Case 2.1: If it's a relation, we expect an object with 'in'/'out' fields
+                            if is_relation {
+                                if let Some(SqlValue::Thing(id)) = obj.get("out") {
+                                    fetched_nodes.get(id).unwrap_or(&SqlValue::Null)
+                                } else {
+                                    // Case 2.1.1: 'out' missing in relation should not be possible
+                                    item
+                                }
+                                // Case 2.2: If it's an embedded array object, we expect a simple object
+                            } else {
+                                item
+                            }
+                        }
+                        // Case 3: Other types (e.g., scalar values)
+                        _ => {
+                            item
+                        }
+                    };
+                    trace!("node: {:?}", node);
+
+                    let edge = if is_relation {
                         if let SqlValue::Object(obj) = item {
-                            obj.get("out").unwrap_or(item).clone()
+                            // It's a relation record. We need to filter its fields.
+                            let edge_fields: BTreeMap<String, SqlValue> = obj
+                                .iter()
+                                .filter(|(key, _)| {
+                                    // Keep the 'id' and any custom fields, but discard 'in' and 'out'.
+                                    **key != "in" && **key != "out"
+                                })
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect();
+
+                            // Create a new object containing only the desired edge fields.
+                            SqlValue::Object(edge_fields.into())
                         } else {
-                            item.clone()
+                            // This case should not happen for relations, but as a fallback,
+                            // we treat it as having no specific edge data.
+                            SqlValue::Null
                         }
                     } else {
-                        item.clone()
+                        // For non-relations (embedded arrays), there are no separate edge fields.
+                        // The item itself is the node, and the edge data is null.
+                        SqlValue::Null
                     };
+                    trace!("edge: {:?}", edge);
 
-                    GqlEdge {
-                        gtx: gtx.clone(),
+                    EdgeContext {
                         cursor: cursor::encode_cursor_for_item(item),
-                        edge: item.clone(),
-                        node,
+                        edge: edge.clone(),
+                        node: node.clone(),
                     }
                 })
                 .collect();
 
 
-            let page_info = GqlPageInfo {
+            let page_info = PageInfo {
                 has_next_page: cursor::has_next_page(edges, before_cursor_str.as_deref(), first),
                 has_previous_page: cursor::has_previous_page(edges, after_cursor_str.as_deref(), last),
                 start_cursor,
                 end_cursor,
             };
-            let connection_obj = GqlConnection {
-                gtx,
-                // edges: vec![],
-                // nodes: limited_edges.to_vec(),
+            let connection = ConnectionContext {
                 edges: edge_contexts,
-                nodes: nodes_for_connection,
-                // nodes: GqlValue::List(gql_nodes),
-                // nodes: gql_val,
                 total_count,
                 page_info,
             };
-            trace!("Created connection object: {:?}", connection_obj);
+            trace!("Created connection object: {:?}", connection);
 
-            Ok(Some(FieldValue::owned_any(connection_obj)))
+            Ok(Some(FieldValue::owned_any(connection)))
         })
     }
 }

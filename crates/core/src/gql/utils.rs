@@ -14,11 +14,14 @@ use crate::sql::Statement;
 use crate::sql::{FlowResultExt, Ident};
 use crate::sql::{Thing, Value as SqlValue};
 
+use super::error::GqlError;
 use async_graphql::dynamic::FieldValue;
 use async_graphql::{dynamic::indexmap::IndexMap, Name, Value as GqlValue};
+use base64::engine::general_purpose;
+use base64::Engine;
+use md5::Digest;
 use reblessive::TreeStack;
-
-use super::error::GqlError;
+use sha2::Sha256;
 
 pub(crate) trait GqlValueUtils {
     fn as_i64(&self) -> Option<i64>;
@@ -59,7 +62,7 @@ impl GqlValueUtils for GqlValue {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GQLTx {
     opt: Options,
     ctx: Context,
@@ -147,4 +150,56 @@ pub type ErasedRecord = (GQLTx, Thing);
 
 pub fn field_val_erase_owned(val: ErasedRecord) -> FieldValue<'static> {
     FieldValue::owned_any(val)
+}
+// also, when the cursor pagination is for a entire db table, say e.g. not one home but homes. this homes is also wrapped with the cursor pagination as u can see from the schema generation. but then it throws the downcast error as the cox.parent_value is null as this is the query for the "new" table.
+
+/// Recursively serializes an `SqlValue` into a canonical, stable string format.
+/// This is essential for generating consistent hashes.
+pub fn canonicalize_sql_value(value: &SqlValue) -> String {
+    match value {
+        // For objects, iterate over the already-sorted keys of the BTreeMap.
+        SqlValue::Object(obj) => {
+            let pairs: String = obj
+                .iter()
+                .map(|(k, v)| {
+                    // Recursively canonicalize the value.
+                    format!("\"{}\":{}", k, canonicalize_sql_value(v))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{}}}", pairs)
+        }
+        // For arrays, iterate in order and canonicalize each element.
+        SqlValue::Array(arr) => {
+            let items: String = arr
+                .0
+                .iter()
+                .map(canonicalize_sql_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{}]", items)
+        }
+        // Ensure scalars have a consistent representation.
+        SqlValue::Strand(s) => format!("\"{}\"", s), // Quote strings
+        SqlValue::Thing(t) => format!("\"{}\"", t),   // Quote things
+        SqlValue::Number(n) => n.to_string(),
+        SqlValue::Bool(b) => b.to_string(),
+        SqlValue::None | SqlValue::Null => "null".to_string(),
+        // Add other types as needed, ensuring a stable string format.
+        other => format!("\"{}\"", other.to_string()), // Fallback with quotes
+    }
+}
+
+/// Hashes a canonicalized SqlValue to create a stable, content-addressable cursor.
+pub fn hash_sql_value(value: &SqlValue) -> String {
+    // 1. Get the canonical string representation of the value.
+    let canonical_string = canonicalize_sql_value(value);
+
+    // 2. Hash the string using a stable algorithm like SHA-256.
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_string.as_bytes());
+    let hash_result = hasher.finalize();
+
+    // 3. Base64-encode the raw hash bytes to create a clean cursor string.
+    general_purpose::URL_SAFE_NO_PAD.encode(hash_result)
 }
