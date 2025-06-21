@@ -8,6 +8,8 @@ pub mod schema;
 mod tables;
 mod utils;
 mod geometry;
+mod test;
+mod cursor;
 
 pub use error::GqlError;
 
