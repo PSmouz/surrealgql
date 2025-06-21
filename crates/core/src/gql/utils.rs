@@ -15,7 +15,6 @@ use crate::sql::{FlowResultExt, Ident};
 use crate::sql::{Thing, Value as SqlValue};
 
 use super::error::GqlError;
-use async_graphql::dynamic::FieldValue;
 use async_graphql::{dynamic::indexmap::IndexMap, Name, Value as GqlValue};
 use base64::engine::general_purpose;
 use base64::Engine;
@@ -146,11 +145,11 @@ impl GQLTx {
     }
 }
 
-pub type ErasedRecord = (GQLTx, Thing);
-
-pub fn field_val_erase_owned(val: ErasedRecord) -> FieldValue<'static> {
-    FieldValue::owned_any(val)
-}
+// pub type ErasedRecord = (GQLTx, Thing);
+//
+// pub fn field_val_erase_owned(val: ErasedRecord) -> FieldValue<'static> {
+//     FieldValue::owned_any(val)
+// }
 // also, when the cursor pagination is for a entire db table, say e.g. not one home but homes. this homes is also wrapped with the cursor pagination as u can see from the schema generation. but then it throws the downcast error as the cox.parent_value is null as this is the query for the "new" table.
 
 /// Recursively serializes an `SqlValue` into a canonical, stable string format.

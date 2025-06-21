@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
-use super::utils::field_val_erase_owned;
 use super::GqlError;
 use crate::dbs::Session;
 use crate::gql::schema::kind_to_type;
 use crate::gql::utils::GQLTx;
 use crate::kvs::Datastore;
 use crate::sql::statements::DefineFunctionStatement;
-use crate::sql::{Kind, Value as SqlValue};
+use crate::sql::Value as SqlValue;
 use async_graphql::dynamic::FieldFuture;
 use async_graphql::dynamic::InputValue;
 use async_graphql::dynamic::Object;
@@ -58,14 +57,16 @@ pub async fn process_fns(
 
                     let gql_res = match res {
                         SqlValue::Thing(rid) => {
-                            let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
-                            match kind1 {
-                                Kind::Record(ts) if ts.len() != 1 => {
-                                    tmp = tmp.with_type(rid.tb.clone())
-                                }
-                                _ => {}
-                            }
-                            Some(tmp)
+                            // let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
+                            // match kind1 {
+                            //     Kind::Record(ts) if ts.len() != 1 => {
+                            //         tmp = tmp.with_type(rid.tb.clone())
+                            //     }
+                            //     _ => {}
+                            // }
+                            // Some(tmp)
+                            // FIXME
+                            Some(FieldValue::value(sql_value_to_gql_value(SqlValue::None).unwrap()))
                         }
                         SqlValue::None => None,
                         _ => Some(FieldValue::value(sql_value_to_gql_value(res)?)),
