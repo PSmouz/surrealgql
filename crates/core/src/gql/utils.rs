@@ -202,3 +202,18 @@ pub fn hash_sql_value(value: &SqlValue) -> String {
     // 3. Base64-encode the raw hash bytes to create a clean cursor string.
     general_purpose::URL_SAFE_NO_PAD.encode(hash_result)
 }
+
+/// Wrapper around inflector's to_plural() method. We need this to avoid naming
+/// conflicts in cases where the plural form equals the singular one. We solve
+/// this by appending `List` to the pluralized name.
+pub fn pluralize(input: String) -> String {
+    // We need to get the singular and plural forms (e.g. "images" being the sql table name)
+    // Otherwise, we would append `List` even though the singular form is different.
+    let plural = inflector::string::pluralize::to_plural(&input);
+    let singular = inflector::string::singularize::to_singular(&input);
+    if plural == singular {
+        format!("{}List", plural)
+    } else {
+        plural
+    }
+}

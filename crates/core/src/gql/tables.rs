@@ -18,7 +18,7 @@ use crate::gql::cursor::{make_field_value_resolver, make_list_resolver, make_obj
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
-use crate::gql::utils::{GQLTx, GqlValueUtils};
+use crate::gql::utils::{pluralize, GQLTx, GqlValueUtils};
 use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
@@ -35,7 +35,6 @@ use async_graphql::dynamic::{EnumItem, FieldFuture};
 use async_graphql::dynamic::{Field, ResolverContext};
 use async_graphql::dynamic::{InputObject, Object};
 use async_graphql::dynamic::{InputValue, Union};
-// use async_graphql::types::connection::{Connection, Edge, PageInfo};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use base64::engine::general_purpose;
@@ -580,15 +579,16 @@ pub async fn process_tbs(
 
         let sess2 = session.to_owned();
         let kvs2 = datastore.clone();
-        let fds2 = fds.clone();
+
+        let tb_name_plural = pluralize(tb_name_query);
 
         if cursor {
             query = query.field(
                 cursor_pagination!(
                 types,
-                tb_name_query.to_plural(),
+                &tb_name_plural,
                 &tb_name_gql,
-                make_connection_resolver(tb_name_query.to_plural(), ConnectionKind::Table),
+                make_connection_resolver(&tb_name_plural, ConnectionKind::Table),
                 edge_fields: [],
                 args: [
                     order_input!(&tb_name)
@@ -598,12 +598,11 @@ pub async fn process_tbs(
         } else {
             query = query.field(
                 Field::new(
-                    tb_name_query.to_plural(),
+                    tb_name_plural,
                     TypeRef::named_nn_list_nn(&tb_name_gql),
                     move |ctx| {
                         let tb_name = second_tb_name.clone();
                         let sess2 = sess2.clone();
-                        let fds2 = fds.clone();
                         let kvs2 = kvs2.clone();
                         FieldFuture::new(async move {
                             let gtx = GQLTx::new(&kvs2, &sess2).await?;
@@ -770,16 +769,7 @@ pub async fn process_tbs(
             //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
             // possible performance improvements by skipping fields for prev relations
             for fd in fds.iter().filter(|fd|
-                                            !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
-                                        // {
-                                        // match fd.name.to_string().as_str() {
-                                        //     "in" => false,
-                                        //     "out" => false,
-                                        //     // "id" => false, // FIXME: prob not wanted
-                                        //     _ => true,
-                                        // }
-
-                                        // }
+                !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
             ) {
                 parse_field!(fd, types, cursor, rel_name, fd_map, |fd| fd_vec.push(fd));
             }
@@ -806,7 +796,7 @@ pub async fn process_tbs(
             tb_ty_obj = tb_ty_obj.field(
                 cursor_pagination!(
                 types,
-                rel.name.to_raw().to_camel_case().to_plural(),
+                pluralize(rel.name.to_raw().to_camel_case()),
                 &node_ty_name,
                 make_connection_resolver(rel.name.to_raw(), ConnectionKind::Relation),
                     // Option::from(Kind::Record(vec![Table::from(tb_name.clone())])) TODO:remove
