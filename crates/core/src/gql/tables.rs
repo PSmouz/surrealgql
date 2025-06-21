@@ -223,11 +223,24 @@ macro_rules! cursor_pagination {
         $node_ty_name:expr,
         $connection_resolver:expr, // The actual resolver for the connection field on $obj
         edge_fields: $edge_fields_expr:expr,
-        args: [ $( $extra_connection_arg:expr ),* $(,)? ]
+        args: [ $( $extra_connection_arg:expr ),* $(,)? ],
+        is_relation: $is_relation:expr
     ) => {
         {
-            let edge_type_name = format!("{}Edge", $node_ty_name);
-            let connection_type_name = format!("{}Connection", $node_ty_name);
+            // We must distinguish between relation and non-relation nodes due to the edge fields.
+            // But we still want to use the original Object type for the node type. Thats why we
+            // use the `is_relation` boolean to determine the type names in here.
+            let edge_type_name = if $is_relation {
+                format!("{}RelationEdge", $node_ty_name)
+            } else {
+                format!("{}Edge", $node_ty_name)
+            };
+
+            let connection_type_name = if $is_relation {
+                format!("{}RelationConnection", $node_ty_name)
+            } else {
+                format!("{}Connection", $node_ty_name)
+            };
 
             let mut edge = Object::new(&edge_type_name)
                 .field(Field::new(
@@ -379,7 +392,7 @@ macro_rules! parse_field {
 
                         let $field_ident = cursor_pagination!($types, &fd_name_gql, ty_name,
                         make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
-                        edge_fields: [], args: []);
+                        edge_fields: [], args: [], is_relation: false);
                         $($action_tokens)*;
                     }
                 }
@@ -413,7 +426,7 @@ macro_rules! parse_field {
 
                                 cursor_pagination!($types, &fd_name_gql, ty_name,
                                     make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
-                                    edge_fields: [], args: [])
+                                    edge_fields: [], args: [], is_relation: false)
                             } else {
                                 // Fallback for safety, though inner_kind should always exist for an array
                                 Field::new(fd_name_gql, fd_ty, make_field_resolver(fd_path.as_str(), $fd.kind.clone()))
@@ -555,8 +568,6 @@ pub async fn process_tbs(
 
                             match gtx.get_record_field(thing, "id").await? {
                                 SqlValue::Thing(t) => {
-                                    // let erased: ErasedRecord = (gtx, t);
-                                    // Ok(Some(field_val_erase_owned(erased)))
                                     Ok(Some(FieldValue::owned_any(t)))
                                 }
                                 _ => Ok(None),
@@ -592,9 +603,10 @@ pub async fn process_tbs(
                 edge_fields: [],
                 args: [
                     order_input!(&tb_name)
-                ]
+                ],
+                is_relation: false
             ));
-            define_page_info_type!(types);
+            define_page_info_type!(types); //TODO: remove
         } else {
             query = query.field(
                 Field::new(
@@ -799,11 +811,11 @@ pub async fn process_tbs(
                 pluralize(rel.name.to_raw().to_camel_case()),
                 &node_ty_name,
                 make_connection_resolver(rel.name.to_raw(), ConnectionKind::Relation),
-                    // Option::from(Kind::Record(vec![Table::from(tb_name.clone())])) TODO:remove
                 edge_fields: fd_vec,
                 args: [
                     order_input!(&tb_name)
-                ]
+                ],
+                is_relation: true
             ));
 
             define_order_input_types!(types, rel.name.to_raw(),);
@@ -1263,49 +1275,7 @@ fn make_connection_resolver(
                 args
             );
             let is_relation = matches!(kind_clone, ConnectionKind::Relation);
-
             let gtx = ctx.data::<GQLTx>()?.clone();
-
-            // let db_value_array = if let Some((_, er_rid)) =
-            //     ctx.parent_value.downcast_ref::<ErasedRecord>()
-            // {
-            //     if is_relation {
-            //         // Fetch from a relation table
-            //         trace!(
-            //                 "Fetching relation table '{}' where in = {}",
-            //                 query_source,
-            //                 er_rid
-            //             );
-            //         let ast = Statement::Select(SelectStatement {
-            //             expr: Fields::all(),
-            //             what: vec![SqlValue::Table(query_source.intox())].into(),
-            //             cond: Some(Cond(SqlValue::from(Expression::Binary {
-            //                 l: SqlValue::Idiom(Idiom(vec![Part::Field("in".into())])),
-            //                 o: Operator::Equal,
-            //                 r: SqlValue::Thing(er_rid.clone()),
-            //             }))),
-            //             ..Default::default()
-            //         });
-            //         gtx.process_stmt(ast).await?
-            //     } else {
-            //         // Fetch an embedded array field
-            //         trace!(
-            //                 "Fetching embedded field '{}' from parent {}",
-            //                 query_source,
-            //                 er_rid
-            //             );
-            //         gtx.get_record_field(er_rid.clone(), &query_source)
-            //             .await?
-            //     }
-            // } else {
-            //     // Fetch a root-level table
-            //     let ast = Statement::Select(SelectStatement {
-            //         what: vec![SqlValue::Table(query_source.intox())].into(),
-            //         expr: Fields::all(),
-            //         ..Default::default()
-            //     });
-            //     gtx.process_stmt(ast).await?
-            // };
 
             trace!("parent_value: {:?}", ctx.parent_value);
             let db_value_array = if let Some(thing) = ctx.parent_value.downcast_ref::<Thing>() {
