@@ -640,7 +640,7 @@ pub fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError>
             GqlValue::String(s) => {
                 use Kind::*;
                 any_try_kinds!(val, Datetime, Duration, Uuid);
-                syn::value_legacy_strand(s.as_str()).map_err(|_| type_error(kind, val))
+                Ok(SqlValue::Strand(s.as_str().into()))
             }
             GqlValue::Null => Ok(SqlValue::Null),
             obj @ GqlValue::Object(_) => gql_to_sql_kind(obj, Kind::Object),
