@@ -171,6 +171,13 @@ pub async fn generate_schema(
 		"String encoded UUID",
 		"https://datatracker.ietf.org/doc/html/rfc4122"
 	);
+    scalar_debug_validated!(
+        schema,
+        "Bytes", 
+        Kind::Bytes,
+        "A scalar that represents binary data, serialized as a Base64 string.",
+        "https://datatracker.ietf.org/doc/html/rfc4648#section-4"
+    );
     scalar_debug_validated!(schema, "Decimal", Kind::Decimal);
     scalar_debug_validated!(schema, "Number", Kind::Number);
     scalar_debug_validated!(schema, "Null", Kind::Null);
