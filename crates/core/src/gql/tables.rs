@@ -18,12 +18,12 @@ use crate::gql::cursor::{make_field_value_resolver, make_list_resolver, make_obj
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::{kind_to_type, unwrap_type};
-use crate::gql::utils::{field_val_erase_owned, ErasedRecord, GQLTx, GqlValueUtils};
+use crate::gql::utils::{GQLTx, GqlValueUtils};
 use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Ident, Literal, Operator, Part, Table, TableType, Values};
+use crate::sql::{self, Array, Ident, Literal, Operator, Part, Table, TableType, Values};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
@@ -388,7 +388,7 @@ macro_rules! parse_field {
                      let $field_ident = Field::new(
                             fd_name_gql,
                             fd_ty,
-                            make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                            make_field_resolver(fd_path.as_str(), $fd.kind.clone()),
                         )
                         .description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
@@ -417,14 +417,14 @@ macro_rules! parse_field {
                                     edge_fields: [], args: [])
                             } else {
                                 // Fallback for safety, though inner_kind should always exist for an array
-                                Field::new(fd_name_gql, fd_ty, make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()))
+                                Field::new(fd_name_gql, fd_ty, make_field_resolver(fd_path.as_str(), $fd.kind.clone()))
                             }
                         }
                         _ => {
                             Field::new(
                                 fd_name_gql,
                                 fd_ty,
-                                make_table_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                                make_field_resolver(fd_path.as_str(), $fd.kind.clone()),
                             )
                         }
                     };
@@ -479,9 +479,6 @@ pub async fn process_tbs(
         }
     });
 
-    // trace!("tables: {:?}", tables);
-    // trace!("relations: {:?}", relations);
-
     for tb in tables.iter() {
         let tb_name = tb.name.to_string();
         let first_tb_name = tb_name.clone();
@@ -497,7 +494,7 @@ pub async fn process_tbs(
             .field(Field::new(
                 "id",
                 TypeRef::named_nn(TypeRef::ID),
-                make_table_field_resolver(
+                make_field_resolver(
                     "id",
                     Some(Kind::Record(vec![Table::from(tb_name.clone())])),
                 ),
@@ -559,8 +556,9 @@ pub async fn process_tbs(
 
                             match gtx.get_record_field(thing, "id").await? {
                                 SqlValue::Thing(t) => {
-                                    let erased: ErasedRecord = (gtx, t);
-                                    Ok(Some(field_val_erase_owned(erased)))
+                                    // let erased: ErasedRecord = (gtx, t);
+                                    // Ok(Some(field_val_erase_owned(erased)))
+                                    Ok(Some(FieldValue::owned_any(t)))
                                 }
                                 _ => Ok(None),
                             }
@@ -713,8 +711,9 @@ pub async fn process_tbs(
                                 .into_iter()
                                 .map(|v| {
                                     v.try_as_thing().map(|t| {
-                                        let erased: ErasedRecord = (gtx.clone(), t);
-                                        field_val_erase_owned(erased)
+                                        // let erased: ErasedRecord = (gtx.clone(), t);
+                                        // field_val_erase_owned(erased)
+                                        FieldValue::owned_any(t)
                                     })
                                 })
                                 .collect();
@@ -841,328 +840,404 @@ pub async fn process_tbs(
 
 //TODO: bug: type HomeTypeEnum enum is optional even though it shouldn't
 
-fn make_table_field_resolver(
-    // fd_name: impl Into<String>,
+// fn make_table_field_resolver(
+//     // fd_name: impl Into<String>,
+//     fd_path: impl Into<String>,
+//     kind: Option<Kind>,
+// ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+//     let fd_path = fd_path.into();
+//     move |ctx: ResolverContext| {
+//         let fd_path = fd_path.clone();
+//         let field_kind = kind.clone();
+//         let path_for_resolver = fd_path.clone();
+//         let resolver_field_kind = kind.clone();
+//
+//         // --- Default behavior for non-array-of-records or if not ErasedRecord parent ---
+//         // This includes:
+//         // 1. Scalar fields on an ErasedRecord parent.
+//         // 2. Object fields on an ErasedRecord parent (passing down ErasedRecord).
+//         // 3. Array of SCALARS/Simple Objects on an ErasedRecord parent.
+//         // 4. 'id' field.
+//         FieldFuture::new({
+//             async move {
+//                 trace!(
+//                     "Creating/Running resolver for DB path '{}' (Kind: {:?}) with parent: {:?}",
+//                     fd_path,
+//                     field_kind,
+//                     ctx.parent_value // Use the user-provided trace format
+//                 );
+//
+//                 // Check if parent is an ErasedRecord (normal case)
+//                 if let Some((gtx, rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
+//                     trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
+//
+//                     // Check if THIS field is an array of Records
+//                     if let Some(Kind::Array(ref inner_kind_box, _)) = resolver_field_kind.as_ref()
+//                         .map(|k| k.non_optional()) {
+//                         if let Kind::Record(_) = inner_kind_box.as_ref().non_optional() {
+//                             trace!("Field '{}' is an Array of Records. Fetching and wrapping items.", path_for_resolver);
+//                             let db_value_array = gtx.get_record_field(rid.clone(), &path_for_resolver).await?;
+//
+//                             match db_value_array {
+//                                 SqlValue::Array(surreal_array) => {
+//                                     let mut gql_record_items = Vec::new();
+//                                     for item_sql_value in surreal_array.0 {
+//                                         match item_sql_value {
+//                                             SqlValue::Thing(thing_val) => {
+//                                                 // Wrap each Thing in ErasedRecord
+//                                                 let record_context: ErasedRecord = (gtx.clone(), thing_val);
+//                                                 gql_record_items.push(field_val_erase_owned(record_context));
+//                                             }
+//                                             SqlValue::Null | SqlValue::None => {
+//                                                 // Handle null items in the list if the inner type is nullable
+//                                                 gql_record_items.push(FieldValue::NULL);
+//                                             }
+//                                             _ => {
+//                                                 // This should ideally not happen if the DB schema matches GQL schema
+//                                                 return Err(internal_error(format!(
+//                                                     "Expected Thing for Record array element at path '{}', got {:?}",
+//                                                     path_for_resolver, item_sql_value
+//                                                 )).into());
+//                                             }
+//                                         }
+//                                     }
+//                                     return Ok(Some(FieldValue::list(gql_record_items)));
+//                                 }
+//                                 SqlValue::Null | SqlValue::None => { // The whole array field is null
+//                                     return Ok(None);
+//                                 }
+//                                 other => {
+//                                     return Err(internal_error(format!(
+//                                         "Expected Array from DB for array-of-records field path '{}', got {:?}",
+//                                         path_for_resolver, other
+//                                     )).into());
+//                                 }
+//                             }
+//                         }
+//                     }
+//
+//                     return match resolver_field_kind.as_ref().map(|k| k.non_optional()) {
+//                         Some(Kind::Object) | Some(Kind::Record(_)) if path_for_resolver != "id" => {
+//                             // For Object or Record link fields, pass down the current ErasedRecord context.
+//                             // The next resolver will use this parent_rid and this fd_path (e.g., "profile")
+//                             // as a segment to fetch further or will resolve fields on this record.
+//                             trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", path_for_resolver);
+//                             Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
+//                         }
+//                         _ => {
+//                             // For scalars, 'id', or arrays of non-records.
+//                             trace!("Field at path '{}' is scalar/id/array-of-non-record. Fetching actual value.", path_for_resolver);
+//                             let sql_value = gtx.get_record_field(rid.clone(), &path_for_resolver).await?;
+//                             trace!("Fetched DB value for '{}': {:?}", path_for_resolver,
+//                                 sql_value);
+//                             // Use the simple converter for these cases.
+//                             // `sql_value_to_gql_value` will handle nested arrays of scalars/simple objects.
+//                             let gql_val = sql_value_to_gql_value(sql_value)?;
+//                             Ok(Some(FieldValue::value(gql_val)))
+//                         }
+//                     };
+//
+//
+//                     match field_kind {
+//                         // A) Field is Object or Record link (not 'id'): Pass ErasedRecord context down
+//                         Some(Kind::Object) | Some(Kind::Record(_)) if fd_path != "id" => {
+//                             trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", fd_path);
+//                             Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
+//                         }
+//                         // B) Scalar field or id field: Get actual value
+//                         _ => {
+//                             trace!("Field at path '{}' is scalar/id/terminal, fetching value via get_record_field", fd_path);
+//                             let sql_value = gtx.get_record_field(rid.clone(), &fd_path).await?;
+//                             trace!("Fetched value for path '{}': {:?}", fd_path, sql_value);
+//                             let gql_val = sql_value_to_gql_value(sql_value)?;
+//                             trace!("GQL value: {:?}", gql_val);
+//                             Ok(Some(FieldValue::value(gql_val)))
+//                         }
+//                     }
+//                 } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<EdgeContext>() {
+//                     // CASE 2: Parent is a connection edge. Resolve from pre-fetched data.
+//                     trace!("Parent is GqlEdgeContext, resolving path '{}' from edge_data", fd_path);
+//                     let field_name = fd_path.split('.').last().unwrap_or(&fd_path);
+//                     if let SqlValue::Object(obj) = &edge_ctx.edge {
+//                         // Find the field and clone it. If not found, it's None.
+//                         let sql_value = obj.get(field_name).cloned().unwrap_or(SqlValue::None);
+//                         Ok(Some(FieldValue::value(sql_value_to_gql_value(sql_value)?)))
+//                     } else {
+//                         // The edge data wasn't an object, so the field can't exist.
+//                         Ok(Some(FieldValue::NULL))
+//                     }
+//                 }
+//                 // Handle the array element case where we receive a raw object instead of ErasedRecord
+//                 else if let Some(obj) = ctx.parent_value.try_to_value()?.as_object() {
+//                     trace!("Parent is a raw object for path '{}', looking for direct field: {:?}", fd_path, obj);
+//
+//                     // For array element fields, we look for the field directly in the object
+//                     let field_parts: Vec<&str> = fd_path.split('.').collect();
+//                     let field_name = field_parts.last().unwrap_or(&"");
+//
+//                     if let Some(value) = obj.get(&Name::new(field_name)) {
+//                         trace!("Found direct field '{}' in object: {:?}", field_name, value);
+//                         let x = value.clone();
+//                         Ok(Some(FieldValue::value(x)))
+//                     } else {
+//                         trace!("Field '{}' not found in object", field_name);
+//                         Ok(None)
+//                     }
+//                 } else if let value = ctx.parent_value.try_to_value()? {
+//                     trace!("Parent is a value for path '{}', looking for direct field: {:?}", fd_path, value);
+//
+//                     Ok(Some(FieldValue::value(value.clone())))
+//                     // // For array element fields, we look for the field directly in the object
+//                     // let field_parts: Vec<&str> = fd_path.split('.').collect();
+//                     // let field_name = field_parts.last().unwrap_or(&"");
+//                     //
+//                     // if let Some(value) = value.as_object().and_then(|obj| obj.get(&Name::new(field_name))) {
+//                     //     trace!("Found direct field '{}' in object: {:?}", field_name, value);
+//                     //     let x = value.clone();
+//                     //     Ok(Some(FieldValue::value(x)))
+//                     // } else {
+//                     //     trace!("Field '{}' not found in object", field_name);
+//                     //     Ok(None)
+//                     // }
+//                 } else {
+//                     Err(async_graphql::Error::new(format!(
+//                         "Unexpected parent value type for field '{}': {:?}",
+//                         fd_path, ctx.parent_value
+//                     )))
+//                 }
+//
+//                 // // trace!("parent_value: {:?}", ctx.parent_value);
+//                 // let (ref gtx, ref rid) = ctx
+//                 //     .parent_value
+//                 //     .downcast_ref::<ErasedRecord>()
+//                 //     .ok_or_else(|| internal_error("failed to downcast"))?;
+//                 //
+//                 // trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
+//                 //
+//                 // match field_kind {
+//                 //     // A) Field is Object or Record link (not 'id'): Pass ErasedRecord context down
+//                 //     Some(Kind::Object) | Some(Kind::Record(_)) if fd_path != "id" => {
+//                 //         trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", fd_path);
+//                 //         // let gtx_clone = gtx.clone();
+//                 //         // let rid_clone = rid.clone();
+//                 //         // let nested_context: ErasedRecord = (gtx_clone, rid_clone);
+//                 //         // let field_value = field_val_erase_owned(nested_context);
+//                 //         // let field_value = ;
+//                 //         // Optional: Add .with_type() hints for record link unions/interfaces here if needed
+//                 //         Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
+//                 //     }
+//                 //
+//                 //
+//                 //     // C) Field is an Array
+//                 //     Some(Kind::Array(inner_kind_box, _)) => {
+//                 //         trace!("Field at path '{}' is Array. Inner kind: {:?}", fd_path, inner_kind_box);
+//                 //         let db_value_array = gtx.get_record_field(rid.clone(), &fd_path).await?; // Ensure get_record_field is async
+//                 //         trace!("Got DB value array: {:?}", db_value_array);
+//                 //         trace!("GQL value: {:?}", sql_value_to_gql_value(db_value_array.clone()));
+//                 //
+//                 //         match db_value_array {
+//                 //             SqlValue::Array(surreal_array) => {
+//                 //                 let inner_kind_ref: &Kind = inner_kind_box.as_ref();
+//                 //                 let mut gql_item_values = Vec::new();
+//                 //
+//                 //                 for item_sql_value in surreal_array.0 { // Assuming surreal_array.0 is Vec<SqlValue>
+//                 //                     let concrete_item_kind = inner_kind_ref.non_optional();
+//                 //                     let item_is_nullable = inner_kind_ref.can_be_none();
+//                 //
+//                 //                     if matches!(&item_sql_value, SqlValue::Null | SqlValue::None) {
+//                 //                         if item_is_nullable {
+//                 //                             gql_item_values.push(FieldValue::value(GqlValue::Null));
+//                 //                             continue;
+//                 //                         } else {
+//                 //                             return Err(internal_error(format!(
+//                 //                                 "Unexpected null item for non-nullable array element at path '{}', inner kind: {:?}",
+//                 //                                 fd_path, inner_kind_ref
+//                 //                             )).into());
+//                 //                         }
+//                 //                     }
+//                 //
+//                 //                     match concrete_item_kind {
+//                 //                         Kind::Record(_) => {
+//                 //                             match item_sql_value {
+//                 //                                 SqlValue::Thing(thing_val) => {
+//                 //                                     // Assuming ErasedRecord is (GQLTx, Thing)
+//                 //                                     let nested_context: ErasedRecord = (gtx.clone(), thing_val);
+//                 //                                     gql_item_values.push(field_val_erase_owned(nested_context));
+//                 //                                 }
+//                 //                                 _ => return Err(internal_error(format!(
+//                 //                                     "Expected Thing for Record array element at path '{}', got {:?}",
+//                 //                                     fd_path, item_sql_value
+//                 //                                 )).into()),
+//                 //                             }
+//                 //                         }
+//                 //                         // Dynamic Enum: Kind::Either containing only Kind::Literal(Literal::String(_))
+//                 //                         Kind::Either(ref ks) if ks.iter().all(|k| matches!(k.non_optional(), Kind::Literal(Literal::String(_)))) => {
+//                 //                             match item_sql_value {
+//                 //                                 SqlValue::Strand(db_string) => { // Ensure Strand is the correct SqlValue variant
+//                 //                                     let gql_enum_member = db_string.as_str().to_screaming_snake_case();
+//                 //                                     trace!("Dynamic Enum array element: DB '{}' -> GQL '{}' for path {}", db_string.as_str(), gql_enum_member, fd_path);
+//                 //                                     gql_item_values.push(FieldValue::value(GqlValue::Enum(Name::new(gql_enum_member))));
+//                 //                                 }
+//                 //                                 // // Handle other string-like types if necessary, e.g., SqlValue::String
+//                 //                                 // SqlValue::String(db_string) => {
+//                 //                                 //     let gql_enum_member = db_string.as_str().to_screaming_snake_case();
+//                 //                                 //     gql_item_values.push(FieldValue::value(GqlValue::Enum(Name::new(gql_enum_member))));
+//                 //                                 // }
+//                 //                                 _ => return Err(internal_error(format!("Expected String/Strand from DB for dynamic enum in array element at path '{}', got {:?}", fd_path, item_sql_value)).into()),
+//                 //                             }
+//                 //                         }
+//                 //                         // Other scalar types
+//                 //                         _ => {
+//                 //                             let gql_val = sql_value_to_gql_value(item_sql_value)
+//                 //                                 .map_err(|e| GqlError::ResolverError(format!("SQL\
+//                 //                                  to GQL translation failed for path '{}': {}", fd_path, e)))?;
+//                 //                             gql_item_values.push(FieldValue::value(gql_val));
+//                 //                         }
+//                 //                     }
+//                 //                 }
+//                 //                 Ok(Some(FieldValue::list(gql_item_values)))
+//                 //             }
+//                 //             SqlValue::None | SqlValue::Null => {
+//                 //                 // The entire array field is null.
+//                 //                 // This is valid if the GraphQL field for the array is nullable.
+//                 //                 Ok(None) // async-graphql handles mapping this to `null`
+//                 //             }
+//                 //             other => {
+//                 //                 Err(internal_error(format!(
+//                 //                     "Expected Array from DB for array field path '{}', got {:?}",
+//                 //                     fd_path, other
+//                 //                 )).into())
+//                 //             }
+//                 //         }
+//                 //     }
+//                 //     // B) Field is scalar/terminal/'id': Fetch value using (modified) get_record_field
+//                 //     _ => {
+//                 //         trace!("Field at path '{}' is scalar/id/terminal, fetching value via get_record_field", fd_path);
+//                 //
+//                 //         // Call the modified get_record_field which accepts a path string
+//                 //         let sql_value: SqlValue = gtx
+//                 //             .get_record_field(rid.clone(), &fd_path)
+//                 //             .await?;
+//                 //
+//                 //         trace!("Fetched value for path '{}': {:?}", fd_path, sql_value);
+//                 //
+//                 //         // --- Convert the fetched value ---
+//                 //         match sql_value {
+//                 //             SqlValue::None | SqlValue::Null => Ok(None),
+//                 //
+//                 //             // This case primarily handles 'id' now or potentially Things returned
+//                 //             // unexpectedly for scalar paths.
+//                 //             SqlValue::Thing(thing_val) => {
+//                 //                 trace!("Value for path '{}' is Thing: {}", fd_path, thing_val);
+//                 //                 let gql_val = sql_value_to_gql_value(SqlValue::Thing(thing_val))?;
+//                 //                 Ok(Some(FieldValue::value(gql_val)))
+//                 //             }
+//                 //
+//                 //             // Handle scalars and Enums
+//                 //             v => {
+//                 //                 trace!("Converting value {:?} for path '{}'", v, fd_path);
+//                 //                 let is_dynamic_enum = match &field_kind { // Use the kind passed to factory
+//                 //                     Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
+//                 //                     Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
+//                 //                     _ => false,
+//                 //                 };
+//                 //
+//                 //                 let gql_val = if is_dynamic_enum {
+//                 //                     match v {
+//                 //                         SqlValue::Strand(db_string) => {
+//                 //                             let gql_enum_member = db_string.as_str().to_screaming_snake_case();
+//                 //                             trace!("Dynamic Enum conversion: DB '{}' -> GQL '{}' for path {}", db_string.as_str(), gql_enum_member, fd_path);
+//                 //                             GqlValue::Enum(Name::new(gql_enum_member))
+//                 //                         }
+//                 //                         _ => return Err(internal_error(format!("Expected String/Strand from DB for dynamic enum at path '{}', got {:?}", fd_path, v)).into())
+//                 //                     }
+//                 //                 } else {
+//                 //                     sql_value_to_gql_value(v)
+//                 //                         .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for path '{}': {}", fd_path, e)))?
+//                 //                 };
+//                 //
+//                 //                 trace!("Conversion successful for path '{}': {:?}", fd_path, gql_val);
+//                 //                 Ok(Some(FieldValue::value(gql_val)))
+//                 //             }
+//                 //         }
+//                 //     }
+//                 // }
+//             }
+//         })
+//     }
+// }
+
+/// A generic resolver for fields on any object type (table records or connection edges).
+///
+/// It intelligently handles different parent contexts:
+/// - If the parent is a `Thing`, it fetches the field from the database.
+/// - If the parent is a `SqlValue`, it resolves the field from the pre-fetched object data.
+fn make_field_resolver(
     fd_path: impl Into<String>,
-    kind: Option<Kind>,
+    _kind: Option<Kind>,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
     let fd_path = fd_path.into();
     move |ctx: ResolverContext| {
         let fd_path = fd_path.clone();
-        let field_kind = kind.clone();
-        let path_for_resolver = fd_path.clone();
-        let resolver_field_kind = kind.clone();
+        FieldFuture::new(async move {
+            let gtx = ctx.data::<GQLTx>()?;
+            let fd_name = fd_path.split('.').last().unwrap_or(&fd_path);
 
-        // --- Default behavior for non-array-of-records or if not ErasedRecord parent ---
-        // This includes:
-        // 1. Scalar fields on an ErasedRecord parent.
-        // 2. Object fields on an ErasedRecord parent (passing down ErasedRecord).
-        // 3. Array of SCALARS/Simple Objects on an ErasedRecord parent.
-        // 4. 'id' field.
-        FieldFuture::new({
-            async move {
-                trace!(
-                    "Creating/Running resolver for DB path '{}' (Kind: {:?}) with parent: {:?}",
-                    fd_path,
-                    field_kind,
-                    ctx.parent_value // Use the user-provided trace format
-                );
-
-                // Check if parent is an ErasedRecord (normal case)
-                if let Some((gtx, rid)) = ctx.parent_value.downcast_ref::<ErasedRecord>() {
-                    trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
-
-                    // Check if THIS field is an array of Records
-                    if let Some(Kind::Array(ref inner_kind_box, _)) = resolver_field_kind.as_ref()
-                        .map(|k| k.non_optional()) {
-                        if let Kind::Record(_) = inner_kind_box.as_ref().non_optional() {
-                            trace!("Field '{}' is an Array of Records. Fetching and wrapping items.", path_for_resolver);
-                            let db_value_array = gtx.get_record_field(rid.clone(), &path_for_resolver).await?;
-
-                            match db_value_array {
-                                SqlValue::Array(surreal_array) => {
-                                    let mut gql_record_items = Vec::new();
-                                    for item_sql_value in surreal_array.0 {
-                                        match item_sql_value {
-                                            SqlValue::Thing(thing_val) => {
-                                                // Wrap each Thing in ErasedRecord
-                                                let record_context: ErasedRecord = (gtx.clone(), thing_val);
-                                                gql_record_items.push(field_val_erase_owned(record_context));
-                                            }
-                                            SqlValue::Null | SqlValue::None => {
-                                                // Handle null items in the list if the inner type is nullable
-                                                gql_record_items.push(FieldValue::NULL);
-                                            }
-                                            _ => {
-                                                // This should ideally not happen if the DB schema matches GQL schema
-                                                return Err(internal_error(format!(
-                                                    "Expected Thing for Record array element at path '{}', got {:?}",
-                                                    path_for_resolver, item_sql_value
-                                                )).into());
-                                            }
-                                        }
-                                    }
-                                    return Ok(Some(FieldValue::list(gql_record_items)));
-                                }
-                                SqlValue::Null | SqlValue::None => { // The whole array field is null
-                                    return Ok(None);
-                                }
-                                other => {
-                                    return Err(internal_error(format!(
-                                        "Expected Array from DB for array-of-records field path '{}', got {:?}",
-                                        path_for_resolver, other
-                                    )).into());
-                                }
-                            }
-                        }
-                    }
-
-                    return match resolver_field_kind.as_ref().map(|k| k.non_optional()) {
-                        Some(Kind::Object) | Some(Kind::Record(_)) if path_for_resolver != "id" => {
-                            // For Object or Record link fields, pass down the current ErasedRecord context.
-                            // The next resolver will use this parent_rid and this fd_path (e.g., "profile")
-                            // as a segment to fetch further or will resolve fields on this record.
-                            trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", path_for_resolver);
-                            Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
-                        }
-                        _ => {
-                            // For scalars, 'id', or arrays of non-records.
-                            trace!("Field at path '{}' is scalar/id/array-of-non-record. Fetching actual value.", path_for_resolver);
-                            let sql_value = gtx.get_record_field(rid.clone(), &path_for_resolver).await?;
-                            trace!("Fetched DB value for '{}': {:?}", path_for_resolver,
-                                sql_value);
-                            // Use the simple converter for these cases.
-                            // `sql_value_to_gql_value` will handle nested arrays of scalars/simple objects.
-                            let gql_val = sql_value_to_gql_value(sql_value)?;
-                            Ok(Some(FieldValue::value(gql_val)))
-                        }
-                    };
-
-
-                    match field_kind {
-                        // A) Field is Object or Record link (not 'id'): Pass ErasedRecord context down
-                        Some(Kind::Object) | Some(Kind::Record(_)) if fd_path != "id" => {
-                            trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", fd_path);
-                            Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
-                        }
-                        // B) Scalar field or id field: Get actual value
-                        _ => {
-                            trace!("Field at path '{}' is scalar/id/terminal, fetching value via get_record_field", fd_path);
-                            let sql_value = gtx.get_record_field(rid.clone(), &fd_path).await?;
-                            trace!("Fetched value for path '{}': {:?}", fd_path, sql_value);
-                            let gql_val = sql_value_to_gql_value(sql_value)?;
-                            trace!("GQL value: {:?}", gql_val);
-                            Ok(Some(FieldValue::value(gql_val)))
-                        }
-                    }
-                } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<EdgeContext>() {
-                    // CASE 2: Parent is a connection edge. Resolve from pre-fetched data.
-                    trace!("Parent is GqlEdgeContext, resolving path '{}' from edge_data", fd_path);
-                    let field_name = fd_path.split('.').last().unwrap_or(&fd_path);
-                    if let SqlValue::Object(obj) = &edge_ctx.edge {
-                        // Find the field and clone it. If not found, it's None.
-                        let sql_value = obj.get(field_name).cloned().unwrap_or(SqlValue::None);
-                        Ok(Some(FieldValue::value(sql_value_to_gql_value(sql_value)?)))
-                    } else {
-                        // The edge data wasn't an object, so the field can't exist.
-                        Ok(Some(FieldValue::NULL))
-                    }
-                }
-                // Handle the array element case where we receive a raw object instead of ErasedRecord
-                else if let Some(obj) = ctx.parent_value.try_to_value()?.as_object() {
-                    trace!("Parent is a raw object for path '{}', looking for direct field: {:?}", fd_path, obj);
-
-                    // For array element fields, we look for the field directly in the object
-                    let field_parts: Vec<&str> = fd_path.split('.').collect();
-                    let field_name = field_parts.last().unwrap_or(&"");
-
-                    if let Some(value) = obj.get(&Name::new(field_name)) {
-                        trace!("Found direct field '{}' in object: {:?}", field_name, value);
-                        let x = value.clone();
-                        Ok(Some(FieldValue::value(x)))
-                    } else {
-                        trace!("Field '{}' not found in object", field_name);
-                        Ok(None)
-                    }
-                } else if let value = ctx.parent_value.try_to_value()? {
-                    trace!("Parent is a value for path '{}', looking for direct field: {:?}", fd_path, value);
-
-                    Ok(Some(FieldValue::value(value.clone())))
-                    // // For array element fields, we look for the field directly in the object
-                    // let field_parts: Vec<&str> = fd_path.split('.').collect();
-                    // let field_name = field_parts.last().unwrap_or(&"");
-                    //
-                    // if let Some(value) = value.as_object().and_then(|obj| obj.get(&Name::new(field_name))) {
-                    //     trace!("Found direct field '{}' in object: {:?}", field_name, value);
-                    //     let x = value.clone();
-                    //     Ok(Some(FieldValue::value(x)))
-                    // } else {
-                    //     trace!("Field '{}' not found in object", field_name);
-                    //     Ok(None)
-                    // }
+            trace!("PARENT VALUE: {:?}", ctx.parent_value);
+            let sql_value = if let Some(thing) = ctx.parent_value.downcast_ref::<Thing>() {
+                // CASE 1: Parent is a `Thing` (a record ID). Fetch from the database.
+                trace!("Case 1: Parent is Thing, fetching path '{}' from RID {}", fd_path, thing);
+                gtx.get_record_field(thing.clone(), &fd_path).await?
+            } else if let Some(edge_ctx) = ctx.parent_value.downcast_ref::<EdgeContext>() {
+                // CASE 2: Parent is a connection edge. Resolve from pre-fetched data.
+                trace!("Case 2.1: Parent is GqlEdgeContext, resolving path '{}' from edge_data",
+                    fd_path);
+                let fd_name = fd_path.split('.').last().unwrap_or(&fd_path);
+                if let SqlValue::Object(obj) = &edge_ctx.edge {
+                    obj.get(fd_name).cloned().unwrap_or(SqlValue::None)
                 } else {
-                    Err(async_graphql::Error::new(format!(
-                        "Unexpected parent value type for field '{}': {:?}",
-                        fd_path, ctx.parent_value
-                    )))
+                    SqlValue::None
                 }
+            } else if let Some(parent_sql_val) = ctx.parent_value.downcast_ref::<SqlValue>() {
+                // CASE 2: Parent is a `SqlValue` (a pre-fetched object like a node or edge).
+                trace!("Case 2.2: Parent is SqlValue, resolving path '{}' from object", fd_path);
+                if let SqlValue::Object(obj) = parent_sql_val {
+                    obj.get(fd_name).cloned().unwrap_or(SqlValue::None)
+                } else {
+                    SqlValue::None // Parent is not an object, so it can't have sub-fields.
+                }
+            } else if let Ok(parent_gql_val) = ctx.parent_value.try_to_value() {
+                // Case 3: Parent is a GqlValue (a nested object from a list).
+                // This is the case for `title` inside `nestedEmbeddedArray`.
+                trace!("Case 3: Parent is GqlValue, resolving path '{}' from object", fd_path);
+                if let GqlValue::Object(obj) = parent_gql_val {
+                    // We found a GqlValue, so we can return it directly.
+                    // No need for further sql_value_to_gql_value conversion.
+                    return Ok(Some(FieldValue::value(
+                        obj.get(&Name::new(fd_name)).cloned().unwrap_or(GqlValue::Null),
+                    )));
+                }
+                SqlValue::None
+            } else {
+                trace!("parent_value: {:?}", ctx.parent_value);
+                return Err(internal_error(format!(
+                    "Unexpected parent type for field '{}'",
+                    fd_path
+                ))
+                    .into());
+            };
 
-                // // trace!("parent_value: {:?}", ctx.parent_value);
-                // let (ref gtx, ref rid) = ctx
-                //     .parent_value
-                //     .downcast_ref::<ErasedRecord>()
-                //     .ok_or_else(|| internal_error("failed to downcast"))?;
-                //
-                // trace!("Parent is ErasedRecord for path '{}', RID: {}", fd_path, rid);
-                //
-                // match field_kind {
-                //     // A) Field is Object or Record link (not 'id'): Pass ErasedRecord context down
-                //     Some(Kind::Object) | Some(Kind::Record(_)) if fd_path != "id" => {
-                //         trace!("Field at path '{}' is Object/Record, passing down ErasedRecord", fd_path);
-                //         // let gtx_clone = gtx.clone();
-                //         // let rid_clone = rid.clone();
-                //         // let nested_context: ErasedRecord = (gtx_clone, rid_clone);
-                //         // let field_value = field_val_erase_owned(nested_context);
-                //         // let field_value = ;
-                //         // Optional: Add .with_type() hints for record link unions/interfaces here if needed
-                //         Ok(Some(field_val_erase_owned((gtx.clone(), rid.clone()))))
-                //     }
-                //
-                //
-                //     // C) Field is an Array
-                //     Some(Kind::Array(inner_kind_box, _)) => {
-                //         trace!("Field at path '{}' is Array. Inner kind: {:?}", fd_path, inner_kind_box);
-                //         let db_value_array = gtx.get_record_field(rid.clone(), &fd_path).await?; // Ensure get_record_field is async
-                //         trace!("Got DB value array: {:?}", db_value_array);
-                //         trace!("GQL value: {:?}", sql_value_to_gql_value(db_value_array.clone()));
-                //
-                //         match db_value_array {
-                //             SqlValue::Array(surreal_array) => {
-                //                 let inner_kind_ref: &Kind = inner_kind_box.as_ref();
-                //                 let mut gql_item_values = Vec::new();
-                //
-                //                 for item_sql_value in surreal_array.0 { // Assuming surreal_array.0 is Vec<SqlValue>
-                //                     let concrete_item_kind = inner_kind_ref.non_optional();
-                //                     let item_is_nullable = inner_kind_ref.can_be_none();
-                //
-                //                     if matches!(&item_sql_value, SqlValue::Null | SqlValue::None) {
-                //                         if item_is_nullable {
-                //                             gql_item_values.push(FieldValue::value(GqlValue::Null));
-                //                             continue;
-                //                         } else {
-                //                             return Err(internal_error(format!(
-                //                                 "Unexpected null item for non-nullable array element at path '{}', inner kind: {:?}",
-                //                                 fd_path, inner_kind_ref
-                //                             )).into());
-                //                         }
-                //                     }
-                //
-                //                     match concrete_item_kind {
-                //                         Kind::Record(_) => {
-                //                             match item_sql_value {
-                //                                 SqlValue::Thing(thing_val) => {
-                //                                     // Assuming ErasedRecord is (GQLTx, Thing)
-                //                                     let nested_context: ErasedRecord = (gtx.clone(), thing_val);
-                //                                     gql_item_values.push(field_val_erase_owned(nested_context));
-                //                                 }
-                //                                 _ => return Err(internal_error(format!(
-                //                                     "Expected Thing for Record array element at path '{}', got {:?}",
-                //                                     fd_path, item_sql_value
-                //                                 )).into()),
-                //                             }
-                //                         }
-                //                         // Dynamic Enum: Kind::Either containing only Kind::Literal(Literal::String(_))
-                //                         Kind::Either(ref ks) if ks.iter().all(|k| matches!(k.non_optional(), Kind::Literal(Literal::String(_)))) => {
-                //                             match item_sql_value {
-                //                                 SqlValue::Strand(db_string) => { // Ensure Strand is the correct SqlValue variant
-                //                                     let gql_enum_member = db_string.as_str().to_screaming_snake_case();
-                //                                     trace!("Dynamic Enum array element: DB '{}' -> GQL '{}' for path {}", db_string.as_str(), gql_enum_member, fd_path);
-                //                                     gql_item_values.push(FieldValue::value(GqlValue::Enum(Name::new(gql_enum_member))));
-                //                                 }
-                //                                 // // Handle other string-like types if necessary, e.g., SqlValue::String
-                //                                 // SqlValue::String(db_string) => {
-                //                                 //     let gql_enum_member = db_string.as_str().to_screaming_snake_case();
-                //                                 //     gql_item_values.push(FieldValue::value(GqlValue::Enum(Name::new(gql_enum_member))));
-                //                                 // }
-                //                                 _ => return Err(internal_error(format!("Expected String/Strand from DB for dynamic enum in array element at path '{}', got {:?}", fd_path, item_sql_value)).into()),
-                //                             }
-                //                         }
-                //                         // Other scalar types
-                //                         _ => {
-                //                             let gql_val = sql_value_to_gql_value(item_sql_value)
-                //                                 .map_err(|e| GqlError::ResolverError(format!("SQL\
-                //                                  to GQL translation failed for path '{}': {}", fd_path, e)))?;
-                //                             gql_item_values.push(FieldValue::value(gql_val));
-                //                         }
-                //                     }
-                //                 }
-                //                 Ok(Some(FieldValue::list(gql_item_values)))
-                //             }
-                //             SqlValue::None | SqlValue::Null => {
-                //                 // The entire array field is null.
-                //                 // This is valid if the GraphQL field for the array is nullable.
-                //                 Ok(None) // async-graphql handles mapping this to `null`
-                //             }
-                //             other => {
-                //                 Err(internal_error(format!(
-                //                     "Expected Array from DB for array field path '{}', got {:?}",
-                //                     fd_path, other
-                //                 )).into())
-                //             }
-                //         }
-                //     }
-                //     // B) Field is scalar/terminal/'id': Fetch value using (modified) get_record_field
-                //     _ => {
-                //         trace!("Field at path '{}' is scalar/id/terminal, fetching value via get_record_field", fd_path);
-                //
-                //         // Call the modified get_record_field which accepts a path string
-                //         let sql_value: SqlValue = gtx
-                //             .get_record_field(rid.clone(), &fd_path)
-                //             .await?;
-                //
-                //         trace!("Fetched value for path '{}': {:?}", fd_path, sql_value);
-                //
-                //         // --- Convert the fetched value ---
-                //         match sql_value {
-                //             SqlValue::None | SqlValue::Null => Ok(None),
-                //
-                //             // This case primarily handles 'id' now or potentially Things returned
-                //             // unexpectedly for scalar paths.
-                //             SqlValue::Thing(thing_val) => {
-                //                 trace!("Value for path '{}' is Thing: {}", fd_path, thing_val);
-                //                 let gql_val = sql_value_to_gql_value(SqlValue::Thing(thing_val))?;
-                //                 Ok(Some(FieldValue::value(gql_val)))
-                //             }
-                //
-                //             // Handle scalars and Enums
-                //             v => {
-                //                 trace!("Converting value {:?} for path '{}'", v, fd_path);
-                //                 let is_dynamic_enum = match &field_kind { // Use the kind passed to factory
-                //                     Some(Kind::Option(inner)) => matches!(**inner, Kind::Either(ref ks) if ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_))))),
-                //                     Some(Kind::Either(ref ks)) => ks.iter().all(|k| matches!(k, Kind::Literal(Literal::String(_)))),
-                //                     _ => false,
-                //                 };
-                //
-                //                 let gql_val = if is_dynamic_enum {
-                //                     match v {
-                //                         SqlValue::Strand(db_string) => {
-                //                             let gql_enum_member = db_string.as_str().to_screaming_snake_case();
-                //                             trace!("Dynamic Enum conversion: DB '{}' -> GQL '{}' for path {}", db_string.as_str(), gql_enum_member, fd_path);
-                //                             GqlValue::Enum(Name::new(gql_enum_member))
-                //                         }
-                //                         _ => return Err(internal_error(format!("Expected String/Strand from DB for dynamic enum at path '{}', got {:?}", fd_path, v)).into())
-                //                     }
-                //                 } else {
-                //                     sql_value_to_gql_value(v)
-                //                         .map_err(|e| GqlError::ResolverError(format!("SQL to GQL translation failed for path '{}': {}", fd_path, e)))?
-                //                 };
-                //
-                //                 trace!("Conversion successful for path '{}': {:?}", fd_path, gql_val);
-                //                 Ok(Some(FieldValue::value(gql_val)))
-                //             }
-                //         }
-                //     }
-                // }
+            match sql_value {
+                // Case 1: We have a `Thing` (record ID) so we cannot lose the context, because we
+                // need it to resolve its fields. Except for the 'id' field, which is a scalar.
+                SqlValue::Thing(thing) if fd_name != "id" => {
+                    Ok(Some(FieldValue::owned_any(thing)))
+                }
+                // Case 2: We do not need the Thing context anymore, we can return the value directly.
+                v => {
+                    let gql_val = sql_value_to_gql_value(v)?;
+                    Ok(Some(FieldValue::value(gql_val)))
+                }
             }
         })
     }
@@ -1201,39 +1276,125 @@ fn make_connection_resolver(
 
             let gtx = ctx.data::<GQLTx>()?.clone();
 
-            let db_value_array = if let Some((_, er_rid)) =
-                ctx.parent_value.downcast_ref::<ErasedRecord>()
-            {
+            // let db_value_array = if let Some((_, er_rid)) =
+            //     ctx.parent_value.downcast_ref::<ErasedRecord>()
+            // {
+            //     if is_relation {
+            //         // Fetch from a relation table
+            //         trace!(
+            //                 "Fetching relation table '{}' where in = {}",
+            //                 query_source,
+            //                 er_rid
+            //             );
+            //         let ast = Statement::Select(SelectStatement {
+            //             expr: Fields::all(),
+            //             what: vec![SqlValue::Table(query_source.intox())].into(),
+            //             cond: Some(Cond(SqlValue::from(Expression::Binary {
+            //                 l: SqlValue::Idiom(Idiom(vec![Part::Field("in".into())])),
+            //                 o: Operator::Equal,
+            //                 r: SqlValue::Thing(er_rid.clone()),
+            //             }))),
+            //             ..Default::default()
+            //         });
+            //         gtx.process_stmt(ast).await?
+            //     } else {
+            //         // Fetch an embedded array field
+            //         trace!(
+            //                 "Fetching embedded field '{}' from parent {}",
+            //                 query_source,
+            //                 er_rid
+            //             );
+            //         gtx.get_record_field(er_rid.clone(), &query_source)
+            //             .await?
+            //     }
+            // } else {
+            //     // Fetch a root-level table
+            //     let ast = Statement::Select(SelectStatement {
+            //         what: vec![SqlValue::Table(query_source.intox())].into(),
+            //         expr: Fields::all(),
+            //         ..Default::default()
+            //     });
+            //     gtx.process_stmt(ast).await?
+            // };
+
+            trace!("parent_value: {:?}", ctx.parent_value);
+            let db_value_array = if let Some(thing) = ctx.parent_value.downcast_ref::<Thing>() {
+                // CASE 1: Parent is a `Thing`. This is a first-level nested connection.
                 if is_relation {
-                    // Fetch from a relation table
-                    trace!(
-                            "Fetching relation table '{}' where in = {}",
-                            query_source,
-                            er_rid
-                        );
+                    // Fetch from a relation table using the parent `Thing` as the `in` filter.
+                    trace!("Fetching relation '{}' where in = {}", query_source, thing);
                     let ast = Statement::Select(SelectStatement {
-                        expr: Fields::all(),
                         what: vec![SqlValue::Table(query_source.intox())].into(),
+                        expr: Fields::all(),
                         cond: Some(Cond(SqlValue::from(Expression::Binary {
                             l: SqlValue::Idiom(Idiom(vec![Part::Field("in".into())])),
                             o: Operator::Equal,
-                            r: SqlValue::Thing(er_rid.clone()),
+                            r: SqlValue::Thing(thing.clone()),
                         }))),
                         ..Default::default()
                     });
                     gtx.process_stmt(ast).await?
                 } else {
-                    // Fetch an embedded array field
-                    trace!(
-                            "Fetching embedded field '{}' from parent {}",
-                            query_source,
-                            er_rid
-                        );
-                    gtx.get_record_field(er_rid.clone(), &query_source)
-                        .await?
+                    // Fetch an embedded array field from the parent `Thing`.
+                    trace!("Fetching embedded field '{}' from parent {}", query_source, thing);
+                    gtx.get_record_field(thing.clone(), &query_source).await?
                 }
+            } else if let Some(parent_sql_val) = ctx.parent_value.downcast_ref::<SqlValue>() {
+                // CASE 2: Parent is a `SqlValue`. This is a deeply nested connection.
+                // The data we need is already inside this parent object.
+                trace!("Fetching nested connection field '{}' from parent SqlValue", query_source);
+                if let SqlValue::Object(obj) = parent_sql_val {
+                    let field_name = query_source.split('.').last().unwrap_or(&query_source);
+                    obj.get(field_name).cloned().unwrap_or_else(|| SqlValue::Array(Default::default()))
+                } else {
+                    // Parent is not an object, so it can't have the field.
+                    SqlValue::Array(Default::default())
+                }
+            } else if let Some(parent_gql_val) = ctx.parent_value.downcast_ref::<GqlValue>() {
+                trace!("ja gql value works!!");
+                SqlValue::Array(Default::default())
+            } else if let Ok(parent_gql_val) = ctx.parent_value.try_to_value() {
+                trace!("Fetching parent connection field '{}' from parent Object", query_source);
+                trace!("parent_value: {:?}", parent_gql_val);
+                let fd_name = query_source.split('.').last().unwrap_or(&query_source);
+
+                if let GqlValue::Object(obj) = parent_gql_val {
+                    // fixme: build in assertion
+
+                    let fv = FieldValue::value(
+                        obj.get(&Name::new(fd_name))
+                            .cloned()
+                            .unwrap_or(GqlValue::Null),
+                    );
+
+                    if let Some(GqlValue::List(list)) = fv.as_value() {
+                        let sql_list: Result<Vec<SqlValue>, _> = list
+                            .iter()
+                            .map(|gql_val| gql_to_sql_kind(gql_val, Kind::Any))
+                            .collect();
+
+                        SqlValue::Array(Array::from(sql_list.unwrap()))
+                    } else {
+                        SqlValue::Array(Default::default())
+                    }
+                    // Array::from(SqlValue::None)
+                } else {
+                    SqlValue::Array(Default::default())
+                }
+                // Array::from(SqlValue::None)
+
+                // // Case 3: Parent is a `GqlValue` (a node from a previous connection).
+                // if let GqlValue::Object(obj) = parent_gql_val {
+                //
+                //     // We need to convert the GqlValue back to SqlValue for processing.
+                //
+                //     gql_to_sql_kind(field_val.unwrap_or(&GqlValue::Null), Kind::Array(Box::new(Kind::Any), None))?
+                // } else {
+                //     SqlValue::Array(Default::default())
+                // }
             } else {
-                // Fetch a root-level table
+                // CASE 3: No specific parent. This is a root-level connection query.
+                trace!("Fetching root query for table '{}'", query_source);
                 let ast = Statement::Select(SelectStatement {
                     what: vec![SqlValue::Table(query_source.intox())].into(),
                     expr: Fields::all(),
@@ -1325,7 +1486,6 @@ fn make_connection_resolver(
             };
             trace!("fetched_nodes: {:?}", fetched_nodes);
 
-            // FIXME: simplify this logic
             let edge_contexts: Vec<EdgeContext> = limited_edges
                 .iter()
                 .map(|item| {
@@ -1341,8 +1501,7 @@ fn make_connection_resolver(
                                 if let Some(SqlValue::Thing(id)) = obj.get("out") {
                                     fetched_nodes.get(id).unwrap_or(&SqlValue::Null)
                                 } else {
-                                    // Case 2.1.1: 'out' missing in relation should not be possible
-                                    item
+                                    item // Case 2.1.1: 'out' missing in relation should not be possible
                                 }
                                 // Case 2.2: If it's an embedded array object, we expect a simple object
                             } else {
