@@ -787,18 +787,19 @@ fn make_field_resolver(
                 } else {
                     SqlValue::None
                 }
-            } else if let Some(parent_sql_val) = ctx.parent_value.downcast_ref::<SqlValue>() {
-                // CASE 2: Parent is a `SqlValue` (a pre-fetched object like a node or edge).
+            } else if let Some(val) = ctx.parent_value.downcast_ref::<SqlValue>() {
+                // CASE 3: Parent is a `SqlValue`. We need this for the case where we have
+                // objects with record fields (Things) inside them. Otherwise, we would lose the
+                // context and could not resolve the record fields later.
                 trace!("Case 2.2: Parent is SqlValue, resolving path '{}' from object", fd_path);
-                if let SqlValue::Object(obj) = parent_sql_val {
-                    obj.get(fd_name).cloned().unwrap_or(SqlValue::None)
-                } else {
-                    SqlValue::None // Parent is not an object, so it can't have sub-fields.
+                match val {
+                    SqlValue::Object(obj) => obj.get(fd_name).cloned().unwrap_or(SqlValue::None),
+                    _ => SqlValue::None,
                 }
             } else if let Ok(parent_gql_val) = ctx.parent_value.try_to_value() {
-                // Case 3: Parent is a GqlValue (a nested object from a list).
+                // Case 4: Parent is a GqlValue (a nested object from a list).
                 // This is the case for `title` inside `nestedEmbeddedArray`.
-                trace!("Case 3: Parent is GqlValue, resolving path '{}' from object", fd_path);
+                trace!("Case 4: Parent is GqlValue, resolving path '{}' from object", fd_path);
                 if let GqlValue::Object(obj) = parent_gql_val {
                     // We found a GqlValue, so we can return it directly.
                     // No need for further sql_value_to_gql_value conversion.
@@ -822,7 +823,30 @@ fn make_field_resolver(
                 SqlValue::Thing(thing) if fd_name != "id" => {
                     Ok(Some(FieldValue::owned_any(thing)))
                 }
-                // Case 2: We do not need the Thing context anymore, we can return the value directly.
+                // Case 2: We have an array of `Thing` records, which we must return as a list of
+                // Things to not lose the context and fetch their fields later.
+                // P.S. We cannot put this case into the sql_value_to_gql_value function because it
+                // always has to return a GqlValue. But we need a FieldValue in the inner list.
+                SqlValue::Array(a) if a[0].is_thing() => {
+                    trace!("Case 2 (Array of Things): Returning list of Things for path '{}'", fd_path);
+                    Ok(Some(FieldValue::list(a.into_iter().map(
+                        |v| FieldValue::owned_any(v.record().unwrap())
+                    ).collect::<Vec<FieldValue>>())))
+                }
+                // Case 3: We have an array of `SqlValue` objects containing at minimum one Thing
+                // which we cannot yet convert to GqlValue. The `Thing` context is needed later for
+                // fetching the record.
+                SqlValue::Array(a) if a[0].is_object() && {
+                    match &a[0] {
+                        SqlValue::Object(o) => o.values().any(SqlValue::is_thing),
+                        _ => false,
+                    }
+                } => {
+                    trace!("Case 3 (Array of Objects with Things):  '{}'", fd_path);
+                    Ok(Some(FieldValue::list(a.into_iter().map(|v| FieldValue::owned_any(v))
+                        .collect::<Vec<FieldValue>>())))
+                }
+                // Case 4: Scalar or Enum value etc
                 v => {
                     let gql_val = sql_value_to_gql_value(v)?;
                     Ok(Some(FieldValue::value(gql_val)))
