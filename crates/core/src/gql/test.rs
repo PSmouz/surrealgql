@@ -315,7 +315,7 @@ mod e2e_queries_cursor {
     use crate::gql::test::{get_singleton, CURSOR_SINGLETON};
     use serde_json::json;
 
-    const SCHEMA_AST: &str = r#"
+    const AST: &str = r#"
         DEFINE TABLE aircraft SCHEMAFULL TYPE NORMAL;
         DEFINE FIELD manufacturer ON aircraft TYPE string;
         DEFINE FIELD model ON aircraft TYPE string;
@@ -393,7 +393,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_record() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query {
               aircraft(id: "aircraft:a380") {
@@ -417,7 +417,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_relation() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
               airline(id: "airline:lh") {
@@ -536,7 +536,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_array_scalar() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -606,7 +606,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_array_records() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -706,7 +706,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_array_embedded_object() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -790,7 +790,7 @@ mod e2e_queries_cursor {
 
     #[tokio::test]
     async fn test_array_embedded_nested() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, SCHEMA_AST).await;
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -1011,6 +1011,136 @@ mod e2e_queries_cursor {
                         "endCursor": "NIMbvTOokRlvBY-td12aJJG7R36JRVuRe7zEZ4wB8xA"
                     }
                 }
+            }
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_array_root_query() {
+        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+
+        let query = r#"
+            query AircraftList {
+                aircraftList {
+                    edges {
+                        cursor
+                        node {
+                            id
+                            capacity
+                            manufacturer
+                            model
+                            airline {
+                                id
+                                name
+                            }
+                        }
+                    }
+                    nodes {
+                        id
+                        capacity
+                        manufacturer
+                        model
+                        airline {
+                            id
+                            name
+                        }
+                    }
+                    pageInfo {
+                        hasNextPage
+                        hasPreviousPage
+                        startCursor
+                        endCursor
+                    }
+                    totalCount
+                }
+            }
+        "#;
+
+        let res = singleton.schema.execute(query).await;
+        let json = res.data.into_json().unwrap();
+
+        assert_eq!(json, json!({
+            "aircraftList": {
+                "edges": [
+                    {
+                        "cursor": "YpzIAbBU0t2UVRPN7sISgFsG5QfI3lqmzAwT98RaPmA",
+                        "node": {
+                            "id": "aircraft:a320",
+                            "capacity": 150,
+                            "manufacturer": "Airbus",
+                            "model": "A320-200",
+                            "airline": {
+                                "id": "airline:lh",
+                                "name": "Lufthansa"
+                            }
+                        }
+                    },
+                    {
+                        "cursor": "oXg9fHR2NJYB3LGhftQ6v0mY-SQCvJQW1fKIxr_bWec",
+                        "node": {
+                            "id": "aircraft:a350",
+                            "capacity": 314,
+                            "manufacturer": "Airbus",
+                            "model": "A350-900",
+                            "airline": {
+                                "id": "airline:lh",
+                                "name": "Lufthansa"
+                            }
+                        }
+                    },
+                    {
+                        "cursor": "MkFwfulfjDk6JEC7oXlhxoq0c6mhF_Uxx83_jHonk5c",
+                        "node": {
+                            "id": "aircraft:a380",
+                            "capacity": 555,
+                            "manufacturer": "Airbus",
+                            "model": "A380-800",
+                            "airline": {
+                                "id": "airline:lh",
+                                "name": "Lufthansa"
+                            }
+                        }
+                    }
+                ],
+                "nodes": [
+                    {
+                        "id": "aircraft:a320",
+                        "capacity": 150,
+                        "manufacturer": "Airbus",
+                        "model": "A320-200",
+                        "airline": {
+                            "id": "airline:lh",
+                            "name": "Lufthansa"
+                        }
+                    },
+                    {
+                        "id": "aircraft:a350",
+                        "capacity": 314,
+                        "manufacturer": "Airbus",
+                        "model": "A350-900",
+                        "airline": {
+                            "id": "airline:lh",
+                            "name": "Lufthansa"
+                        }
+                    },
+                    {
+                        "id": "aircraft:a380",
+                        "capacity": 555,
+                        "manufacturer": "Airbus",
+                        "model": "A380-800",
+                        "airline": {
+                            "id": "airline:lh",
+                            "name": "Lufthansa"
+                        }
+                    }
+                ],
+                "pageInfo": {
+                    "hasNextPage": false,
+                    "hasPreviousPage": false,
+                    "startCursor": "YpzIAbBU0t2UVRPN7sISgFsG5QfI3lqmzAwT98RaPmA",
+                    "endCursor": "MkFwfulfjDk6JEC7oXlhxoq0c6mhF_Uxx83_jHonk5c"
+                },
+                "totalCount": 3
             }
         }));
     }
@@ -1383,6 +1513,64 @@ mod e2e_queries {
                     }
                 ]
             }
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_array_root_query() {
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
+
+        let query = r#"
+            query AircraftList {
+                aircraftList {
+                    id
+                    capacity
+                    manufacturer
+                    model
+                    airline {
+                        id
+                        name
+                    }
+                }
+            }
+        "#;
+
+        let res = singleton.schema.execute(query).await;
+        let json = res.data.into_json().unwrap();
+
+        assert_eq!(json, json!({
+            "aircraftList": [
+                {
+                    "id": "aircraft:a320",
+                    "capacity": 150,
+                    "manufacturer": "Airbus",
+                    "model": "A320-200",
+                    "airline": {
+                        "id": "airline:lh",
+                        "name": "Lufthansa"
+                    }
+                },
+                {
+                    "id": "aircraft:a350",
+                    "capacity": 314,
+                    "manufacturer": "Airbus",
+                    "model": "A350-900",
+                    "airline": {
+                        "id": "airline:lh",
+                        "name": "Lufthansa"
+                    }
+                },
+                {
+                    "id": "aircraft:a380",
+                    "capacity": 555,
+                    "manufacturer": "Airbus",
+                    "model": "A380-800",
+                    "airline": {
+                        "id": "airline:lh",
+                        "name": "Lufthansa"
+                    }
+                }
+            ]
         }));
     }
 }
