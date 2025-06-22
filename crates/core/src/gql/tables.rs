@@ -513,11 +513,7 @@ pub async fn process_tbs(
         // =======================================================
         // Add all instances query
         // =======================================================
-
-        let sess2 = session.to_owned();
-        let kvs2 = datastore.clone();
-
-        let tb_name_plural = pluralize(tb_name_query);
+        let tb_name_plural = pluralize(tb_name_query.clone());
 
         if cursor {
             query = query.field(
@@ -525,7 +521,7 @@ pub async fn process_tbs(
                 types,
                 &tb_name_plural,
                 &tb_name_gql,
-                make_connection_resolver(&tb_name_plural, ConnectionKind::Table),
+                make_connection_resolver(&tb_name_query, ConnectionKind::Table),
                 edge_fields: [],
                 args: [
                     order_input!(&tb_name)
@@ -866,7 +862,7 @@ fn make_connection_resolver(
                 args
             );
             let is_relation = matches!(kind_clone, ConnectionKind::Relation);
-            let gtx = ctx.data::<GQLTx>()?.clone();
+            let gtx = ctx.data::<GQLTx>()?;
 
             trace!("parent_value: {:?}", ctx.parent_value);
             let db_value_array = if let Some(thing) = ctx.parent_value.downcast_ref::<Thing>() {
@@ -890,59 +886,29 @@ fn make_connection_resolver(
                     trace!("Fetching embedded field '{}' from parent {}", query_source, thing);
                     gtx.get_record_field(thing.clone(), &query_source).await?
                 }
-            } else if let Some(parent_sql_val) = ctx.parent_value.downcast_ref::<SqlValue>() {
-                // CASE 2: Parent is a `SqlValue`. This is a deeply nested connection.
-                // The data we need is already inside this parent object.
-                trace!("Fetching nested connection field '{}' from parent SqlValue", query_source);
-                if let SqlValue::Object(obj) = parent_sql_val {
-                    let field_name = query_source.split('.').last().unwrap_or(&query_source);
-                    obj.get(field_name).cloned().unwrap_or_else(|| SqlValue::Array(Default::default()))
-                } else {
-                    // Parent is not an object, so it can't have the field.
-                    SqlValue::Array(Default::default())
-                }
-            } else if let Some(parent_gql_val) = ctx.parent_value.downcast_ref::<GqlValue>() {
-                trace!("ja gql value works!!");
-                SqlValue::Array(Default::default())
-            } else if let Ok(parent_gql_val) = ctx.parent_value.try_to_value() {
+            } else if let Some(obj) = ctx.parent_value.try_to_value()?.as_object() {
+                // CASE 2: Parent is a GqlValue object.
                 trace!("Fetching parent connection field '{}' from parent Object", query_source);
-                trace!("parent_value: {:?}", parent_gql_val);
+                trace!("parent_value: {:?}", obj);
                 let fd_name = query_source.split('.').last().unwrap_or(&query_source);
 
-                if let GqlValue::Object(obj) = parent_gql_val {
-                    // fixme: build in assertion
+                // if let GqlValue::Object(obj) = val {
+                let fv = FieldValue::value(
+                    obj.get(&Name::new(fd_name))
+                        .cloned()
+                        .unwrap_or(GqlValue::Null),
+                );
 
-                    let fv = FieldValue::value(
-                        obj.get(&Name::new(fd_name))
-                            .cloned()
-                            .unwrap_or(GqlValue::Null),
-                    );
+                if let Some(GqlValue::List(list)) = fv.as_value() {
+                    let sql_list: Result<Vec<SqlValue>, _> = list
+                        .iter()
+                        .map(|gql_val| gql_to_sql_kind(gql_val, Kind::Any))
+                        .collect();
 
-                    if let Some(GqlValue::List(list)) = fv.as_value() {
-                        let sql_list: Result<Vec<SqlValue>, _> = list
-                            .iter()
-                            .map(|gql_val| gql_to_sql_kind(gql_val, Kind::Any))
-                            .collect();
-
-                        SqlValue::Array(Array::from(sql_list.unwrap()))
-                    } else {
-                        SqlValue::Array(Default::default())
-                    }
-                    // Array::from(SqlValue::None)
+                    SqlValue::Array(Array::from(sql_list.unwrap()))
                 } else {
                     SqlValue::Array(Default::default())
                 }
-                // Array::from(SqlValue::None)
-
-                // // Case 3: Parent is a `GqlValue` (a node from a previous connection).
-                // if let GqlValue::Object(obj) = parent_gql_val {
-                //
-                //     // We need to convert the GqlValue back to SqlValue for processing.
-                //
-                //     gql_to_sql_kind(field_val.unwrap_or(&GqlValue::Null), Kind::Array(Box::new(Kind::Any), None))?
-                // } else {
-                //     SqlValue::Array(Default::default())
-                // }
             } else {
                 // CASE 3: No specific parent. This is a root-level connection query.
                 trace!("Fetching root query for table '{}'", query_source);
@@ -953,8 +919,6 @@ fn make_connection_resolver(
                 });
                 gtx.process_stmt(ast).await?
             };
-
-            // trace!("db_value_array: {:?}", db_value_array.clone());
 
             let first = args.get("first").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
             let last = args.get("last").and_then(GqlValueUtils::as_i64).map(|v| v as usize);
