@@ -103,7 +103,7 @@ pub async fn generate_schema(
 
     match tbs {
         Some(tbs) if !tbs.is_empty() => {
-            query = process_tbs(tbs, query, &mut types, &tx, ns, db, session, datastore, cursor).await?;
+            query = process_tbs(tbs, query, &mut types, &tx, ns, db, cursor).await?;
         }
         _ => {}
     }
