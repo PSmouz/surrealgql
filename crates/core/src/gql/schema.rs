@@ -2,14 +2,25 @@ use std::collections::BTreeMap;
 use std::ops::Add;
 use std::sync::Arc;
 
+use super::error::{resolver_error, GqlError};
+#[cfg(debug_assertions)]
+use super::ext::ValidatorExt;
 use crate::dbs::Session;
+use crate::gql::cursor::{make_field_value_resolver, PageInfo};
+use crate::gql::error::{internal_error, schema_error, type_error};
+use crate::gql::ext::{NamedContainer, TryFromExt, TryIntoExt};
 use crate::gql::functions::process_fns;
+use crate::gql::geometry;
 use crate::gql::tables::process_tbs;
+use crate::gql::utils::{GQLTx, GqlValueUtils};
 use crate::kvs::Datastore;
+use crate::kvs::LockType;
+use crate::kvs::TransactionType;
 use crate::sql;
 use crate::sql::kind::Literal;
 use crate::sql::statements::define::config::graphql::{FunctionsConfig, TablesConfig};
 use crate::sql::Kind;
+use crate::sql::Value as SqlValue;
 use crate::sql::{Geometry, Ident};
 use async_graphql::dynamic::Schema;
 use async_graphql::dynamic::{Enum, Type, Union};
@@ -22,20 +33,10 @@ use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use inflector::Inflector;
+use js::Type::Object;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Number;
-
-use super::error::{resolver_error, GqlError};
-#[cfg(debug_assertions)]
-use super::ext::ValidatorExt;
-use crate::gql::error::{internal_error, schema_error, type_error};
-use crate::gql::ext::{NamedContainer, TryFromExt, TryIntoExt};
-use crate::gql::geometry;
-use crate::gql::utils::{GQLTx, GqlValueUtils};
-use crate::kvs::LockType;
-use crate::kvs::TransactionType;
-use crate::sql::Value as SqlValue;
 
 pub async fn generate_schema(
     datastore: &Arc<Datastore>,
@@ -185,6 +186,62 @@ pub async fn generate_schema(
     scalar_debug_validated!(schema, "Duration", Kind::Duration);
     scalar_debug_validated!(schema, "Object", Kind::Object);
     scalar_debug_validated!(schema, "Any", Kind::Any);
+
+    // =======================================================
+    // Cursor/Custom types
+    // =======================================================
+
+    schema = schema.register(Enum::new("OrderDirection")
+        .items([
+            EnumItem::new("ASC")
+                .description("Specifies an ascending order for a given `orderBy` argument."),
+            EnumItem::new("DESC")
+                .description("Specifies a descending order for a given `orderBy` argument."),
+        ])
+        .description("Possible directions in which to order a list of items when provided and `orderBy` argument."));
+
+    schema = schema.register(Object::new("PageInfo")
+        .field(
+            Field::new(
+                "hasNextPage",
+                TypeRef::named_nn(TypeRef::BOOLEAN),
+                make_field_value_resolver(|pi: &PageInfo| pi.has_next_page),
+            ).description("When paginating forwards, are there more items?")
+        )
+        .field(
+            Field::new(
+                "hasPreviousPage",
+                TypeRef::named_nn(TypeRef::BOOLEAN),
+                make_field_value_resolver(|pi: &PageInfo| pi.has_previous_page),
+            ).description("When paginating backwards, are there more items?")
+        )
+        .field(
+            Field::new(
+                "startCursor",
+                TypeRef::named(TypeRef::STRING),
+                // asyncGQL Value doesnt implement from for Option<T>
+                make_field_value_resolver(|pi: &PageInfo|
+                    match &pi.start_cursor {
+                        Some(s) => GqlValue::from(s.clone()),
+                        None => GqlValue::Null,
+                    }
+                ),
+            ).description("When paginating backwards, the cursor to continue.")
+        )
+        .field(
+            Field::new(
+                "endCursor",
+                TypeRef::named(TypeRef::STRING),
+                make_field_value_resolver(|pi: &PageInfo|
+                    match &pi.end_cursor {
+                        Some(s) => GqlValue::from(s.clone()),
+                        None => GqlValue::Null,
+                    }
+                ),
+            ).description("When paginating forwards, the cursor to continue.")
+        )
+        .description("Information about pagination in a connection.")
+    );
 
     // =======================================================
     // Geometry types

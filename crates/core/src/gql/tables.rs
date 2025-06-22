@@ -111,68 +111,6 @@ macro_rules! filter_input {
 	};
 }
 
-macro_rules! define_page_info_type {
-    ($types:ident) => {
-        $types.push(Type::Object({
-            Object::new("PageInfo")
-            .field(
-                Field::new(
-                "hasNextPage",
-                TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &PageInfo| pi.has_next_page),
-                ).description("When paginating forwards, are there more items?")
-            )
-            .field(
-                Field::new(
-                "hasPreviousPage",
-                TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &PageInfo| pi.has_previous_page),
-                ).description("When paginating backwards, are there more items?")
-            )
-            .field(
-                Field::new(
-                "startCursor",
-                TypeRef::named(TypeRef::STRING),
-                // asyncGQL Value doesnt implement from for Option<T>
-                make_field_value_resolver(|pi: &PageInfo|
-                    match &pi.start_cursor {
-                        Some(s) => GqlValue::from(s.clone()),
-                        None => GqlValue::Null,
-                    }
-                ),
-                ).description("When paginating backwards, the cursor to continue.")
-            )
-            .field(
-                Field::new(
-                "endCursor",
-                TypeRef::named(TypeRef::STRING),
-                make_field_value_resolver(|pi: &PageInfo|
-                    match &pi.end_cursor {
-                        Some(s) => GqlValue::from(s.clone()),
-                        None => GqlValue::Null,
-                    }
-                ),
-                ).description("When paginating forwards, the cursor to continue.")
-            )
-            .description("Information about pagination in a connection.")
-        }))
-    };
-}
-
-macro_rules! define_order_direction_enum {
-    ($types:ident) => {
-        $types.push(Type::Enum({
-            Enum::new("OrderDirection")
-            .item(EnumItem::new("ASC").description("Specifies an ascending order for a given \
-            `orderBy` argument."))
-            .item(EnumItem::new("DESC").description("Specifies a descending order for a given \
-            `orderBy` argument."))
-            .description("Possible directions in which to order a list of \
-            items when provided and `orderBy` argument.")
-        }))
-    };
-}
-
 /// This macro needs the order direction enum type defined. you may use
 /// `define_order_direction_enum` for it.
 macro_rules! define_order_input_types {
@@ -606,7 +544,6 @@ pub async fn process_tbs(
                 ],
                 is_relation: false
             ));
-            define_page_info_type!(types); //TODO: remove
         } else {
             query = query.field(
                 Field::new(
@@ -833,8 +770,6 @@ pub async fn process_tbs(
             types.push(Type::Object(obj));
         }
         types.push(Type::Object(tb_ty_obj));
-
-        define_order_direction_enum!(types); // Needed for order_input
     }
 
     Ok(query)
