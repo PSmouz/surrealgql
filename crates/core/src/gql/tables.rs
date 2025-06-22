@@ -338,7 +338,7 @@ macro_rules! parse_field {
                      let $field_ident = Field::new(
                             fd_name_gql,
                             fd_ty,
-                            make_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                            make_field_resolver(fd_path.as_str()),
                         )
                         .description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
@@ -367,14 +367,14 @@ macro_rules! parse_field {
                                     edge_fields: [], args: [], is_relation: false)
                             } else {
                                 // Fallback for safety, though inner_kind should always exist for an array
-                                Field::new(fd_name_gql, fd_ty, make_field_resolver(fd_path.as_str(), $fd.kind.clone()))
+                                Field::new(fd_name_gql, fd_ty, make_field_resolver(fd_path.as_str()))
                             }
                         }
                         _ => {
                             Field::new(
                                 fd_name_gql,
                                 fd_ty,
-                                make_field_resolver(fd_path.as_str(), $fd.kind.clone()),
+                                make_field_resolver(fd_path.as_str()),
                             )
                         }
                     };
@@ -442,10 +442,7 @@ pub async fn process_tbs(
             .field(Field::new(
                 "id",
                 TypeRef::named_nn(TypeRef::ID),
-                make_field_resolver(
-                    "id",
-                    Some(Kind::Record(vec![Table::from(tb_name.clone())])),
-                ),
+                make_field_resolver("id"),
             ))
             .implement("Record");
 
