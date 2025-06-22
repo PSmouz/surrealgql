@@ -869,8 +869,8 @@ mod e2e_queries_cursor {
                             "cursor": "AT_xom8psJ5xboTBYHpnPcADbnU5wCOUJabw4FSP_MA",
                             "node": {
                                 "aircraftModel": {
-                                    "id": null,
-                                    "model": null
+                                    "id": "aircraft:a380",
+                                    "model": "A380-800"
                                 },
                                 "checks": {
                                     "totalCount": 2,
@@ -909,8 +909,8 @@ mod e2e_queries_cursor {
                             "cursor": "NIMbvTOokRlvBY-td12aJJG7R36JRVuRe7zEZ4wB8xA",
                             "node": {
                                 "aircraftModel": {
-                                    "id": null,
-                                    "model": null
+                                    "id": "aircraft:a350",
+                                    "model": "A350-900"
                                 },
                                 "checks": {
                                     "totalCount": 1,
@@ -971,8 +971,8 @@ mod e2e_queries_cursor {
                                 ]
                             },
                             "aircraftModel": {
-                                "id": null,
-                                "model": null
+                                "id": "aircraft:a380",
+                                "model": "A380-800"
                             }
                         },
                         {
@@ -999,8 +999,8 @@ mod e2e_queries_cursor {
                                 ]
                             },
                             "aircraftModel": {
-                                "id": null,
-                                "model": null
+                                "id": "aircraft:a350",
+                                "model": "A350-900"
                             }
                         }
                     ],
