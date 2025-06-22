@@ -1017,7 +1017,7 @@ mod e2e_queries_cursor {
 }
 
 mod e2e_queries {
-    use crate::gql::test::{get_singleton, CURSOR_SINGLETON};
+    use crate::gql::test::{get_singleton, NO_CURSOR_SINGLETON};
     use serde_json::json;
 
     const AST: &str = r#"
@@ -1098,7 +1098,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_record() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Aircraft {
                 aircraft(id: "a380") {
@@ -1124,7 +1124,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_relation() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -1224,7 +1224,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_array_scalar() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "airline:lh") {
@@ -1254,7 +1254,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_array_records() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "airline:lh") {
@@ -1298,7 +1298,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_array_embedded_object() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
@@ -1334,7 +1334,7 @@ mod e2e_queries {
 
     #[tokio::test]
     async fn test_array_embedded_nested() {
-        let singleton = get_singleton(&CURSOR_SINGLETON, AST).await;
+        let singleton = get_singleton(&NO_CURSOR_SINGLETON, AST).await;
         let query = r#"
             query Airline {
                 airline(id: "lh") {
