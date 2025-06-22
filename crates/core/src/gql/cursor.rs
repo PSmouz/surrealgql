@@ -71,7 +71,7 @@ pub fn encode_cursor_for_item(item: &SqlValue) -> String {
 ///
 /// - `P`: The type of the parent struct (e.g., `GqlConnection`, `GqlPageInfo`).
 /// - `F`: The type of the field being resolved, which must be convertible into a `FieldValue`.
-pub fn make_field_value_resolver<P, F>(
+pub fn make_value_resolver<P, F>(
     extractor: impl Fn(&P) -> F + Clone + Send + Sync + 'static,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static
 where

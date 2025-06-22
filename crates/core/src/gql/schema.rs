@@ -6,7 +6,7 @@ use super::error::{resolver_error, GqlError};
 #[cfg(debug_assertions)]
 use super::ext::ValidatorExt;
 use crate::dbs::Session;
-use crate::gql::cursor::{make_field_value_resolver, PageInfo};
+use crate::gql::cursor::{make_value_resolver, PageInfo};
 use crate::gql::error::{internal_error, schema_error, type_error};
 use crate::gql::ext::{NamedContainer, TryFromExt, TryIntoExt};
 use crate::gql::functions::process_fns;
@@ -33,7 +33,6 @@ use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use inflector::Inflector;
-use js::Type::Object;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Number;
@@ -205,14 +204,14 @@ pub async fn generate_schema(
             Field::new(
                 "hasNextPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &PageInfo| pi.has_next_page),
+                make_value_resolver(|pi: &PageInfo| pi.has_next_page),
             ).description("When paginating forwards, are there more items?")
         )
         .field(
             Field::new(
                 "hasPreviousPage",
                 TypeRef::named_nn(TypeRef::BOOLEAN),
-                make_field_value_resolver(|pi: &PageInfo| pi.has_previous_page),
+                make_value_resolver(|pi: &PageInfo| pi.has_previous_page),
             ).description("When paginating backwards, are there more items?")
         )
         .field(
@@ -220,7 +219,7 @@ pub async fn generate_schema(
                 "startCursor",
                 TypeRef::named(TypeRef::STRING),
                 // asyncGQL Value doesnt implement from for Option<T>
-                make_field_value_resolver(|pi: &PageInfo|
+                make_value_resolver(|pi: &PageInfo|
                     match &pi.start_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,
@@ -232,7 +231,7 @@ pub async fn generate_schema(
             Field::new(
                 "endCursor",
                 TypeRef::named(TypeRef::STRING),
-                make_field_value_resolver(|pi: &PageInfo|
+                make_value_resolver(|pi: &PageInfo|
                     match &pi.end_cursor {
                         Some(s) => GqlValue::from(s.clone()),
                         None => GqlValue::Null,

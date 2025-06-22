@@ -13,7 +13,7 @@ use crate::dbs::capabilities::RouteTarget::Sql;
 use crate::dbs::Session;
 use crate::fnc::time::format;
 use crate::gql::cursor;
-use crate::gql::cursor::{make_field_value_resolver, make_list_resolver, make_object_resolver, ConnectionContext,
+use crate::gql::cursor::{make_list_resolver, make_object_resolver, make_value_resolver, ConnectionContext,
                          ConnectionKind, EdgeContext, PageInfo};
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
@@ -23,7 +23,7 @@ use crate::iam::base::BASE64;
 use crate::kvs::{Datastore, Transaction};
 use crate::sql::order::{OrderList, Ordering};
 use crate::sql::statements::{DefineFieldStatement, DefineTableStatement, SelectStatement};
-use crate::sql::{self, Array, Ident, Literal, Operator, Part, Table, TableType, Values};
+use crate::sql::{self, Array, Ident, Literal, Operator, Part, Table, TableType, Value, Values};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
@@ -184,12 +184,12 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "cursor",
                     TypeRef::named_nn(TypeRef::STRING),
-                    make_field_value_resolver(|e: &EdgeContext| e.cursor.clone()),
+                    make_value_resolver(|e: &EdgeContext| e.cursor.clone()),
                 ).description("A cursor for use in pagination."))
                 .field(Field::new(
                     "node",
                     TypeRef::named($node_ty_name),
-                    make_field_value_resolver(|e: &EdgeContext| sql_value_to_gql_value(e
+                    make_value_resolver(|e: &EdgeContext| sql_value_to_gql_value(e
                     .node.clone()).unwrap()),
                 ).description("The item at the end of the edge."))
                 .description("An edge in a connection.");
@@ -230,7 +230,7 @@ macro_rules! cursor_pagination {
                 .field(Field::new(
                     "totalCount",
                     TypeRef::named_nn(TypeRef::INT),
-                    make_field_value_resolver(|conn: &ConnectionContext| conn.total_count),
+                    make_value_resolver(|conn: &ConnectionContext| conn.total_count),
                 ).description("Identifies the total count of items in the connection."))
                 .description(format!("The connection type for {}.", $node_ty_name));
 
