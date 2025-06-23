@@ -70,13 +70,21 @@ macro_rules! after_input {
 macro_rules! limit_input {
 	() => {
 		InputValue::new("limit", TypeRef::named(TypeRef::INT))
-        .description("xxx")
+        .description("Maximum number of records to return. Use this parameter to limit result size.")
+	};
+}
+
+macro_rules! start_input {
+	() => {
+		InputValue::new("start", TypeRef::named(TypeRef::INT))
+        .description("Number of records to skip. Use this parameter with 'limit' for offset-based pagination.")
 	};
 }
 
 macro_rules! id_input {
 	() => {
 		InputValue::new("id", TypeRef::named(TypeRef::ID))
+        .description("The ID of the record to fetch. Can be a string ID or a record ID in the format 'table:id'.")
 	};
 }
 
@@ -388,7 +396,6 @@ macro_rules! parse_field {
     };
 }
 
-
 fn is_sortable(ty: &Kind) -> bool {
     match ty {
         Kind::Int | Kind::Float | Kind::Decimal | Kind::String | Kind::Datetime | Kind::Duration
@@ -545,6 +552,8 @@ pub async fn process_tbs(
                             let args = ctx.args.as_index_map();
                             trace!("received request with args: {args:?}");
 
+                            let start = args.get("start").and_then(|v| v.as_i64()).map(|s| s.intox());
+                            let limit = args.get("limit").and_then(|v| v.as_i64()).map(|l| l.intox());
                             let order_by_arg = args.get("orderBy").and_then(GqlValueUtils::as_object);
                             let order_by = order_by(order_by_arg);
 
@@ -561,10 +570,9 @@ pub async fn process_tbs(
                                         true,
                                     ),
                                     order: order_by,
-                                    // order: orders.map(|x| Ordering::Order(OrderList(x))),
                                     // cond,
-                                    // limit,
-                                    // start,
+                                    start,
+                                    limit,
                                     ..Default::default()
                                 }
                             });
@@ -611,6 +619,7 @@ pub async fn process_tbs(
                                 &tb_name)
                     })
                     .argument(limit_input!())
+                    .argument(start_input!())
                     .argument(order_input!(&tb_name))
                 // .argument(filter_input!(&tb_name))
             );
