@@ -851,20 +851,9 @@ fn make_field_resolver(
     }
 }
 
-#[allow(clippy::too_many_lines)] // Due to detailed logic
+#[allow(clippy::too_many_lines)]
 fn make_connection_resolver(
-    // For table connections: table name (e.g., "user")
-    // For relation connections: relation table name (e.g., "authored_posts")
     name_for_query_source: impl Into<String>,
-    // Kind of items being paginated (e.g., Kind::Record for users or relation records)
-    // We'll use this to understand if it's a relation and to get table/relation schema if needed.
-    // For now, we primarily use name_for_query_source and parent_rid to infer.
-    // item_kind: Option<Kind>,
-    // We need the schema definition of the relation if this is a relation connection
-    // to correctly determine 'in'/'out' fields and target node type.
-    // This is a simplification for now: assumes 'in' links to parent, 'out' to target.
-    // relation_def: Option<Arc<DefineTableStatement>>, // TODO: Pass this if needed
-    // is_relation: bool,
     kind: ConnectionKind,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
     let query_source_name = name_for_query_source.into();
@@ -911,7 +900,6 @@ fn make_connection_resolver(
                 trace!("parent_value: {:?}", obj);
                 let fd_name = query_source.split('.').last().unwrap_or(&query_source);
 
-                // if let GqlValue::Object(obj) = val {
                 let fv = FieldValue::value(
                     obj.get(&Name::new(fd_name))
                         .cloned()
@@ -973,11 +961,6 @@ fn make_connection_resolver(
                 let start = limited_edges.len().saturating_sub(last_val);
                 limited_edges = &limited_edges[start..];
             }
-
-            //fixme: dont do duplicated. get from edges.
-            let start_cursor = limited_edges.first().map(cursor::encode_cursor);
-            let end_cursor = limited_edges.last().map(cursor::encode_cursor);
-
 
             let ids_to_fetch: Vec<SqlValue> = limited_edges
                 .iter()
@@ -1110,12 +1093,11 @@ fn make_connection_resolver(
                 })
                 .collect();
 
-
             let page_info = PageInfo {
                 has_next_page: cursor::has_next_page(edges, before_cursor_str.as_deref(), first),
                 has_previous_page: cursor::has_previous_page(edges, after_cursor_str.as_deref(), last),
-                start_cursor,
-                end_cursor,
+                start_cursor: edge_contexts.first().map(|e| e.cursor.clone()),
+                end_cursor: edge_contexts.last().map(|e| e.cursor.clone()),
             };
             let connection = ConnectionContext {
                 edges: edge_contexts,

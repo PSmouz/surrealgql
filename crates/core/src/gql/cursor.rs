@@ -1,11 +1,11 @@
-use crate::gql::error::{input_error, internal_error};
-use crate::gql::utils::hash_sql_value;
+use crate::gql::error::internal_error;
 use crate::gql::GqlError;
-use crate::iam::base::BASE64;
-use crate::sql::{Thing, Value as SqlValue};
+use crate::sql::Value as SqlValue;
 use async_graphql::dynamic::{FieldFuture, FieldValue, ResolverContext};
 use async_graphql::Value as GqlValue;
-use base64::Engine;
+use base64::{engine::general_purpose, Engine as _};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::any::Any;
 
 // We cant use the async_graphql versions as they are generic and require
@@ -39,29 +39,18 @@ pub enum ConnectionKind {
     Relation, // Connection is a relation of a table
 }
 
-fn encode_cursor(thing: &Thing) -> String {
-    BASE64.encode(thing.to_string().as_bytes())
-}
+pub fn encode_cursor<T>(input: &T) -> String
+where
+    T: Serialize,
+{
+    let serialized = serde_json::to_string(input)
+        .expect("Failed to serialize input for cursor encoding");
 
-// Helper to decode a cursor string back into a Thing ID
-fn decode_cursor(cursor: &str) -> Result<Thing, GqlError> {
-    let bytes = BASE64
-        .decode(cursor.as_bytes())
-        .map_err(|e| input_error(format!("Invalid cursor: failed to decode base64: {}", e)))?;
-    let s = String::from_utf8(bytes)
-        .map_err(|e| input_error(format!("Invalid cursor: failed to convert to utf8: {}", e)))?;
-    s.try_into()
-        .map_err(|se| input_error(format!("Invalid cursor content: {:?}", se)))
-}
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    let hash_result = hasher.finalize();
 
-/// Generates a stable, content-addressable cursor for any given item in a list.
-///
-/// This function creates a consistent hash of the item's content, making the
-/// cursor independent of the item's position in the list.
-pub fn encode_cursor_for_item(item: &SqlValue) -> String {
-    // The index is no longer needed for encoding, but we keep it in the
-    // signature to maintain compatibility with the calling function.
-    hash_sql_value(item)
+    general_purpose::URL_SAFE_NO_PAD.encode(hash_result)
 }
 
 /// A generic resolver factory for fields that return a terminal GraphQL value (scalar, enum, etc.).
@@ -167,7 +156,7 @@ fn find_index_for_cursor(
     cursor: &str,
 ) -> Option<usize> {
     all_edges.iter().enumerate().find_map(|(i, item)| {
-        if encode_cursor_for_item(item) == cursor {
+        if encode_cursor(item) == cursor {
             Some(i)
         } else {
             None
