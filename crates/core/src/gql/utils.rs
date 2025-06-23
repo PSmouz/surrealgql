@@ -24,6 +24,7 @@ pub(crate) trait GqlValueUtils {
     fn as_string(&self) -> Option<String>;
     fn as_list(&self) -> Option<&Vec<GqlValue>>;
     fn as_object(&self) -> Option<&IndexMap<Name, GqlValue>>;
+    fn as_name(&self) -> Option<&Name>;
 }
 
 impl GqlValueUtils for GqlValue {
@@ -52,6 +53,14 @@ impl GqlValueUtils for GqlValue {
     fn as_object(&self) -> Option<&IndexMap<Name, GqlValue>> {
         if let GqlValue::Object(o) = self {
             Some(o)
+        } else {
+            None
+        }
+    }
+    
+    fn as_name(&self) -> Option<&Name> {
+        if let GqlValue::Enum(e) = self {
+            Some(e)
         } else {
             None
         }
