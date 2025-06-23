@@ -43,19 +43,6 @@ use inflector::Inflector;
 use log::trace;
 use sha2::{Digest, Sha256};
 
-// macro_rules! order {
-// 	(asc, $field:expr) => {{
-// 		let mut tmp = sql::Order::default();
-// 		tmp.value = $field.into();
-// 		tmp.direction = true;
-// 		tmp
-// 	}};
-// 	(desc, $field:expr) => {{
-// 		let mut tmp = sql::Order::default();
-// 		tmp.value = $field.into();
-// 		tmp
-// 	}};
-// }
 macro_rules! first_input {
 	() => {
 		InputValue::new("first", TypeRef::named(TypeRef::INT))
@@ -773,6 +760,8 @@ fn make_field_resolver(
             let fd_name = fd_path.split('.').last().unwrap_or(&fd_path);
 
             trace!("PARENT VALUE: {:?}", ctx.parent_value);
+            trace!("FD PATH VALUE: {:?}", &fd_path);
+            trace!("FD NAME VALUE: {:?}", &fd_name);
             let sql_value = if let Some(thing) = ctx.parent_value.downcast_ref::<Thing>() {
                 // CASE 1: Parent is a `Thing` (a record ID). Fetch from the database.
                 trace!("Case 1: Parent is Thing, fetching path '{}' from RID {}", fd_path, thing);
@@ -817,10 +806,15 @@ fn make_field_resolver(
                     .into());
             };
 
+            trace!("Fetched SQL value for path '{}': {:?}", fd_path, sql_value);
+            trace!("KIND of value: {:?}", sql_value.kindof());
+
             match sql_value {
                 // Case 1: We have a `Thing` (record ID) so we cannot lose the context, because we
                 // need it to resolve its fields. Except for the 'id' field, which is a scalar.
                 SqlValue::Thing(thing) if fd_name != "id" => {
+                    trace!("Case 1 (Thing): Returning Thing as FieldValue::owned_any for path \
+                    '{}'", fd_path);
                     Ok(Some(FieldValue::owned_any(thing)))
                 }
                 // Case 2: We have an array of `Thing` records, which we must return as a list of
@@ -848,6 +842,7 @@ fn make_field_resolver(
                 }
                 // Case 4: Scalar or Enum value etc
                 v => {
+                    trace!("Case 4 (Scalar/Enum): Converting SQL value to GQL value for path '{}'", fd_path);
                     let gql_val = sql_value_to_gql_value(v)?;
                     Ok(Some(FieldValue::value(gql_val)))
                 }
@@ -979,22 +974,31 @@ fn make_connection_resolver(
                 limited_edges = &limited_edges[start..];
             }
 
-            let start_cursor = limited_edges.first().map(cursor::encode_cursor_for_item);
-            let end_cursor = limited_edges.last().map(cursor::encode_cursor_for_item);
+            //fixme: dont do duplicated. get from edges.
+            let start_cursor = limited_edges.first().map(cursor::encode_cursor);
+            let end_cursor = limited_edges.last().map(cursor::encode_cursor);
+
 
             let ids_to_fetch: Vec<SqlValue> = limited_edges
                 .iter()
-                .filter_map(|edge| {
+                .flat_map(|edge| {
                     match edge {
-                        SqlValue::Thing(_) => Option::from(edge.clone()),
+                        SqlValue::Thing(_) => vec![edge.clone()],
                         SqlValue::Object(obj) => {
-                            if let Some(SqlValue::Thing(thing)) = obj.get("out") {
-                                Some(SqlValue::Thing(thing.clone()))
-                            } else {
-                                None
-                            }
+                            trace!("OBJ {:?}", &obj);
+                            let x = obj.iter()
+                                .filter_map(|(k, v)| {
+                                    match v {
+                                        SqlValue::Thing(thing) if k != "id" =>
+                                            Some(SqlValue::Thing(thing.clone())),
+                                        _ => None,
+                                    }
+                                })
+                                .collect::<Vec<SqlValue>>();
+                            trace!("XXXX {:?}", x);
+                            x
                         }
-                        _ => None,
+                        _ => vec![],
                     }
                 })
                 .collect();
@@ -1034,19 +1038,36 @@ fn make_connection_resolver(
                             fetched_nodes.get(thing).unwrap()
                         }
                         // Case 2: Array item is an Object
-                        SqlValue::Object(obj) => {
-                            // Case 2.1: If it's a relation, we expect an object with 'in'/'out' fields
-                            if is_relation {
-                                if let Some(SqlValue::Thing(id)) = obj.get("out") {
+                        SqlValue::Object(obj) =>
+                            match (is_relation, obj.get("out")) {
+                                // Case 2.1: We have a relation record. It must have an 'out' field.
+                                // Only the fetched `out` record is the node.
+                                (true, Some(SqlValue::Thing(id))) => {
                                     fetched_nodes.get(id).unwrap_or(&SqlValue::Null)
-                                } else {
-                                    item // Case 2.1.1: 'out' missing in relation should not be possible
                                 }
-                                // Case 2.2: If it's an embedded array object, we expect a simple object
-                            } else {
-                                item
+                                // Case 2.2: We have an object with fields, possibly including Things.
+                                _ => {
+                                    let new_map = obj
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            let val = match v {
+                                                // Case 2.2.1: If a field's value is a `Thing`,
+                                                // look it up and replace it. Except for id
+                                                // fields, we want them as scalar strings.
+                                                SqlValue::Thing(id) if k != "id" => fetched_nodes
+                                                    .get(id)
+                                                    .cloned() // Clone to get an owned value from the map
+                                                    .unwrap_or(SqlValue::Null),
+                                                // Case 2.2.2: Otherwise, keep the original value.
+                                                _ => v.clone(),
+                                            };
+                                            (k.clone(), val)
+                                        })
+                                        .collect();
+
+                                    &SqlValue::Object(new_map)
+                                }
                             }
-                        }
                         // Case 3: Other types (e.g., scalar values)
                         _ => {
                             item
@@ -1056,7 +1077,9 @@ fn make_connection_resolver(
 
                     let edge = if is_relation {
                         if let SqlValue::Object(obj) = item {
-                            // It's a relation record. We need to filter its fields.
+                            // It's a relation record. We need to filter its fields. We want all
+                            // relation fields as edge fields, except 'in' and 'out' which are
+                            // `Things` to the parent and target nodes.
                             let edge_fields: BTreeMap<String, SqlValue> = obj
                                 .iter()
                                 .filter(|(key, _)| {
@@ -1066,7 +1089,6 @@ fn make_connection_resolver(
                                 .map(|(key, value)| (key.clone(), value.clone()))
                                 .collect();
 
-                            // Create a new object containing only the desired edge fields.
                             SqlValue::Object(edge_fields.into())
                         } else {
                             // This case should not happen for relations, but as a fallback,
@@ -1081,7 +1103,7 @@ fn make_connection_resolver(
                     trace!("edge: {:?}", edge);
 
                     EdgeContext {
-                        cursor: cursor::encode_cursor_for_item(item),
+                        cursor: cursor::encode_cursor(item),
                         edge: edge.clone(),
                         node: node.clone(),
                     }
@@ -1358,21 +1380,21 @@ fn parse_order_input(order: Option<&GqlValue>) -> Result<Option<Vec<sql::Order>>
     let mut current = o;
 
     loop {
-        let Some(GqlValue::Enum(field_name_enum)) = current.get("field") else {
+        let Some(GqlValue::Enum(fd_name_enum)) = current.get("field") else {
             return Err(resolver_error("Order input must contain 'field' enum"));
         };
         let Some(GqlValue::Enum(direction_enum)) = current.get("direction") else {
             return Err(resolver_error("Order input must contain 'direction' enum (ASC/DESC)"));
         };
 
-        let field_name_screaming = field_name_enum.as_str(); // e.g., "CREATED_AT", "SIZE_WIDTH"
+        let fd_name_screaming = fd_name_enum.as_str(); // e.g., "CREATED_AT", "SIZE_WIDTH"
         // Convert SCREAMING_SNAKE_CASE back to DB snake_case.dot notation
-        let db_field_name = field_name_screaming.to_lowercase(); // Simple conversion, might need underscores replaced with dots
+        let db_fd_name = fd_name_screaming.to_lowercase(); // Simple conversion, might need underscores replaced with dots
 
         let direction_is_asc = direction_enum.as_str() == "ASC";
 
         let mut order_clause = sql::Order::default();
-        order_clause.value = db_field_name.into(); // Use DB name/path
+        order_clause.value = db_fd_name.into(); // Use DB name/path
         order_clause.direction = direction_is_asc;
         orders.push(order_clause);
 
