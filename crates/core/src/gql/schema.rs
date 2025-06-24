@@ -96,6 +96,7 @@ pub async fn generate_schema(
     }
 
     let mut query = Object::new("Query");
+    let mut mutation = Object::new("Mutation");
     let mut types: Vec<Type> = Vec::new();
     let cursor = config.cursor; //TODO: use cursor config here
 
@@ -103,7 +104,16 @@ pub async fn generate_schema(
 
     match tbs {
         Some(tbs) if !tbs.is_empty() => {
-            query = process_tbs(tbs, query, &mut types, &tx, ns, db, cursor).await?;
+            (query, mutation) = process_tbs(
+                tbs,
+                query,
+                mutation,
+                &mut types,
+                &tx,
+                ns,
+                db,
+                cursor,
+            ).await?;
         }
         _ => {}
     }
@@ -114,7 +124,8 @@ pub async fn generate_schema(
 
     // trace!("current Query object for schema: {:?}", query);
 
-    let mut schema = Schema::build("Query", None, None).register(query);
+    let mut schema = Schema::build("Query", Some("Mutation"), None)
+        .register(query).register(mutation);
     for ty in types {
         // trace!("adding type: {ty:?}");
         schema = schema.register(ty);
@@ -372,6 +383,11 @@ pub async fn generate_schema(
         .field(InterfaceField::new("out", TypeRef::named_nn("Record")))
         .implement("Record");
     schema = schema.register(relation_interface);
+
+    // let payload_interface = Interface::new("Payload")
+    //     .field(InterfaceField::new("success", TypeRef::named_nn(TypeRef::BOOLEAN))
+    //         .description("Did the operation succeed?")
+    //     );
 
 
     schema

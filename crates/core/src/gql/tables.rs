@@ -39,6 +39,15 @@ use async_graphql::Value as GqlValue;
 use inflector::Inflector;
 use log::trace;
 
+
+fn dummy_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+    move |_ctx: ResolverContext| {
+        FieldFuture::new(async move {
+            Ok(Some(FieldValue::value("".to_string())))
+        })
+    }
+}
+
 macro_rules! first_input {
 	() => {
 		InputValue::new("first", TypeRef::named(TypeRef::INT))
@@ -85,6 +94,17 @@ macro_rules! id_input {
 	() => {
 		InputValue::new("id", TypeRef::named(TypeRef::ID))
         .description("The ID of the record to fetch. Can be a string ID or a record ID in the format 'table:id'.")
+	};
+}
+
+macro_rules! input_input {
+	(
+        $ty: expr,
+        $name: expr
+    ) => {
+		InputValue::new("input",
+            TypeRef::named(format!("{}{}Input", $ty.to_pascal_case(), $name.to_pascal_case())))
+        .description("")
 	};
 }
 
@@ -267,12 +287,12 @@ macro_rules! cursor_pagination {
 macro_rules! parse_field {
     (
         $fd:ident,
-        $types:ident,
-        $order_by:ident,
-        $cursor:ident,
         $tb_name:ident,
-        $map:ident,
-        |$field_ident:ident| $($action_tokens:tt)*
+        $types:ident,
+        $cursor:ident,
+        $query_vec:ident,
+        $nested_objs_map:ident,
+        $order_vec:ident
     ) => {
         let kind = match $fd.kind.clone() {
             Some(k) => k,
@@ -308,12 +328,12 @@ macro_rules! parse_field {
         let fd_ty = kind_to_type(kind.clone(), $types, path.as_slice())?;
 
         if is_sortable(&kind_non_optional) {
-            $order_by.push(fd_name_gql.clone());
+            $order_vec.push(fd_name_gql.clone());
         }
 
         // object map used to add fields step by step to the objects
         if kind_non_optional == Kind::Object {
-            $map.insert(
+            $nested_objs_map.insert(
                 fd_path.clone(),
                 Object::new(fd_ty.type_name())
                     .description(if let Some(ref c) = $fd.comment {
@@ -332,14 +352,19 @@ macro_rules! parse_field {
                         let ty_ref = kind_to_type(kind.clone(), $types, path.as_slice())?;
                         let ty_name = ty_ref.type_name();
 
-                        let $field_ident = cursor_pagination!($types, &fd_name_gql, ty_name,
-                        make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
-                        edge_fields: [], args: [], is_relation: false);
-                        $($action_tokens)*;
+                        $query_vec.push(cursor_pagination!(
+                            $types,
+                            &fd_name_gql,
+                            ty_name,
+                            make_connection_resolver(fd_path.as_str(), ConnectionKind::Field),
+                            edge_fields: [],
+                            args: [],
+                            is_relation: false
+                        ));
                     }
                 }
                 _ => {
-                     let $field_ident = Field::new(
+                    $query_vec.push(Field::new(
                             fd_name_gql,
                             fd_ty,
                             make_field_resolver(fd_path.as_str()),
@@ -348,8 +373,8 @@ macro_rules! parse_field {
                             format!("{c}")
                         } else {
                             "".to_string()
-                        });
-                    $($action_tokens)*;
+                        })
+                    );
                 }
             }
         } else { // nested field
@@ -358,7 +383,7 @@ macro_rules! parse_field {
 
             // expects the parent's `DefineFieldStatement` to come before its children as is
             // with `tx.all_tb_fields()`
-            match $map.remove(&fd_path_parent) {
+            match $nested_objs_map.remove(&fd_path_parent) {
                 Some(obj) => {
                     let new_field = match kind_non_optional {
                         Kind::Array(_, _) if $cursor => {
@@ -382,7 +407,7 @@ macro_rules! parse_field {
                             )
                         }
                     };
-                    $map.insert(fd_path_parent.clone(), Object::from(obj)
+                    $nested_objs_map.insert(fd_path_parent.clone(), Object::from(obj)
                         .field(new_field.description(if let Some(ref c) = $fd.comment {
                             format!("{c}")
                         } else {
@@ -423,12 +448,13 @@ fn remove_leading_dot(input: &str) -> &str {
 pub async fn process_tbs(
     tbs: Arc<[DefineTableStatement]>,
     mut query: Object,
+    mut mutation: Object,
     types: &mut Vec<Type>,
     tx: &Transaction,
     ns: &str,
     db: &str,
     cursor: bool,
-) -> Result<Object, GqlError> {
+) -> Result<(Object, Object), GqlError> {
     // Type::Any is not supported. FIXME: throw error in the future.
     let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs
         .iter().partition(|tb| {
@@ -446,11 +472,124 @@ pub async fn process_tbs(
         let tb_name_gql = tb_name.to_pascal_case();
         let tb_name_query = tb_name.to_camel_case(); // field name for the table in the query
 
-        let mut gql_objects: BTreeMap<String, Object> = BTreeMap::new();
-        let mut fds_orderable = Vec::new();
+        let mut tb_fds_query = Vec::<Field>::new();
+        let mut tb_fds_create_input = Vec::<InputValue>::new();
+        let mut tb_fds_update_input = Vec::<InputValue>::new();
+        let mut tb_fds_delete_input = Vec::<InputValue>::new();
+        let mut tb_nested_objs = BTreeMap::<String, Object>::new();
+        let mut tb_fds_orderable = Vec::<String>::new();
+
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
 
-        let mut tb_ty_obj = Object::new(tb_name_gql.clone())
+        // =======================================================
+        // Parse fields
+        // =======================================================
+
+        for fd in fds.iter() {
+            // We have already defined "id", so we don't take any new definition for it.
+            if fd.name.is_id() { continue; };
+
+            parse_field!(
+                fd,
+                tb_name,
+                types,
+                cursor,
+                tb_fds_query,
+                tb_nested_objs,
+                tb_fds_orderable
+            );
+        }
+        define_order_input_types!(types, tb_name, tb_fds_orderable);
+
+        // =======================================================
+        // Parse relations
+        // =======================================================
+
+        for rel in relations.iter().filter(|stmt| {
+            match &stmt.kind {
+                TableType::Relation(r) => match &r.from {
+                    Some(Kind::Record(tbs)) => tbs.contains(&Table::from(tb_name.clone())),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }) {
+            let rel_name = rel.name.to_string();
+
+            let (_, outs) = match &rel.kind {
+                TableType::Relation(r) => match (&r.from, &r.to) {
+                    (Some(Kind::Record(from)), Some(Kind::Record(to))) => (from, to),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+
+            let mut rel_fds = Vec::<Field>::new();
+            let mut rel_nested_objs = BTreeMap::<String, Object>::new();
+            let mut rel_fds_orderable = Vec::<String>::new();
+
+            let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
+
+            //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
+            // possible performance improvements by skipping fields for prev relations
+            for fd in fds.iter().filter(|fd|
+                !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
+            ) {
+                parse_field!(
+                    fd,
+                    tb_name,
+                    types,
+                    cursor,
+                    rel_fds,
+                    rel_nested_objs,
+                    rel_fds_orderable
+                );
+            }
+            define_order_input_types!(types, &rel_name, rel_fds_orderable);
+
+            // Node type for the relation connection
+            let node_ty_name = match outs.len() {
+                // we have only one `to` table, thus we can use the object type directly
+                1 => outs.first().unwrap().to_string().to_pascal_case(),
+                // we have more than one `to` table, thus we need a union type
+                _ => {
+                    let mut tmp_union = Union::new(format!("{}Union", rel.name.to_raw().to_pascal_case()));
+                    for n in outs {
+                        tmp_union = tmp_union.possible_type(n.0.to_string().to_pascal_case());
+                    }
+                    // async_graphql types do not implement clone, thus we need to get the typename
+                    // before the move
+                    let union_name = tmp_union.type_name().to_string();
+                    types.push(Type::Union(tmp_union));
+
+                    union_name
+                }
+            };
+
+            tb_fds_query.push(
+                cursor_pagination!(
+                    types,
+                    pluralize(rel_name.to_camel_case()),
+                    &node_ty_name,
+                    make_connection_resolver(&rel_name, ConnectionKind::Relation),
+                    edge_fields: rel_fds,
+                    args: [
+                        order_input!(&tb_name)
+                    ],
+                    is_relation: true
+                )
+            );
+
+            for obj in rel_nested_objs.into_values() {
+                types.push(Type::Object(obj));
+            }
+        }
+
+        // =======================================================
+        // Create objects
+        // =======================================================
+
+        let mut query_obj = Object::new(&tb_name_gql)
             .field(Field::new(
                 "id",
                 TypeRef::named_nn(TypeRef::ID),
@@ -458,26 +597,97 @@ pub async fn process_tbs(
             ))
             .implement("Record");
 
-        // =======================================================
-        // Parse Fields
-        // =======================================================
-        for fd in fds.iter() {
-            // We have already defined "id", so we don't take any new definition for it.
-            if fd.name.is_id() { continue; };
+        let mut create_input_obj = InputObject::new(format!("Create{}Input", &tb_name_gql))
+            .field(InputValue::new(
+                "id",
+                TypeRef::named(TypeRef::ID),
+            ).description(format!("The {} ID to create.", &tb_name_gql)),
+            ).description(format!("Autogenerated input type of Create{}.", &tb_name_gql));
 
-            parse_field!(fd, types, fds_orderable, cursor, tb_name, gql_objects, |fd| tb_ty_obj = tb_ty_obj
-                .field(fd));
-        }
+        let mut update_input_obj = InputObject::new(format!("Update{}Input", &tb_name_gql))
+            .field(InputValue::new(
+                "id",
+                TypeRef::named(TypeRef::ID),
+            ).description(format!("The {} ID to update.", &tb_name_gql)),
+            ).description(format!("Autogenerated input type of Update{}.", &tb_name_gql));
+
+        let mut delete_input_obj = InputObject::new(format!("Delete{}Input", &tb_name_gql))
+            .field(InputValue::new(
+                "id",
+                TypeRef::named(TypeRef::ID),
+            ).description(format!("The {} ID to delete.", &tb_name_gql)),
+            ).description(format!("Autogenerated input type of Delete{}.", &tb_name_gql));
+
+        let tb_create_payload_obj = Object::new(format!("Create{}Payload", &tb_name_gql))
+            .field(Field::new(
+                "success",
+                TypeRef::named(TypeRef::BOOLEAN),
+                dummy_resolver(),
+            ).description("Did the operation succeed?")
+            ).description(format!("Autogenerated return type of Create{}.", &tb_name_gql));
+
+        let tb_update_payload_obj = Object::new(format!("Update{}Payload", &tb_name_gql))
+            .field(Field::new(
+                "success",
+                TypeRef::named(TypeRef::BOOLEAN),
+                dummy_resolver(),
+            ).description("Did the operation succeed?")
+            ).description(format!("Autogenerated return type of Update{}.", &tb_name_gql));
+
+        let tb_delete_payload_obj = Object::new(format!("Delete{}Payload", &tb_name_gql))
+            .field(Field::new(
+                "success",
+                TypeRef::named(TypeRef::BOOLEAN),
+                dummy_resolver(),
+            ).description("Did the operation succeed?")
+            ).description(format!("Autogenerated return type of Delete{}.", &tb_name_gql));
 
         // =======================================================
-        // Add filters
+        // Add create mutation
         // =======================================================
 
-        define_order_input_types!(types, tb_name, fds_orderable);
+        mutation = mutation.field(
+            Field::new(
+                format!("create{}", &tb_name_gql),
+                TypeRef::named(tb_create_payload_obj.type_name()),
+                dummy_resolver(),
+            )
+                .description("")
+                .argument(input_input!("Create", &tb_name_gql))
+        );
 
         // =======================================================
-        // Add single instance query
+        // Add update mutation
         // =======================================================
+
+        mutation = mutation.field(
+            Field::new(
+                format!("update{}", &tb_name_gql),
+                TypeRef::named(tb_update_payload_obj.type_name()),
+                dummy_resolver(),
+            )
+                .description("")
+                .argument(input_input!("Update", &tb_name_gql))
+        );
+
+        // =======================================================
+        // Add delete mutation
+        // =======================================================
+
+        mutation = mutation.field(
+            Field::new(
+                format!("delete{}", &tb_name_gql),
+                TypeRef::named(tb_delete_payload_obj.type_name()),
+                dummy_resolver(),
+            )
+                .description("")
+                .argument(input_input!("Delete", &tb_name_gql))
+        );
+
+        // =======================================================
+        // Add single query
+        // =======================================================
+
         query = query.field(
             Field::new(
                 tb_name_query.to_singular(),
@@ -522,8 +732,9 @@ pub async fn process_tbs(
         );
 
         // =======================================================
-        // Add all instances query
+        // Add list query
         // =======================================================
+
         let tb_name_plural = pluralize(tb_name_query.clone());
 
         if cursor {
@@ -625,92 +836,38 @@ pub async fn process_tbs(
             );
         }
 
+
         // =======================================================
-        // Add relations
+        // Add types / build objects
         // =======================================================
 
-        for rel in relations.iter().filter(|stmt| {
-            match &stmt.kind {
-                TableType::Relation(r) => match &r.from {
-                    Some(Kind::Record(tbs)) => tbs.contains(&Table::from(tb_name.clone())),
-                    _ => false,
-                },
-                _ => false,
-            }
-        }) {
-            let rel_name = rel.name.to_string();
-
-            let (_, outs) = match &rel.kind {
-                TableType::Relation(r) => match (&r.from, &r.to) {
-                    (Some(Kind::Record(from)), Some(Kind::Record(to))) => (from, to),
-                    _ => continue,
-                },
-                _ => continue,
-            };
-
-            let mut fd_map: BTreeMap<String, Object> = BTreeMap::new();
-            let mut fd_vec = Vec::<Field>::new();
-            let mut fds_orderable = Vec::new();
-            let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
-
-            //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
-            // possible performance improvements by skipping fields for prev relations
-            for fd in fds.iter().filter(|fd|
-                !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
-            ) {
-                parse_field!(fd, types, fds_orderable, cursor, rel_name, fd_map, |fd| fd_vec.push(fd));
-            }
-
-            // Node type for the relation connection
-            let node_ty_name = match outs.len() {
-                // we have only one `to` table, thus we can use the object type directly
-                1 => outs.first().unwrap().to_string().to_pascal_case(),
-                // we have more than one `to` table, thus we need a union type
-                _ => {
-                    let mut tmp_union = Union::new(format!("{}Union", rel.name.to_raw().to_pascal_case()));
-                    for n in outs {
-                        tmp_union = tmp_union.possible_type(n.0.to_string().to_pascal_case());
-                    }
-                    // async_graphql types do not implement clone, thus we need to get the typename
-                    // before the move
-                    let union_name = tmp_union.type_name().to_string();
-                    types.push(Type::Union(tmp_union));
-
-                    union_name
-                }
-            };
-
-            tb_ty_obj = tb_ty_obj.field(
-                cursor_pagination!(
-                types,
-                pluralize(rel.name.to_raw().to_camel_case()),
-                &node_ty_name,
-                make_connection_resolver(rel.name.to_raw(), ConnectionKind::Relation),
-                edge_fields: fd_vec,
-                args: [
-                    order_input!(&tb_name)
-                ],
-                is_relation: true
-            ));
-
-            define_order_input_types!(types, rel.name.to_raw(),fds_orderable);
-
-            for (_, obj) in fd_map {
-                types.push(Type::Object(obj));
-            }
+        for fd in tb_fds_query.into_iter() {
+            query_obj = query_obj.field(fd);
+        }
+        for fd in tb_fds_create_input.into_iter() {
+            create_input_obj = create_input_obj.field(fd);
+        }
+        for fd in tb_fds_update_input.into_iter() {
+            update_input_obj = update_input_obj.field(fd);
+        }
+        for fd in tb_fds_delete_input.into_iter() {
+            delete_input_obj = delete_input_obj.field(fd);
         }
 
-        // =======================================================
-        // Add types
-        // =======================================================
-        // for loop because Type::Object needs owned obj, not a reference
-        for (_, obj) in gql_objects {
+        types.push(Type::Object(query_obj));
+        types.push(Type::InputObject(create_input_obj));
+        types.push(Type::InputObject(update_input_obj));
+        types.push(Type::InputObject(delete_input_obj));
+        types.push(Type::Object(tb_create_payload_obj));
+        types.push(Type::Object(tb_update_payload_obj));
+        types.push(Type::Object(tb_delete_payload_obj));
+
+        for obj in tb_nested_objs.into_values() {
             types.push(Type::Object(obj));
         }
-        types.push(Type::Object(tb_ty_obj));
     }
 
-    Ok(query)
+    Ok((query, mutation))
 }
 
 /// A generic resolver for fields on any object type (table records or connection edges).
