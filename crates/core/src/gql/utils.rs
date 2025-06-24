@@ -16,7 +16,6 @@ use crate::sql::{Thing, Value as SqlValue};
 
 use super::error::GqlError;
 use async_graphql::{dynamic::indexmap::IndexMap, Name, Value as GqlValue};
-use md5::Digest;
 use reblessive::TreeStack;
 
 pub(crate) trait GqlValueUtils {
@@ -57,7 +56,7 @@ impl GqlValueUtils for GqlValue {
             None
         }
     }
-    
+
     fn as_name(&self) -> Option<&Name> {
         if let GqlValue::Enum(e) = self {
             Some(e)
