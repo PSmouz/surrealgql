@@ -40,7 +40,17 @@ fn dummy_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> +
     }
 }
 
-macro_rules! add_description {
+/// Generates a description string for a field definition.
+///
+/// This macro checks if the field definition has a comment and returns it as a formatted string.
+/// If the comment is not present, it returns an empty string or a provided default description.
+///
+/// # Parameters
+/// - `$fd`: The field definition to check for a comment.
+/// - `$desc`: (optional) A default description to return if the field definition does not have a comment.
+/// # Returns
+/// - A formatted string containing the comment or the default description.
+macro_rules! description {
     ($fd:ident) => {
         if let Some(ref c) = $fd.comment {
             format!("{c}")
@@ -115,9 +125,27 @@ macro_rules! input_input {
             TypeRef::named_nn(format!("{}{}Input", $ty.to_pascal_case(), $name.to_pascal_case())))
         .description("")
 	};
+    (
+        $name: expr
+    ) => {
+		InputValue::new("input",
+            TypeRef::named_nn($name))
+        .description("")
+	};
 }
 
-/// This macro needs the order input types to be defined with `define_order_input_types`.
+/// Generates an input value for ordering options based on the provided name.
+///
+/// This macro creates an `InputValue` for the `orderBy` argument,
+/// which is used to specify ordering options for connections.
+///
+/// **Important**: This macro needs the order input types to be defined
+/// with [`define_order_input_types!`].
+///
+/// # Parameters
+/// - `$name`: The name of the entity for which ordering options are defined.
+/// # Returns
+/// - An `InputValue` for the `orderBy` argument, which is used in GraphQL queries to specify.
 macro_rules! order_input {
 	($name: expr) => {
 		InputValue::new("orderBy", TypeRef::named(format!("{}Order", $name.to_pascal_case())))
@@ -131,12 +159,21 @@ macro_rules! filter_input {
 	};
 }
 
-/// This macro needs the order direction enum type defined.
+/// Defines the order input types for a given base name and fields.
+/// This macro generates an enum for the order fields and an input object for ordering options.
+///
+/// **Important**: This macro requires the order direction enum type defined.
+///
+/// # Parameters
+/// - `$types`: The types vector to which the order input types are added.
+/// - `$base_name`: The base name for the order fields and input object.
+/// - `$fields`: A vector of field names that can be used for ordering.
+/// # Returns
+/// - Adds an enum and an input object to the `$types` vector.
 macro_rules! define_order_input_types {
     (
         $types:ident,
         $base_name:expr,
-        // $( $fds:ident ),* $(,)?
         $fields:expr
     ) => {
         let base_name_pascal = $base_name.to_pascal_case();
@@ -145,9 +182,6 @@ macro_rules! define_order_input_types {
 
         let mut order_by_enum = Enum::new(&enum_name)
             .item(EnumItem::new("ID").description(format!("{} by ID.", $base_name)))
-            // $(.item(EnumItem::new(stringify!($fds).to_screaming_snake_case())
-            //     .description(format!("{} by {}.",
-            //     $base_name, stringify!($fds).to_screaming_snake_case()))))*
             .description(format!("Properties by which {} can be ordered.", $base_name));
 
         for field in $fields {
@@ -174,20 +208,22 @@ macro_rules! define_order_input_types {
 /// Adds a connection field to the specified object.
 ///
 /// # Parameters
-/// - (`obj`: The object to which the connection field is added.)
 /// - `types`: The types vector to which the connection and edge types are added.
 /// - `fd_name`: The name of the connection field.
 /// - `node_ty_name`: The name of the node type.
-/// - `connection_resolver`: The resolver for the connection field.
-/// - `edges`: Additional edge fields.
-/// - `args`: Additional connection arguments.
-#[macro_export]
+/// - `connection_resolver`: The resolver function for the connection field.
+/// - `edge_fields`: Additional edge fields to include in the connection. Should be a vector of
+/// `Field` objects.
+/// - `args`: Additional arguments to add to the connection field. Should be a vector of
+/// `InputValue` objects.
+/// - `is_relation`: A boolean indicating whether the connection is for a relation or not.
+/// # Returns
 macro_rules! cursor_pagination {
     (
         $types:ident,
         $fd_name:expr,
         $node_ty_name:expr,
-        $connection_resolver:expr, // The actual resolver for the connection field on $obj
+        $connection_resolver:expr,
         edge_fields: $edge_fields_expr:expr,
         args: [ $( $extra_connection_arg:expr ),* $(,)? ],
         is_relation: $is_relation:expr
@@ -281,18 +317,206 @@ macro_rules! cursor_pagination {
     };
 }
 
+/// This macro defines a CRUD operation for a singular field in a table.
+/// It generates the necessary input and payload objects, as well as the field definition
+/// for the operation.
+/// # Parameters
+/// - `$types`: The types vector to which the input and payload objects are added.
+/// - `$op`: The operation type, such as "update", "add", or "remove".
+/// - `$fd_name`: The name of the field.
+/// - `$tb_name`: The name of the table.
+/// - `$ty`: The type of the field.
+macro_rules! define_singular_field_crud {
+    (
+        $types:ident,
+        $op:literal,
+        $fd_name:ident,
+        $tb_name:ident,
+        $ty:expr
+    ) => {
+        {
+            let name = format!("{}{}", $tb_name.to_pascal_case(), $fd_name.to_pascal_case());
+            let input_obj = define_obj!(input, $op, $fd_name, $tb_name, $ty);
+            let payload_obj = define_obj!(payload, $op, $fd_name, $tb_name, $ty);
+
+            let fd = Field::new(
+                format!("{}{}", $op, &name),
+                TypeRef::named(payload_obj.type_name()),
+                dummy_resolver()
+            )
+            .description(format!("{}s the `{}` field of a `{}` table record.", $op.to_pascal_case(),
+                $fd_name, $tb_name))
+            .argument(input_input!($op.to_pascal_case(), &name));
+
+            $types.push(Type::InputObject(input_obj));
+            $types.push(Type::Object(payload_obj));
+
+            fd
+        }
+    };
+}
+
+/// This macro defines an object or input object for a CRUD operation.
+/// It generates the necessary fields and types based on the operation type and table name.
+/// # Parameters
+/// - `payload/input/query`: Defines whether the object is a payload, input object, or query object.
+/// - `$op`: The operation type, such as "create", "update", or "delete".
+/// - `$tb_name`: The name of the table.
+/// - `$fd_name`: The name of the field (optional, used for singular field operations).
+/// - `$ty`: The type of the field (optional, used for singular field operations).
+/// # Returns
+/// - An `Object` or `InputObject` type with the specified fields and types.
+macro_rules! define_obj {
+
+    (
+        payload,
+        $op:literal,
+        $tb_name:expr
+    ) => {
+         Object::new(format!("{}{}Payload", $op.to_pascal_case(), $tb_name))
+            .field(Field::new(
+                "success",
+                TypeRef::named(TypeRef::BOOLEAN),
+                dummy_resolver(), //TODO: implement resolver
+            ).description("Did the operation succeed?"))
+            .field(Field::new(
+                $tb_name.to_camel_case(),
+                TypeRef::named($tb_name),
+                dummy_resolver(),
+            ).description(format!("The {}d {}.", $op, $tb_name))
+            .description(format!("Autogenerated return type of {}{}.", $op.to_pascal_case(),$tb_name)))
+    };
+    (
+        input,
+        $op:literal,
+        $tb_name:expr
+    ) => {
+        InputObject::new(format!("{}{}Input", $op.to_pascal_case(), $tb_name))
+            .field(InputValue::new(
+            "id",
+            TypeRef::named(TypeRef::ID), // Align with SurrealDB and create ID if none is provided
+            ).description(format!("The `{}` table record ID to {}.", $tb_name, $op)))
+            .description(format!("Autogenerated input type of {}{}.", $op.to_pascal_case(),
+                $tb_name.to_pascal_case()))
+    };
+    (
+        query,
+        $tb_name:expr
+    ) => {
+        Object::new($tb_name)
+            .field(Field::new(
+                "id",
+                TypeRef::named_nn(TypeRef::ID),
+                make_field_resolver("id"),
+            ).description(format!("The {} ID.", $tb_name)))
+            .description(format!("Autogenerated query type for `{}`.", $tb_name))
+            .implement("Record")
+    };
+    (
+        payload,
+        $op:literal,
+        $fd_name:expr,
+        $tb_name:expr,
+        $ty:expr
+    ) => {
+        {
+            let name = format!("{}{}", $tb_name.to_pascal_case(), $fd_name.to_pascal_case());
+
+             Object::new(format!("{}{}Payload", $op.to_pascal_case(), &name))
+                .field(Field::new(
+                    "success",
+                    TypeRef::named(TypeRef::BOOLEAN),
+                    dummy_resolver(), //TODO: implement resolver
+                ).description("Did the operation succeed?"))
+                .field(Field::new(
+                    $fd_name.to_camel_case(),
+                    unwrap_type($ty), // Make type optional in payload
+                    dummy_resolver(),
+                ).description(format!("The {}d {}.", $op, $fd_name))
+                .description(format!("Autogenerated return type of {}{}.", $op.to_pascal_case(), &name)))
+        }
+    };
+    (
+        input,
+        $op:literal,
+        $fd_name:expr,
+        $tb_name:expr,
+        $ty:expr
+    ) => {
+        {
+            let name = format!("{}{}", $tb_name.to_pascal_case(), $fd_name.to_pascal_case());
+
+            let mut in_obj: InputObject = define_obj!(input, $op, &name);
+            in_obj = in_obj.field(InputValue::new(
+                $fd_name.to_camel_case(),
+                TypeRef::named_nn($ty.type_name()),
+            ).description(format!("The `{}` field of the `{}` table to {}.", $fd_name, $tb_name, $op)));
+
+            in_obj
+        }
+    };
+}
+
+/// This macro is used to add a field to an object, typically a mutation or query object.
+/// It allows for adding fields with a specific operation type (like "create", "update", or "delete")
+/// and an object that implements the `type_name` method.
+/// It can also be used to add a field without an operation type.
+/// # Parameters
+/// - `$root`: The root object to which the field is added (e.g., mutation or query).
+/// - `$op`: (optional) The operation type, such as "create", "update", or "delete".
+/// - `$obj`: The object to add, which should implement the `type_name` method.
+/// - `$tb_name`: (optional) The table name, used for naming conventions and descriptions.
+macro_rules! add_to_obj {
+    /// This macro is used to add a field to an object, typically a mutation or query object.
+    /// # Parameters
+    /// - `$root`: The root object to which the field is added (e.g., mutation or query).
+    /// - `$op`: The operation type, such as "create", "update", or "delete".
+    /// - `$obj`: The object to add, which should implement the `type_name` method.
+    /// - `$tb_name`: The table name, used for naming conventions and descriptions.
+    (
+        $root:ident,
+        $op:literal,
+        $obj:expr,
+        $tb_name:expr
+    ) => {
+        $root = $root.field(
+            Field::new(
+                format!("{}{}", $op, $tb_name.to_pascal_case()),
+                TypeRef::named($obj.type_name()),
+                dummy_resolver(), //TODO: implement resolver
+            )
+            .description(format!("{}s a record of the `{}` table.", $op.to_pascal_case(), $tb_name))
+            .argument(input_input!($op.to_pascal_case(), $tb_name))
+        );
+    };
+    /// This macro is used to add a field to an object, typically a mutation or query object.
+    /// # Parameters
+    /// - `$root`: The root object to which the field is added (e.g., mutation or query).
+    /// - `$obj`: The object to add, which should implement the `type_name` method.
+    (
+        $root:ident,
+        $obj:expr
+    ) => {
+        $root = $root.field($obj);
+    };
+}
+
 /// This macro is used to parse a field definition and add it to the object map.
 /// It handles different kinds of fields, including nested fields and array fields.
 /// It also manages the creation of connection fields for array types.
 ///
 /// # Parameters
 /// - `$fd`: The field definition to parse.
+/// - `$tb_name`: The name of the table.
 /// - `$types`: The types vector to which the field type is added.
 /// - `$cursor`: A boolean indicating whether to use cursor pagination.
-/// - `$tb_name`: The name of the table.
-/// - `$map`: The object map to which the field is added.
-/// - `$field_ident`: The identifier for the field.
-/// - `$action_tokens`: The action tokens to execute after parsing the field.
+/// - `$query_vec`: The vector of fields for the query object.
+/// - `$nested_objs_map`: The map of nested objects to which the field is added.
+/// - `$order_vec`: The vector of orderable fields for the table.
+/// - `$create_obj`: The input object for the createTable mutation.
+/// - `$update_obj`: The input object for the updateTable mutation.
+/// - `$mutation_add_vec`: The vector of addTableFieldName mutations for the table.
+/// - `$mutation_update_vec`: The vector of updateTableFieldName mutations for the table.
 macro_rules! parse_field {
     (
         $fd:ident,
@@ -301,7 +525,11 @@ macro_rules! parse_field {
         $cursor:ident,
         $query_vec:ident,
         $nested_objs_map:ident,
-        $order_vec:ident
+        $order_vec:ident,
+        $create_obj:ident,
+        $update_obj:ident,
+        $mutation_add_vec:ident,
+        $mutation_update_vec:ident
     ) => {
         let kind: Kind = match $fd.kind.clone() {
             Some(k) => k,
