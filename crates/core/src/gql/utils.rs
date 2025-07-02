@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::ctx::Context;
@@ -9,12 +10,13 @@ use crate::kvs::Datastore;
 use crate::kvs::LockType;
 use crate::kvs::TransactionType;
 use crate::sql;
-use crate::sql::Function;
 use crate::sql::Statement;
 use crate::sql::{FlowResultExt, Ident};
+use crate::sql::{Function, Kind};
 use crate::sql::{Thing, Value as SqlValue};
 
 use super::error::GqlError;
+use async_graphql::dynamic::{Type, TypeRef};
 use async_graphql::{dynamic::indexmap::IndexMap, Name, Value as GqlValue};
 use reblessive::TreeStack;
 
@@ -62,6 +64,26 @@ impl GqlValueUtils for GqlValue {
             Some(e)
         } else {
             None
+        }
+    }
+}
+
+pub(crate) trait GqlTypeRefUtils {
+    fn rename(&self, name: impl Into<String>) -> Self;
+}
+
+impl GqlTypeRefUtils for TypeRef {
+    fn rename(&self, name: impl Into<String>) -> Self {
+        match self {
+            TypeRef::Named(_) => {
+                TypeRef::Named(Cow::from(name.into()))
+            }
+            TypeRef::List(inner) => {
+                TypeRef::List(Box::new(inner.rename(name)))
+            }
+            TypeRef::NonNull(inner) => {
+                TypeRef::NonNull(Box::new(inner.rename(name)))
+            }
         }
     }
 }
@@ -162,5 +184,36 @@ pub fn pluralize(input: String) -> String {
         format!("{}List", plural)
     } else {
         plural
+    }
+}
+
+pub fn is_primitive(ty: &Kind) -> bool {
+    match ty {
+        Kind::Bool |
+        Kind::Datetime |
+        Kind::Decimal |
+        Kind::Duration |
+        Kind::Float |
+        Kind::Int |
+        Kind::Number |
+        Kind::String |
+        Kind::Uuid
+        => true,
+        _ => false
+    }
+}
+
+/// This function is needed because the `Type` enum in async-graphql only has a pub crate method
+///  name. Thus, it is inaccessible for us.
+pub fn get_type_name(t: &Type) -> &str {
+    match t {
+        Type::Scalar(s) => s.type_name(),
+        Type::Object(obj) => obj.type_name(),
+        Type::InputObject(io) => io.type_name(),
+        Type::Enum(e) => e.type_name(),
+        Type::Interface(i) => i.type_name(),
+        Type::Union(u) => u.type_name(),
+        Type::Subscription(s) => s.type_name(),
+        Type::Upload => "Upload",
     }
 }
