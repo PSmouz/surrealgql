@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::ops::Add;
 use std::sync::Arc;
 
 use super::error::{resolver_error, GqlError};
@@ -507,6 +506,17 @@ pub fn sql_value_to_gql_value(v: SqlValue) -> Result<GqlValue, GqlError> {
     Ok(out)
 }
 
+/// Converts a `Kind` to a `TypeRef` and registers it in the provided `types` vector.
+///
+/// For Records this function returns a union type if there are multiple fields, the table name
+/// Object if there is one field, or an ID type if there are no fields.
+///
+/// # Parameters
+/// - `kind`: The `Kind` to convert.
+/// - `types`: A mutable reference to a vector of `Type` where the new type will be registered.
+/// - `path`: A slice of `Ident` that represents the path to the type, used for naming.
+/// # Returns
+/// - A `Result` containing the `TypeRef` if successful, or a `GqlError` if an error occurs.
 pub fn kind_to_type(kind: Kind, types: &mut Vec<Type>, path: &[&Ident]) ->
 Result<TypeRef,
     GqlError> {
@@ -533,7 +543,7 @@ Result<TypeRef,
         Kind::String => TypeRef::named(TypeRef::STRING),
         Kind::Uuid => TypeRef::named("UUID"),
         Kind::Record(mut r) => match r.len() {
-            0 => TypeRef::named("Record"),
+            0 => TypeRef::named(TypeRef::ID),
             1 => TypeRef::named(r.pop().unwrap().0.to_pascal_case()),
             _ => {
                 let names: Vec<String> = r.into_iter().map(|t| t.0.to_pascal_case()).collect();
@@ -650,13 +660,6 @@ Result<TypeRef,
         false => TypeRef::NonNull(Box::new(out_ty)),
     };
     Ok(out)
-}
-
-pub fn unwrap_type(ty: TypeRef) -> TypeRef {
-    match ty {
-        TypeRef::NonNull(t) => unwrap_type(*t),
-        _ => ty,
-    }
 }
 
 macro_rules! either_try_kind {
