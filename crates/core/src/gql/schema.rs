@@ -26,7 +26,7 @@ use async_graphql::dynamic::{Enum, Type, Union};
 use async_graphql::dynamic::{EnumItem, Interface};
 use async_graphql::dynamic::{Field, InterfaceField, ResolverContext};
 use async_graphql::dynamic::{FieldFuture, Object};
-use async_graphql::dynamic::{Scalar, TypeRef};
+use async_graphql::dynamic::{InputObject, InputValue, Scalar, TypeRef};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
@@ -281,12 +281,11 @@ pub async fn generate_schema(
 						})
 					})),
 			);
-			// $schema = $schema.register(
-			// 	InputObject::new(format!("{}_input", $name))
-			// 		.field(InputValue::new("type", TypeRef::named("GeometryType")))
-			// 		// .field(InputValue::new("geotype", TypeRef::named(TypeRef::STRING)))
-			// 		.field(InputValue::new("coordinates", $type.clone())),
-			// );
+			$schema = $schema.register(
+				InputObject::new(format!("Geometry{}Input", $name))
+					.field(InputValue::new("type", TypeRef::named("GeometryType")))
+					.field(InputValue::new("coordinates", $type.clone())),
+			);
 		};
 	}
 
@@ -900,10 +899,10 @@ pub fn gql_to_sql_kind(val: &GqlValue, kind: Kind) -> Result<SqlValue, GqlError>
         Kind::Geometry(ref ts) => match &val {
             GqlValue::Object(map) => match map.get("type") {
                 Some(t) => match t {
-                    GqlValue::String(acutal_t) => {
+                    GqlValue::String(actual_t) => {
                         let mut included = false;
                         for ty in ts {
-                            if geometry::geometry_kind_name_to_type_name(ty)? == acutal_t {
+                            if geometry::geometry_kind_name_to_type_name(ty)? == actual_t {
                                 included = true;
                                 break;
                             }
