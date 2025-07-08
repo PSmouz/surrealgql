@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::ctx::Context;
@@ -70,6 +71,18 @@ impl GqlValueUtils for GqlValue {
 
 pub(crate) trait GqlTypeRefUtils {
     fn rename(&self, name: impl Into<String>) -> Self;
+    fn to_non_null(&self) -> Self;
+    /// Unwraps a `TypeRef` from a `NonNull` type, returning the inner type.
+    /// If the type is not `NonNull`, it returns the type as is.
+    ///
+    /// This is useful for handling cases where you want to work with the underlying type
+    /// without the `NonNull` wrapper.
+    ///
+    /// # Parameters:
+    /// - `ty`: The `TypeRef` to unwrap.
+    /// # Returns:
+    /// - The unwrapped `TypeRef` if it was `NonNull`, or the original type if not.
+    fn to_optional(&self) -> Self;
 }
 
 impl GqlTypeRefUtils for TypeRef {
@@ -84,6 +97,24 @@ impl GqlTypeRefUtils for TypeRef {
             TypeRef::NonNull(inner) => {
                 TypeRef::NonNull(Box::new(inner.rename(name)))
             }
+        }
+    }
+
+    /// Converts a `TypeRef` to a non-nullable type.
+    fn to_non_null(&self) -> Self {
+        match self {
+            TypeRef::Named(_) => TypeRef::NonNull(Box::new(self.clone())),
+            TypeRef::List(inner) => TypeRef::List(Box::new(inner.to_non_null())),
+            TypeRef::NonNull(_) => self.clone(),
+        }
+    }
+
+    /// Converts a `TypeRef` to an optional type.
+    fn to_optional(&self) -> Self {
+        match self {
+            // TypeRef::NonNull(t) => t.into_inner().to_optional(),
+            TypeRef::NonNull(t) => t.deref().to_optional(),
+            _ => self.clone(),
         }
     }
 }
