@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
 use super::GqlError;
-use crate::dbs::Session;
 use crate::gql::schema::kind_to_type;
 use crate::gql::utils::GQLTx;
-use crate::kvs::Datastore;
 use crate::sql::statements::DefineFunctionStatement;
 use crate::sql::Value as SqlValue;
 use async_graphql::dynamic::FieldFuture;
@@ -19,28 +17,22 @@ pub async fn process_fns(
     fns: Arc<[DefineFunctionStatement]>,
     mut query: Object,
     types: &mut Vec<Type>,
-    session: &Session,
-    datastore: &Arc<Datastore>,
 ) -> Result<Object, GqlError> {
     for fnd in fns.iter() {
         let Some(kind) = &fnd.returns else {
             // TODO: handle case where there are no typed functions and give graceful error
             continue;
         };
-        let sess1 = session.clone();
-        let kvs1 = datastore.clone();
         let fnd1 = fnd.clone();
         let kind1 = kind.clone();
         let mut field = Field::new(
             format!("fn_{}", fnd.name),
             kind_to_type(kind.clone(), types, &[&fnd1.name])?,
             move |ctx| {
-                let sess1 = sess1.clone();
-                let kvs1 = kvs1.clone();
                 let fnd1 = fnd1.clone();
                 let kind1 = kind1.clone();
                 FieldFuture::new(async move {
-                    let gtx = GQLTx::new(&kvs1, &sess1).await?;
+                    let gtx = ctx.data::<GQLTx>()?;
                     let gql_args = ctx.args.as_index_map();
                     let mut args = Vec::new();
 
@@ -57,6 +49,14 @@ pub async fn process_fns(
 
                     let gql_res = match res {
                         SqlValue::Thing(rid) => {
+                            // let mut tmp = rid.clone();
+                            // match kind1 {
+                            //     Kind::Record(ts) if ts.len() != 1 => {
+                            //         tmp = tmp.with_type(rid.tb.clone())
+                            //     }
+                            //     _ => {}
+                            // }
+                            // Some(tmp)
                             // let mut tmp = field_val_erase_owned((gtx.clone(), rid.clone()));
                             // match kind1 {
                             //     Kind::Record(ts) if ts.len() != 1 => {

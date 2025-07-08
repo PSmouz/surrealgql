@@ -118,7 +118,7 @@ pub async fn generate_schema(
     }
 
     if let Some(fns) = fns {
-        query = process_fns(fns, query, &mut types, session, datastore).await?;
+        query = process_fns(fns, query, &mut types).await?;
     }
 
     // trace!("current Query object for schema: {:?}", query);
@@ -134,7 +134,6 @@ pub async fn generate_schema(
     // Custom Scalar types
     // =======================================================
 
-    #[macro_export]
     macro_rules! scalar_debug_validated {
 		($schema:ident, $name:expr, $kind:expr) => {
 			scalar_debug_validated!(
