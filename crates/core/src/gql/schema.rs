@@ -601,6 +601,8 @@ Result<TypeRef,
                                 "just checked that this is a Kind::Literal(Literal::String(_))"
                             );
                         };
+                        // FIXME: Here we force ENUM naming convetions, when resolving values
+                        // we must accord for this, rn its broken if not SNAKE_CASE from the start
                         out.0.to_string().to_screaming_snake_case()
                     })
                     .collect();

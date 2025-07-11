@@ -822,7 +822,7 @@ pub async fn process_tbs(
                 }) {
                     parse_field!(
                         fd,
-                        tb_name,
+                        rel_name,
                         types,
                         cursor,
                         rel_fds,
