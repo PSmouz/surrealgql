@@ -27,6 +27,7 @@ pub(crate) trait GqlValueUtils {
     fn as_list(&self) -> Option<&Vec<GqlValue>>;
     fn as_object(&self) -> Option<&IndexMap<Name, GqlValue>>;
     fn as_name(&self) -> Option<&Name>;
+    fn is_null(&self) -> bool;
 }
 
 impl GqlValueUtils for GqlValue {
@@ -37,7 +38,6 @@ impl GqlValueUtils for GqlValue {
             None
         }
     }
-
     fn as_string(&self) -> Option<String> {
         if let GqlValue::String(s) = self {
             Some(s.to_owned())
@@ -59,13 +59,15 @@ impl GqlValueUtils for GqlValue {
             None
         }
     }
-
     fn as_name(&self) -> Option<&Name> {
         if let GqlValue::Enum(e) = self {
             Some(e)
         } else {
             None
         }
+    }
+    fn is_null(&self) -> bool {
+        matches!(self, GqlValue::Null)
     }
 }
 

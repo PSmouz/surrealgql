@@ -108,10 +108,16 @@ macro_rules! start_input {
 }
 
 macro_rules! input {
-	() => {
-		InputValue::new("id", TypeRef::named(TypeRef::ID))
-        .description("The ID of the record to fetch. Can be a string ID or a record ID in the \
-        format 'table:id'. If an ID is provided, other unique field inputs are ignored.")
+    (NON_NULL) => {
+        InputValue::new("id", TypeRef::named_nn(TypeRef::ID))
+            .description("The required ID of the record. Can be a string ID or a record ID in the format 'table:id'.")
+    };
+    (OPTIONAL) => {
+        InputValue::new("id", TypeRef::named(TypeRef::ID))
+            .description("The ID of the record. Can be a string or a record ID ('table:id'). Only one unique identifier (id, or another unique field) can be provided.")
+    };
+    () => {
+		input!(OPTIONAL)
 	};
     (
         $fd_name: expr,
@@ -522,7 +528,7 @@ macro_rules! parse_field {
         $tb_name:ident,
         $types:ident,
         $cursor:ident,
-        $unique_map:ident,
+        $idx_map:ident,
         $query_vec:ident,
         $nested_objs_map:ident,
         $order_vec:ident,
@@ -656,13 +662,14 @@ macro_rules! parse_field {
             // Doing it here for double security, but should work outside of the if as well, as only
             // top level fields can be indexed?! However, it should be after the fd_type record
             // setter.
-            if $unique_map.contains_key(&fd_name) {
+            if $idx_map.contains_key(&fd_name) {
                 // The key in the map is the raw field name from the database, which is
                 // needed for the SQL query. The value is the GraphQL InputValue, which
                 // contains the camel-cased name for the schema.
-                $unique_map.insert(
+                $idx_map.insert(
                     fd_name.clone(),
-                    Some(input!(&fd_name, fd_ty.clone().to_optional())),
+                    Some(fd_ty.clone()),
+                    // Some(input!(&fd_name, fd_ty.clone().to_optional())),
                 );
             }
             // Cannot use query object here directly, because parse field for relations
@@ -766,9 +773,12 @@ pub async fn process_tbs(
         let mut tb_fds_orderable = Vec::<String>::new();
         let mut tb_fds_mutation_add = Vec::<Field>::new();
         let mut tb_fds_mutation_update = Vec::<Field>::new();
-        // Collects all fields that have unique indexes on them so they can also be as query input
-        // for single table queries and collects their input fields
-        let mut tb_fds_unique = BTreeMap::<String, Option<InputValue>>::new();
+        // Collects all fields that are columns in unique indexes thus needing an input value
+        // e.g., k: "email", v: Some(InputValue::new("email", TypeRef::STRING))
+        let mut tb_fds_index = BTreeMap::<String, Option<TypeRef>>::new();
+        // Collects all unique indexes. k: fd_name combined, v: column names (keys in the tb_fds_index)
+        // e.g., cols: ["name", "email"] -> k: "NameEmail", v: ["name", "email"]
+        let mut indexes = BTreeMap::<String, Vec<String>>::new();
 
         let fds = tx.all_tb_fields(ns, db, &tb.name.0, None).await?;
         let idxs = tx.all_tb_indexes(ns, db, &tb.name.0).await?;
@@ -791,14 +801,16 @@ pub async fn process_tbs(
 
         for idx in idxs.iter().filter(|stmt| stmt.index == Index::Uniq) {
             let idx_cols = idx.cols.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+            let idx_name = idx_cols.iter().map(|c| c.to_pascal_case()).collect::<String>();
 
-            if idx_cols.len() != 1 {
-                warn!("Skipping index `{}` on table `{}` with multiple columns: {:?}. Only single column indexes are supported.", idx.name, tb_name, idx_cols);
-                continue;
+            for col in idx_cols.iter() {
+                tb_fds_index.insert(col.clone(), None);
             }
 
-            let idx_name = idx_cols.first().unwrap();
-            tb_fds_unique.insert(idx_name.clone(), None);
+            indexes.insert(
+                idx_name,
+                idx_cols,
+            );
         }
 
         // =======================================================
@@ -814,7 +826,7 @@ pub async fn process_tbs(
                 tb_name,
                 types,
                 cursor,
-                tb_fds_unique,
+                tb_fds_index,
                 tb_fds_query, // Cannot use query obj here directly, because the second call for
                 // relations needs a vec to store the fields to
                 tb_nested_objs,
@@ -863,7 +875,7 @@ pub async fn process_tbs(
                 let mut temp2 = InputObject::new("temp2"); //TODO: remove
                 let mut temp3 = Vec::<Field>::new(); //TODO: remove
                 let mut temp4 = Vec::<Field>::new(); //TODO: remove
-                let mut rel_fds_unique = BTreeMap::<String, Option<InputValue>>::new();
+                let mut rel_fds_unique = BTreeMap::<String, Option<TypeRef>>::new();
 
                 for fd in fds.iter().filter(|fd| {
                     // for cursor pagination, we only need the edge fields
@@ -945,115 +957,67 @@ pub async fn process_tbs(
         // Add single query
         // =======================================================
 
-        let unique_fd_names_for_resolver = tb_fds_unique
+        let unique_fd_names_for_resolver = tb_fds_index
             .iter()
             // We only care about fields for which we successfully created an InputValue.
             .filter(|(_, v)| v.is_some())
             .map(|(k, _)| k.clone())
             .collect::<Vec<String>>();
 
+        // Add table query
         let mut single_query_fd = Field::new(
             tb_name_query.to_singular(),
             TypeRef::named(&tb_name_gql),
-            move |ctx| {
-                let tb_name = first_tb_name.clone();
-                let unique_fd_names = unique_fd_names_for_resolver.clone();
-                FieldFuture::new({
-                    async move {
-                        let gtx = ctx.data::<GQLTx>()?;
-                        let args = ctx.args.as_index_map();
-
-                        if let Some(id) = args.get("id").and_then(GqlValueUtils::as_string) {
-                            let thing = match id.clone().try_into() {
-                                Ok(t) => t,
-                                Err(_) => Thing::from((tb_name, id)),
-                            };
-
-                            return match gtx.get_record_field(thing, "id").await? {
-                                SqlValue::Thing(t) => {
-                                    Ok(Some(FieldValue::owned_any(t)))
-                                }
-                                _ => Ok(None),
-                            };
-                        }
-
-                        // Collect all provided unique identifiers from the arguments.
-                        // The value is a tuple of (db_column_name, gql_value).
-                        let mut provided_identifiers = Vec::new();
-
-                        for (fd_name) in &unique_fd_names {
-                            // args has gql fd_names -> convert with to_camel_case
-                            match (args.get(&Name::new(fd_name.to_camel_case()))) {
-                                Some(GqlValue::Null) => {} // Field exists but value is null, so we skip it
-                                Some(val) => {
-                                    provided_identifiers.push((fd_name.as_str(), val.clone()));
-                                }
-                                None => {} // Field defined but not provided in args
-                            }
-                        }
-
-                        if provided_identifiers.is_empty() {
-                            return Err(input_error(
-                                "A unique identifier argument (e.g., 'id', or other unique fields) is required.",
-                            )
-                                .into());
-                        }
-                        if provided_identifiers.len() > 1 {
-                            return Err(input_error(
-                                "Only one unique identifier argument can be provided at a time.",
-                            )
-                                .into());
-                        }
-
-                        let (fd_name, gql_value) = provided_identifiers.remove(0);
-                        let sql_val = gql_to_sql_kind(&gql_value, Kind::Any)?;
-
-                        let ast = Statement::Select(SelectStatement {
-                            what: vec![SqlValue::Table(tb_name.intox())].into(),
-                            expr: Fields(
-                                vec![sql::Field::Single {
-                                    expr: SqlValue::Idiom(Idiom::from("id")),
-                                    alias: None,
-                                }],
-                                true, // Corresponds to SELECT VALUE id ...
-                            ),
-                            cond: Some(Cond(SqlValue::from(Expression::Binary {
-                                l: SqlValue::Idiom(Idiom::from(fd_name)),
-                                o: Operator::Equal,
-                                r: sql_val,
-                            }))),
-                            limit: Some(1.intox()),
-                            ..Default::default()
-                        });
-
-                        trace!("generated single record query ast: {ast:?}");
-                        let res = gtx.process_stmt(ast).await?;
-                        trace!("query result: {res:?}");
-
-                        return match res {
-                            // The result of SELECT VALUE is an array.
-                            SqlValue::Array(mut arr) if !arr.0.is_empty() => {
-                                let record_id_val = arr.0.remove(0);
-                                match record_id_val.try_as_thing() {
-                                    Ok(t) => Ok(Some(FieldValue::owned_any(t))),
-                                    Err(v) =>
-                                        Err(internal_error(format!("expected thing, found: {v:?}")).into()),
-                                }
-                            }
-                            _ => Ok(None),
-                        };
-                    }
-                })
-            },
+            make_single_query_resolver(
+                first_tb_name.clone(),
+                SingleQueryKind::ByArbitraryIndex(unique_fd_names_for_resolver),
+                indexes.clone(),
+            ),
         )
-            .description(description!(tb, format!("Generated from table `{}`\nallows querying a single record in a table by ID", &tb_name)))
-            .argument(input!()); // The default ID input argument
+            .description(description!(tb, format!("Generated from table `{}` allows querying a single record.", &tb_name)))
+            .argument(input!(OPTIONAL)); // The default ID input argument
 
-        for input_val in tb_fds_unique.into_values().flatten() {
-            single_query_fd = single_query_fd.argument(input_val);
+        for (fd_name, opt_ty) in tb_fds_index.iter() {
+            if let Some(ty) = opt_ty {
+                single_query_fd = single_query_fd.argument(input!(fd_name.as_str(), ty.clone().to_optional()));
+            }
         }
-
         add_to_obj!(query, single_query_fd);
+
+        // Add tableById query
+        add_to_obj!(query, Field::new(
+                format!("{}ById", tb_name_query.to_singular()),
+                TypeRef::named(&tb_name_gql),
+                make_single_query_resolver(
+                    first_tb_name.clone(),
+                    SingleQueryKind::ById,
+                    BTreeMap::new(), // Indexes not needed for this kind
+                ),
+            )
+            .description(description!(tb, format!("Generated from table `{}` allows querying a single record by ID.", &tb_name)))
+            .argument(input!(NON_NULL))
+        );
+
+        // Add tableByIndex queries
+        for (idx_name, fd_names) in indexes.iter() {
+            let mut single_query_fd = Field::new(
+                format!("{}By{}", tb_name_query.to_singular(), idx_name),
+                TypeRef::named(&tb_name_gql),
+                make_single_query_resolver(
+                    first_tb_name.clone(),
+                    SingleQueryKind::BySpecificIndex(fd_names.clone()),
+                    BTreeMap::new(), // Indexes not needed for this kind
+                ),
+            )
+                .description(description!(tb, format!("Generated from table `{}` allows querying a single record by {}.", &tb_name, idx_name)));
+
+            for fd_name in fd_names.iter() {
+                if let Some(Some(ty)) = tb_fds_index.get(fd_name) {
+                    single_query_fd = single_query_fd.argument(input!(fd_name, ty.clone().to_non_null()));
+                }
+            }
+            add_to_obj!(query, single_query_fd);
+        }
 
         // =======================================================
         // Add list query
@@ -1710,4 +1674,171 @@ fn order_by(order_by_arg: Option<&IndexMap<Name, GqlValue>>) -> Option<Ordering>
             Some(Ordering::Order(OrderList(vec![order])))
         }
     }
+}
+
+/// Defines the behavior of the single-record query resolver.
+#[derive(Clone)]
+enum SingleQueryKind {
+    /// The query must have a non-null `id` argument.
+    ById,
+    /// The query must have a set of non-null arguments that match a specific unique index.
+    BySpecificIndex(Vec<String>),
+    /// The query accepts optional arguments for `id` or any complete unique index,
+    /// but exactly one identifier (either `id` or one full index) must be provided.
+    ByArbitraryIndex(Vec<String>),
+}
+
+fn make_single_query_resolver(
+    tb_name: String,
+    kind: SingleQueryKind,
+    indexes: BTreeMap<String, Vec<String>>,
+) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
+    move |ctx: ResolverContext| {
+        let tb_name = tb_name.clone();
+        let kind = kind.clone();
+        let indexes = indexes.clone();
+        FieldFuture::new(async move {
+            let gtx = ctx.data::<GQLTx>()?;
+            let args = ctx.args.as_index_map();
+
+            let cond = match &kind {
+                SingleQueryKind::ById => {
+                    let id = args.get("id").and_then(GqlValueUtils::as_string)
+                        .ok_or_else(|| input_error("Resolver expected 'id' argument."))?;
+
+                    // Here we use the id query "shortcut" and directly query for its db entry.
+                    let thing = match id.clone().try_into() {
+                        Ok(t) => t,
+                        Err(_) => Thing::from((tb_name, id)),
+                    };
+
+                    return match gtx.get_record_field(thing, "id").await? {
+                        SqlValue::Thing(t) => {
+                            Ok(Some(FieldValue::owned_any(t)))
+                        }
+                        _ => Ok(None),
+                    };
+                }
+                SingleQueryKind::BySpecificIndex(required_fds) => {
+                    let mut conditions = Vec::new();
+
+                    for fd_name in required_fds {
+                        let gql_name = fd_name.to_camel_case();
+                        let arg_val = args.get(&Name::new(&gql_name))
+                            .ok_or_else(|| input_error(format!("Resolver expected '{gql_name}' argument.")))?;
+                        conditions.push((fd_name.clone(), arg_val.clone()));
+                    }
+
+                    build_sql_where_clause(&conditions)?
+                }
+                SingleQueryKind::ByArbitraryIndex(input_fds) => {
+                    // Handle 'id' as the highest priority. If present, use it and ignore others.
+                    // Here we use the id query "shortcut" and directly query for its db entry.
+                    if let Some(id) = args.get("id").and_then(GqlValueUtils::as_string) {
+                        let thing = match id.clone().try_into() {
+                            Ok(t) => t,
+                            Err(_) => Thing::from((tb_name, id)),
+                        };
+
+                        return match gtx.get_record_field(thing, "id").await? {
+                            SqlValue::Thing(t) => {
+                                Ok(Some(FieldValue::owned_any(t)))
+                            }
+                            _ => Ok(None),
+                        };
+                    }
+
+                    let provided_args: BTreeMap<String, GqlValue> = input_fds.iter()
+                        .filter_map(|fd_name| {
+                            args.get(&Name::new(fd_name.to_camel_case()))
+                                .filter(|v| !v.is_null()).map(|val| (fd_name.clone(), val.clone()))
+                        })
+                        .collect();
+
+                    if provided_args.is_empty() {
+                        return Err(input_error("A unique identifier argument (e.g., 'id', or a complete unique index) is required.").into());
+                    }
+
+                    let mut satisfied_indexes = Vec::new();
+                    for idx_fds in indexes.values() {
+                        if idx_fds.iter().all(|f| provided_args.contains_key(f)) {
+                            satisfied_indexes.push(idx_fds);
+                        }
+                    }
+
+                    if satisfied_indexes.len() != 1 {
+                        return Err(input_error(format!("You must provide arguments for exactly one unique index. Found {} satisfied indexes.", satisfied_indexes.len())).into());
+                    }
+
+                    let target_idx_fds = satisfied_indexes.remove(0);
+                    if target_idx_fds.len() != provided_args.len() {
+                        return Err(input_error("Extraneous arguments provided. Please provide only the fields for one unique index.").into());
+                    }
+
+                    let conditions: Vec<(String, GqlValue)> = provided_args.into_iter().collect();
+                    build_sql_where_clause(&conditions)?
+                }
+            };
+
+            let ast = Statement::Select(SelectStatement {
+                what: vec![SqlValue::Table(tb_name.intox())].into(),
+                expr: Fields(
+                    vec![sql::Field::Single {
+                        expr: SqlValue::Idiom(Idiom::from("id")),
+                        alias: None,
+                    }],
+                    true,  // Corresponds to SELECT VALUE id ...
+                ),
+                cond: Some(cond),
+                limit: Some(1.intox()),
+                ..Default::default()
+            });
+
+            let res = gtx.process_stmt(ast).await?;
+
+            return match res {
+                // The result of SELECT VALUE is an array.
+                SqlValue::Array(mut arr) if !arr.0.is_empty() => {
+                    let record_id_val = arr.0.remove(0);
+                    match record_id_val.try_as_thing() {
+                        Ok(t) => Ok(Some(FieldValue::owned_any(t))),
+                        Err(v) =>
+                            Err(internal_error(format!("expected thing, found: {v:?}")).into()),
+                    }
+                }
+                _ => Ok(None),
+            };
+        })
+    }
+}
+
+// TODO: make even more arbitrary. The accumulater operation should be selectable like AND/OR etc.
+// then split into binop and aggregate functions.
+/// Builds a SQL WHERE clause from a list of GraphQL arguments.
+///
+/// The conditions are combined using the AND operator. This function will return
+/// an error if the provided list of conditions is empty.
+fn build_sql_where_clause(conditions: &[(String, GqlValue)]) -> Result<Cond, GqlError> {
+    if conditions.is_empty() {
+        return Err(internal_error("Cannot build a WHERE clause from an empty set of conditions.").into());
+    }
+
+    let mut expressions = Vec::new();
+    for (fd_name, gql_val) in conditions {
+        let sql_val = gql_to_sql_kind(gql_val, Kind::Any)?;
+        expressions.push(Expression::Binary {
+            l: SqlValue::Idiom(Idiom::from(fd_name.as_str())),
+            o: Operator::Equal,
+            r: sql_val,
+        });
+    }
+
+    // `unwrap` is safe here because we checked for an empty slice at the start.
+    let combined_expr = expressions.into_iter().reduce(|acc, expr| Expression::Binary {
+        l: acc.into(),
+        o: Operator::And,
+        r: expr.into(),
+    }).unwrap();
+
+    Ok(Cond(SqlValue::from(combined_expr)))
 }
