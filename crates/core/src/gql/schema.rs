@@ -194,6 +194,42 @@ pub async fn generate_schema(
     scalar_debug_validated!(schema, "Object", Kind::Object);
     scalar_debug_validated!(schema, "Any", Kind::Any);
 
+    macro_rules! register_scalar_filter_input_type {
+        ($schema:ident, $ty_ref:expr) => {
+            let name = $ty_ref.type_name();
+
+            $schema = $schema.register(
+                InputObject::new(format!("{}FilterInput", name))
+                    .field(InputValue::new("eq", TypeRef::named(name))
+                        .description("Matches values that are equal to the given value."))
+                    .field(InputValue::new("ne", TypeRef::named(name))
+                        .description("Matches values that are not equal to the given value."))
+                    .field(InputValue::new("in", TypeRef::named_list(name))
+                        .description("Matches any of the given values."))
+                    .field(InputValue::new("nin", TypeRef::named_list(name))
+                        .description("Matches none of the given values."))
+                    .field(InputValue::new("regex", TypeRef::named(name))
+                        .description("Matches values that match the given regular expression."))
+                    .field(InputValue::new("glob", TypeRef::named(name))
+                        .description("Matches values that match the given glob pattern."))
+            );
+        };
+    }
+
+    register_scalar_filter_input_type!(schema, TypeRef::named(TypeRef::ID));
+    register_scalar_filter_input_type!(schema, TypeRef::named(TypeRef::STRING));
+    register_scalar_filter_input_type!(schema, TypeRef::named(TypeRef::INT));
+    register_scalar_filter_input_type!(schema, TypeRef::named(TypeRef::FLOAT));
+    register_scalar_filter_input_type!(schema, TypeRef::named(TypeRef::BOOLEAN));
+    register_scalar_filter_input_type!(schema, TypeRef::named("UUID"));
+    register_scalar_filter_input_type!(schema, TypeRef::named("Bytes"));
+    register_scalar_filter_input_type!(schema, TypeRef::named("Decimal"));
+    register_scalar_filter_input_type!(schema, TypeRef::named("Number"));
+    register_scalar_filter_input_type!(schema, TypeRef::named("DateTime"));
+    register_scalar_filter_input_type!(schema, TypeRef::named("Duration"));
+    // register_scalar_filter_input_type!(schema, TypeRef::named_nn("Object"));
+    // register_scalar_filter_input_type!(schema, TypeRef::named_nn("Any"));
+
     // =======================================================
     // Cursor/Custom types
     // =======================================================

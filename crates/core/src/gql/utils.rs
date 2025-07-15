@@ -220,22 +220,6 @@ pub fn pluralize(input: String) -> String {
     }
 }
 
-pub fn is_primitive(ty: &Kind) -> bool {
-    match ty {
-        Kind::Bool |
-        Kind::Datetime |
-        Kind::Decimal |
-        Kind::Duration |
-        Kind::Float |
-        Kind::Int |
-        Kind::Number |
-        Kind::String |
-        Kind::Uuid
-        => true,
-        _ => false
-    }
-}
-
 /// This function is needed because the `Type` enum in async-graphql only has a pub crate method
 ///  name. Thus, it is inaccessible for us.
 pub fn get_type_name(t: &Type) -> &str {
@@ -250,3 +234,54 @@ pub fn get_type_name(t: &Type) -> &str {
         Type::Upload => "Upload",
     }
 }
+
+pub(crate) trait KindUtils {
+    fn is_scalar(&self) -> bool;
+    fn scalar_to_filter_input_name(&self) -> Option<String>;
+}
+
+impl KindUtils for Kind {
+    /// Checks if the `Kind` is a scalar type.
+    fn is_scalar(&self) -> bool {
+        matches!(
+            self,
+            Kind::Bool
+                | Kind::Bytes
+                | Kind::Datetime
+                | Kind::Decimal
+                | Kind::Duration
+                | Kind::Float
+                | Kind::Int
+                | Kind::Number
+                | Kind::Record(_)
+                | Kind::String
+                | Kind::Uuid
+        )
+    }
+
+    /// Maps a database `Kind` to the corresponding GraphQL `...ScalarInput` object name.
+    ///
+    /// This function directly mirrors the naming convention established by your
+    /// `register_scalar_input_type!` macro.
+    fn scalar_to_filter_input_name(&self) -> Option<String> {
+        let base_type_name = match &self.non_optional() {
+            Kind::String => "String",
+            Kind::Int => "Int",
+            Kind::Float => "Float",
+            Kind::Bool => "Boolean",
+            Kind::Uuid => "Uuid",
+            Kind::Bytes => "Bytes",
+            Kind::Decimal => "Decimal",
+            Kind::Number => "Number",
+            Kind::Datetime => "DateTime",
+            Kind::Duration => "Duration",
+            Kind::Record(_) => "ID",
+            // Other types like Object, Array, etc., are not simple scalars and have no filter input.
+            _ => return None,
+        };
+
+        Some(format!("{}FilterInput", base_type_name))
+    }
+}
+
+

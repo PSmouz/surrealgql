@@ -8,7 +8,7 @@ use crate::gql::cursor::{apply_cursors_to_edges, make_list_resolver, make_object
 use crate::gql::error::internal_error;
 use crate::gql::ext::TryAsExt;
 use crate::gql::schema::kind_to_type;
-use crate::gql::utils::{is_primitive, pluralize, GQLTx, GqlTypeRefUtils, GqlValueUtils};
+use crate::gql::utils::{pluralize, GQLTx, GqlTypeRefUtils, GqlValueUtils, KindUtils};
 use crate::gql::{cursor, utils};
 use crate::kvs::Transaction;
 use crate::sql::order::{OrderList, Ordering};
@@ -19,6 +19,7 @@ use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
 use crate::sql::{Statement, Thing};
 use async_graphql::dynamic::indexmap::IndexMap;
+use async_graphql::dynamic::Type::Scalar;
 use async_graphql::dynamic::TypeRef;
 use async_graphql::dynamic::{Enum, FieldValue, Type};
 use async_graphql::dynamic::{EnumItem, FieldFuture};
@@ -178,17 +179,49 @@ macro_rules! filter_input {
 ///
 /// **Important**: This macro requires the order direction enum type defined.
 ///
+/// # Example
+///
+/// Given the following inputs:
+///
+/// - **`base_name`**: `"Home"`
+/// - **`fields`**: `&["name", "created_at"]`
+///
+/// The macro generates the equivalent of this GraphQL schema:
+///
+/// ```graphql
+/// """Properties by which Home can be ordered."""
+/// enum HomeOrderField {
+///   """Order Home by ID."""
+///   ID
+///
+///   """Order Home by name."""
+///   NAME
+///
+///   """Order Home by created_at."""
+///   CREATED_AT
+/// }
+///
+/// """Ordering options for Home connections."""
+/// input HomeOrder {
+///   """The field to order Home by."""
+///   field: HomeOrderField
+///
+///   """The ordering direction."""
+///   direction: OrderDirection
+/// }
+/// ```
+///
 /// # Parameters
 /// - `$types`: The types vector to which the order input types are added.
 /// - `$base_name`: The base name for the order fields and input object.
-/// - `$fields`: A vector of field names that can be used for ordering.
+/// - `orderable_fds`: A vector of field names that can be used for ordering.
 /// # Returns
 /// - Adds an enum and an input object to the `$types` vector.
 macro_rules! define_order_input_types {
     (
         $types:ident,
         $base_name:expr,
-        $fields:expr
+        $orderable_fds:expr
     ) => {
         let base_name_pascal = $base_name.to_pascal_case();
         let enum_name = format!("{}OrderField", base_name_pascal);
@@ -198,10 +231,10 @@ macro_rules! define_order_input_types {
             .item(EnumItem::new("ID").description(format!("{} by ID.", $base_name)))
             .description(format!("Properties by which {} can be ordered.", $base_name));
 
-        for field in $fields {
+        for (fd, _) in $orderable_fds {
             order_by_enum = order_by_enum.item(
-                EnumItem::new(field.to_screaming_snake_case())
-                .description(format!("{} by {}.", $base_name, field.to_screaming_snake_case()))
+                EnumItem::new(fd.to_screaming_snake_case())
+                .description(format!("{} by {}.", $base_name, fd.to_screaming_snake_case()))
             );
         }
 
@@ -216,6 +249,32 @@ macro_rules! define_order_input_types {
                 .description("The ordering direction."))
             .description(format!("Ordering options for {} connections", $base_name));
         $types.push(Type::InputObject(order_by_obj))
+    };
+}
+
+macro_rules! define_filter_input_types {
+    (
+        $types:ident,
+        $base_name:expr,
+        $filterable_fds:expr
+    ) => {
+        let base_name_pascal = $base_name.to_pascal_case();
+        let obj_name = format!("{}Filter", base_name_pascal);
+
+        let mut filter_by_obj = InputObject::new(&obj_name)
+            .description(format!("The filters that are available when fetching {}.", $base_name));
+
+        for (fd, kind) in $filterable_fds {
+            assert!(kind.is_scalar(), "Filterable fields must be scalar types.");
+
+            filter_by_obj = filter_by_obj.field(
+                InputValue::new(fd.to_camel_case(), TypeRef::named(kind.scalar_to_filter_input_name()
+                .unwrap()))
+                .description(format!("Filters the {} by {}.", $base_name, fd))
+            );
+        }
+
+        $types.push(Type::InputObject(filter_by_obj));
     };
 }
 
@@ -517,7 +576,7 @@ macro_rules! add_to_obj {
 /// - `$unique_map`: The map of unique index fields for the table.
 /// - `$query_vec`: The vector of fields for the query object.
 /// - `$nested_objs_map`: The map of nested objects to which the field is added.
-/// - `$order_vec`: The vector of orderable fields for the table.
+/// - `input_vec`: The vector of scalar fields (fd_name, kind) for the table.
 /// - `$create_obj`: The input object for the createTable mutation.
 /// - `$update_obj`: The input object for the updateTable mutation.
 /// - `$mutation_add_vec`: The vector of addTableFieldName mutations for the table.
@@ -531,7 +590,7 @@ macro_rules! parse_field {
         $idx_map:ident,
         $query_vec:ident,
         $nested_objs_map:ident,
-        $order_vec:ident,
+        $input_vec:ident,
         $create_obj:ident,
         $update_obj:ident,
         $mutation_add_vec:ident,
@@ -566,11 +625,6 @@ macro_rules! parse_field {
         let table_ident = Ident::from($tb_name.clone());
         path.push(&table_ident);
         path.extend_from_slice(parts.as_slice());
-
-        // Decide, based on its kind, wether this field can be ordered by the user.
-        if is_primitive(&kind_non_optional) {
-            $order_vec.push(fd_name_gql.clone());
-        }
 
         let mut fd_ty = kind_to_type(kind.clone(), $types, path.as_slice())?;
 
@@ -658,6 +712,10 @@ macro_rules! parse_field {
         .description(description!($fd));
 
         if fd_path_parent.is_empty() { // top level field
+            // Decide, based on its kind, wether this field can be ordered by the user.
+            if kind_non_optional.is_scalar() {
+                $input_vec.push((fd_name_gql.clone(), kind_non_optional.clone()));
+            }
             // Add input arg if there exists an unique index for this top level field.
             // Doing it here for double security, but should work outside of the if as well, as only
             // top level fields can be indexed?! However, it should be after the fd_type record
@@ -684,7 +742,7 @@ macro_rules! parse_field {
             add_to_obj!($update_obj, fd_u);
 
             // FIXME: make objects and arrays work as well
-            if is_primitive(&kind_non_optional) {
+            if kind_non_optional.is_scalar() {
                 // For each field we also add a updateTableFieldName mutation. Here the ID and
                 // the field to update are non null, even if its kind may originally be
                 // optional.
@@ -758,7 +816,6 @@ pub async fn process_tbs(
         }
     });
 
-
     for tb in tables.iter() {
         let tb_name = tb.name.to_string();
         let first_tb_name = tb_name.clone();
@@ -769,10 +826,11 @@ pub async fn process_tbs(
         let mut tb_fds_query = Vec::<Field>::new();
         // Stores the nested objects. The tuple is (query_obj, create_input_obj, update_input_obj)
         let mut tb_nested_objs = BTreeMap::<String, (Object, InputObject, InputObject)>::new();
-        // Collects all fields that can be used for ordering
-        let mut tb_fds_orderable = Vec::<String>::new();
         let mut tb_fds_mutation_add = Vec::<Field>::new();
         let mut tb_fds_mutation_update = Vec::<Field>::new();
+        // Collects all fields that can be used for ordering and filtering. These are scalar fields.
+        // We use a vec due to lower memory overhead and because we only iter and don't look up.
+        let mut tb_fds_scalar = Vec::<(String, Kind)>::new();
         // Collects all fields that are columns in unique indexes thus needing an input value
         // e.g., k: "email", v: Some(InputValue::new("email", TypeRef::STRING))
         let mut tb_fds_index = BTreeMap::<String, Option<TypeRef>>::new();
@@ -830,14 +888,15 @@ pub async fn process_tbs(
                 tb_fds_query, // Cannot use query obj here directly, because the second call for
                 // relations needs a vec to store the fields to
                 tb_nested_objs,
-                tb_fds_orderable,
+                tb_fds_scalar,
                 mutation_create_obj,
                 mutation_update_obj,
                 tb_fds_mutation_add,
                 tb_fds_mutation_update
             );
         }
-        define_order_input_types!(types, tb_name, tb_fds_orderable);
+        define_order_input_types!(types, &tb_name, &tb_fds_scalar);
+        define_filter_input_types!(types, &tb_name, &tb_fds_scalar);
 
         // =======================================================
         // Parse relations
@@ -867,7 +926,7 @@ pub async fn process_tbs(
 
                 let mut rel_fds = Vec::<Field>::new();
                 let mut rel_nested_objs = BTreeMap::<String, (Object, InputObject, InputObject)>::new();
-                let mut rel_fds_orderable = Vec::<String>::new();
+                let mut rel_fds_scalar = Vec::<(String, Kind)>::new();
 
                 let fds = tx.all_tb_fields(ns, db, &rel.name.0, None).await?;
 
@@ -889,14 +948,15 @@ pub async fn process_tbs(
                         rel_fds_unique,
                         rel_fds,
                         rel_nested_objs,
-                        rel_fds_orderable,
+                        rel_fds_scalar,
                         temp,
                         temp2,
                         temp3,
                         temp4
                     );
                 }
-                define_order_input_types!(types, &rel_name, rel_fds_orderable);
+                define_order_input_types!(types, &rel_name, &rel_fds_scalar);
+                define_filter_input_types!(types, &rel_name, &rel_fds_scalar);
 
                 // Node type for the relation connection
                 let node_ty_name = match outs.len() {
@@ -925,7 +985,8 @@ pub async fn process_tbs(
                         make_connection_resolver(&rel_name, ConnectionKind::Relation),
                         edge_fields: rel_fds,
                         args: [
-                            order_input!(&tb_name)
+                            order_input!(&tb_name),
+                            filter_input!(&tb_name)
                         ],
                         is_relation: true
                     )
@@ -1034,7 +1095,8 @@ pub async fn process_tbs(
                     make_connection_resolver(&tb_name_query, ConnectionKind::Table),
                     edge_fields: [],
                     args: [
-                        order_input!(&tb_name)
+                        order_input!(&tb_name),
+                        filter_input!(&tb_name)
                     ],
                     is_relation: false
                 )
@@ -1117,7 +1179,7 @@ pub async fn process_tbs(
                     .argument(limit_input!())
                     .argument(start_input!())
                     .argument(order_input!(&tb_name))
-                // .argument(filter_input!(&tb_name))
+                    .argument(filter_input!(&tb_name))
             );
         }
 
