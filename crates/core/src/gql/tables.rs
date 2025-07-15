@@ -66,60 +66,39 @@ macro_rules! description {
     };
 }
 
-macro_rules! first_input {
-	() => {
+macro_rules! input {
+    (FIRST) => {
 		InputValue::new("first", TypeRef::named(TypeRef::INT))
         .description("Returns the first *n* elements from the list.")
 	};
-}
-
-macro_rules! last_input {
-	() => {
+    (LAST) => {
 		InputValue::new("last", TypeRef::named(TypeRef::INT))
         .description("Returns the last *n* elements from the list.")
 	};
-}
-
-macro_rules! before_input {
-	() => {
+    (BEFORE) => {
 		InputValue::new("before", TypeRef::named(TypeRef::STRING))
         .description("Returns the elements in the list that come before the specified cursor.")
 	};
-}
-
-macro_rules! after_input {
-	() => {
+    (AFTER) => {
 		InputValue::new("after", TypeRef::named(TypeRef::STRING))
         .description("Returns the elements in the list that come after the specified cursor.")
 	};
-}
-
-macro_rules! limit_input {
-	() => {
-		InputValue::new("limit", TypeRef::named(TypeRef::INT))
-        .description("Maximum number of records to return. Use this parameter to limit result size.")
-	};
-}
-
-macro_rules! start_input {
-	() => {
+    (START) => {
 		InputValue::new("start", TypeRef::named(TypeRef::INT))
         .description("Number of records to skip. Use this parameter with 'limit' for offset-based pagination.")
 	};
-}
-
-macro_rules! input {
-    (NON_NULL) => {
+    (LIMIT) => {
+		InputValue::new("limit", TypeRef::named(TypeRef::INT))
+        .description("Maximum number of records to return. Use this parameter to limit result size.")
+	};
+    (ID_NON_NULL) => {
         InputValue::new("id", TypeRef::named_nn(TypeRef::ID))
             .description("The required ID of the record. Can be a string ID or a record ID in the format 'table:id'.")
     };
-    (OPTIONAL) => {
+    (ID_OPTIONAL) => {
         InputValue::new("id", TypeRef::named(TypeRef::ID))
             .description("The ID of the record. Can be a string or a record ID ('table:id'). Only one unique identifier (id, or another unique field) can be provided.")
     };
-    () => {
-		input!(OPTIONAL)
-	};
     (
         $fd_name: expr,
         $ty_ref: expr
@@ -184,7 +163,7 @@ macro_rules! filter_input {
 /// Given the following inputs:
 ///
 /// - **`base_name`**: `"Home"`
-/// - **`fields`**: `&["name", "created_at"]`
+/// - **`fields`**: `&[("name",Kind::String), ("created_at",Kind:Datetime)]`
 ///
 /// The macro generates the equivalent of this GraphQL schema:
 ///
@@ -1036,7 +1015,7 @@ pub async fn process_tbs(
             ),
         )
             .description(description!(tb, format!("Generated from table `{}` allows querying a single record.", &tb_name)))
-            .argument(input!(OPTIONAL)); // The default ID input argument
+            .argument(input!(ID_OPTIONAL)); // The default ID input argument
 
         for (fd_name, opt_ty) in tb_fds_index.iter() {
             if let Some(ty) = opt_ty {
@@ -1056,7 +1035,7 @@ pub async fn process_tbs(
                 ),
             )
             .description(description!(tb, format!("Generated from table `{}` allows querying a single record by ID.", &tb_name)))
-            .argument(input!(NON_NULL))
+            .argument(input!(ID_NON_NULL))
         );
 
         // Add tableByIndex queries
@@ -1175,9 +1154,10 @@ pub async fn process_tbs(
                     },
                 )
                     .description(description!(tb,
-                        format!("Generated from table `{}`\nallows querying a table with filters",&tb_name)))
-                    .argument(limit_input!())
-                    .argument(start_input!())
+                        format!("Generated from table `{}` allows querying a table with filters",
+                        &tb_name)))
+                    .argument(input!(LIMIT))
+                    .argument(input!(START))
                     .argument(order_input!(&tb_name))
                     .argument(filter_input!(&tb_name))
             );
