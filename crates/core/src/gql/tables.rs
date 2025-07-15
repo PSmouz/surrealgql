@@ -360,10 +360,10 @@ macro_rules! cursor_pagination {
 
             )
             .description(format!("The connection object for the table `{}`", $fd_name))
-            .argument(after_input!())
-            .argument(before_input!())
-            .argument(first_input!())
-            .argument(last_input!())
+            .argument(input!(AFTER))
+            .argument(input!(BEFORE))
+            .argument(input!(FIRST))
+            .argument(input!(LAST))
             $(.argument($extra_connection_arg))*
         }
     };
