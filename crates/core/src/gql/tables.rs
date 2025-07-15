@@ -66,6 +66,20 @@ macro_rules! description {
     };
 }
 
+/// Generates an input value for ordering options based on the provided name.
+///
+/// This macro creates an `InputValue` for the `orderBy` argument,
+/// which is used to specify ordering options for connections.
+///
+/// #### Important:
+/// When using this macro for input types (e.g., order, filter, group), it is
+/// **necessary** to define the corresponding types first. This can be easily done with the
+/// [`define_input_types!`] macro.
+///
+/// # Parameters
+/// - `$name`: The name of the entity for which ordering options are defined.
+/// # Returns
+/// - An `InputValue` for the `orderBy` argument, which is used in GraphQL queries to specify.
 macro_rules! input {
     (FIRST) => {
 		InputValue::new("first", TypeRef::named(TypeRef::INT))
@@ -99,6 +113,16 @@ macro_rules! input {
         InputValue::new("id", TypeRef::named(TypeRef::ID))
             .description("The ID of the record. Can be a string or a record ID ('table:id'). Only one unique identifier (id, or another unique field) can be provided.")
     };
+    (ORDER, $name: expr) => {
+		InputValue::new("orderBy", TypeRef::named(format!("{}Order", $name.to_pascal_case())))
+        .description(format!("Ordering options for `{}` connections.", $name))
+	};
+    (FILTER, $name: expr) => {
+		InputValue::new("filterBy", TypeRef::named(format!("{}Filter", $name.to_pascal_case())))
+	};
+    (GROUP, $name: expr) => {
+		InputValue::new("groupBy", TypeRef::named_nn_list(format!("{}Group", $name.to_pascal_case())))
+	};
     (
         $fd_name: expr,
         $ty_ref: expr
@@ -128,35 +152,11 @@ macro_rules! input_input {
 	};
 }
 
-/// Generates an input value for ordering options based on the provided name.
+/// Defines the input types for a given operation, base name, and fields. By default, it defines
+/// order, filter, and group input types.
 ///
-/// This macro creates an `InputValue` for the `orderBy` argument,
-/// which is used to specify ordering options for connections.
-///
-/// **Important**: This macro needs the order input types to be defined
-/// with [`define_order_input_types!`].
-///
-/// # Parameters
-/// - `$name`: The name of the entity for which ordering options are defined.
-/// # Returns
-/// - An `InputValue` for the `orderBy` argument, which is used in GraphQL queries to specify.
-macro_rules! order_input {
-	($name: expr) => {
-		InputValue::new("orderBy", TypeRef::named(format!("{}Order", $name.to_pascal_case())))
-        .description(format!("Ordering options for `{}` connections.", $name))
-	};
-}
-
-macro_rules! filter_input {
-	($name: expr) => {
-		InputValue::new("filterBy", TypeRef::named(format!("{}Filter", $name.to_pascal_case())))
-	};
-}
-
-/// Defines the order input types for a given base name and fields.
-/// This macro generates an enum for the order fields and an input object for ordering options.
-///
-/// **Important**: This macro requires the order direction enum type defined.
+/// #### Important:
+/// This macro **requires** the order direction enum type defined.
 ///
 /// # Example
 ///
@@ -188,19 +188,42 @@ macro_rules! filter_input {
 ///   """The ordering direction."""
 ///   direction: OrderDirection
 /// }
+///
+/// """Fields to group Home by."""
+/// enum HomeGroup {
+///   """Group Home by ID."""
+///   ID
+///
+///   """Group Home by name."""
+///   NAME
+///
+///   """Group Home by created_at."""
+///   CREATED_AT
+/// }
+///
+/// """The filters that are available when fetching Home."""
+/// input HomeFilter {
+///   """Filters the Home by name."""
+///   NAME: StringFilterInput
+///
+///   """Filters the Home by created_at."""
+///   CREATED_AT: DateTimeFilterInput
+/// }
+///
 /// ```
 ///
 /// # Parameters
 /// - `$types`: The types vector to which the order input types are added.
 /// - `$base_name`: The base name for the order fields and input object.
-/// - `orderable_fds`: A vector of field names that can be used for ordering.
+/// - `fds`: A vector of (field names, Kind) that can be used for ordering, filtering, grouping.
 /// # Returns
 /// - Adds an enum and an input object to the `$types` vector.
-macro_rules! define_order_input_types {
+macro_rules! define_input_types {
     (
+        ORDER,
         $types:ident,
         $base_name:expr,
-        $orderable_fds:expr
+        $fds:expr
     ) => {
         let base_name_pascal = $base_name.to_pascal_case();
         let enum_name = format!("{}OrderField", base_name_pascal);
@@ -210,7 +233,7 @@ macro_rules! define_order_input_types {
             .item(EnumItem::new("ID").description(format!("{} by ID.", $base_name)))
             .description(format!("Properties by which {} can be ordered.", $base_name));
 
-        for (fd, _) in $orderable_fds {
+        for (fd, _) in $fds {
             order_by_enum = order_by_enum.item(
                 EnumItem::new(fd.to_screaming_snake_case())
                 .description(format!("{} by {}.", $base_name, fd.to_screaming_snake_case()))
@@ -229,13 +252,11 @@ macro_rules! define_order_input_types {
             .description(format!("Ordering options for {} connections", $base_name));
         $types.push(Type::InputObject(order_by_obj))
     };
-}
-
-macro_rules! define_filter_input_types {
     (
+        FILTER,
         $types:ident,
         $base_name:expr,
-        $filterable_fds:expr
+        $fds:expr
     ) => {
         let base_name_pascal = $base_name.to_pascal_case();
         let obj_name = format!("{}Filter", base_name_pascal);
@@ -243,7 +264,7 @@ macro_rules! define_filter_input_types {
         let mut filter_by_obj = InputObject::new(&obj_name)
             .description(format!("The filters that are available when fetching {}.", $base_name));
 
-        for (fd, kind) in $filterable_fds {
+        for (fd, kind) in $fds {
             assert!(kind.is_scalar(), "Filterable fields must be scalar types.");
 
             filter_by_obj = filter_by_obj.field(
@@ -254,6 +275,37 @@ macro_rules! define_filter_input_types {
         }
 
         $types.push(Type::InputObject(filter_by_obj));
+    };
+    (
+        GROUP,
+        $types:ident,
+        $base_name:expr,
+        $fds:expr
+    ) => {
+        let base_name_pascal = $base_name.to_pascal_case();
+        let enum_name = format!("{}Group", base_name_pascal);
+
+        let mut group_by_enum = Enum::new(&enum_name)
+            .item(EnumItem::new("ID").description(format!("{} by ID.", $base_name)))
+            .description(format!("Fields to group {} by.", $base_name));
+
+        for (fd, _) in $fds {
+            group_by_enum = group_by_enum.item(
+                EnumItem::new(fd.to_screaming_snake_case())
+                .description(format!("{} by {}.", $base_name, fd.to_screaming_snake_case()))
+            );
+        }
+
+        $types.push(Type::Enum(group_by_enum));
+    };
+    (
+        $types:ident,
+        $base_name:expr,
+        $fds:expr
+    ) => {
+        define_input_types!(ORDER, $types, $base_name, $fds);
+        define_input_types!(FILTER, $types, $base_name, $fds);
+        define_input_types!(GROUP, $types, $base_name, $fds);
     };
 }
 
@@ -874,8 +926,7 @@ pub async fn process_tbs(
                 tb_fds_mutation_update
             );
         }
-        define_order_input_types!(types, &tb_name, &tb_fds_scalar);
-        define_filter_input_types!(types, &tb_name, &tb_fds_scalar);
+        define_input_types!(types, &tb_name, &tb_fds_scalar);
 
         // =======================================================
         // Parse relations
@@ -934,8 +985,7 @@ pub async fn process_tbs(
                         temp4
                     );
                 }
-                define_order_input_types!(types, &rel_name, &rel_fds_scalar);
-                define_filter_input_types!(types, &rel_name, &rel_fds_scalar);
+                define_input_types!(types, &rel_name, &rel_fds_scalar);
 
                 // Node type for the relation connection
                 let node_ty_name = match outs.len() {
@@ -964,8 +1014,9 @@ pub async fn process_tbs(
                         make_connection_resolver(&rel_name, ConnectionKind::Relation),
                         edge_fields: rel_fds,
                         args: [
-                            order_input!(&tb_name),
-                            filter_input!(&tb_name)
+                            input!(ORDER, &tb_name),
+                            input!(FILTER, &tb_name),
+                            input!(GROUP, &tb_name),
                         ],
                         is_relation: true
                     )
@@ -1074,8 +1125,9 @@ pub async fn process_tbs(
                     make_connection_resolver(&tb_name_query, ConnectionKind::Table),
                     edge_fields: [],
                     args: [
-                        order_input!(&tb_name),
-                        filter_input!(&tb_name)
+                        input!(ORDER, &tb_name),
+                        input!(FILTER, &tb_name),
+                        input!(GROUP, &tb_name),
                     ],
                     is_relation: false
                 )
@@ -1158,8 +1210,9 @@ pub async fn process_tbs(
                         &tb_name)))
                     .argument(input!(LIMIT))
                     .argument(input!(START))
-                    .argument(order_input!(&tb_name))
-                    .argument(filter_input!(&tb_name))
+                    .argument(input!(ORDER, &tb_name))
+                    .argument(input!(FILTER, &tb_name))
+                    .argument(input!(GROUP, &tb_name))
             );
         }
 

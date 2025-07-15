@@ -196,21 +196,19 @@ pub async fn generate_schema(
 
     macro_rules! register_scalar_filter_input_type {
         ($schema:ident, $ty_ref:expr) => {
-            let name = $ty_ref.type_name();
-
             $schema = $schema.register(
-                InputObject::new(format!("{}FilterInput", name))
-                    .field(InputValue::new("eq", TypeRef::named(name))
+                InputObject::new(format!("{}FilterInput", $ty_ref.type_name()))
+                    .field(InputValue::new("eq", TypeRef::named($ty_ref.type_name()))
                         .description("Matches values that are equal to the given value."))
-                    .field(InputValue::new("ne", TypeRef::named(name))
+                    .field(InputValue::new("ne", TypeRef::named($ty_ref.type_name()))
                         .description("Matches values that are not equal to the given value."))
-                    .field(InputValue::new("in", TypeRef::named_list(name))
+                    .field(InputValue::new("in", TypeRef::named_list($ty_ref.type_name()))
                         .description("Matches any of the given values."))
-                    .field(InputValue::new("nin", TypeRef::named_list(name))
+                    .field(InputValue::new("nin", TypeRef::named_list($ty_ref.type_name()))
                         .description("Matches none of the given values."))
-                    .field(InputValue::new("regex", TypeRef::named(name))
+                    .field(InputValue::new("regex", TypeRef::named($ty_ref.type_name()))
                         .description("Matches values that match the given regular expression."))
-                    .field(InputValue::new("glob", TypeRef::named(name))
+                    .field(InputValue::new("glob", TypeRef::named($ty_ref.type_name()))
                         .description("Matches values that match the given glob pattern."))
             );
         };
