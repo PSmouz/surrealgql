@@ -10,6 +10,7 @@ mod utils;
 mod geometry;
 mod test;
 mod cursor;
+mod resolvers;
 
 pub use error::GqlError;
 
