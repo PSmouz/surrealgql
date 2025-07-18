@@ -838,17 +838,22 @@ pub async fn process_tbs(
     db: &str,
     cursor: CursorConfig,
 ) -> Result<(Object, Object), GqlError> {
-    // Type::Any is not supported. FIXME: throw error in the future.
-    let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs
-        .iter().partition(|tb| {
-        match tb.kind {
-            TableType::Normal => true,
-            TableType::Relation(_) => false,
-            TableType::Any => false,
-        }
-    });
+    let mut tables = Vec::<&DefineTableStatement>::new();
+    let mut relations = Vec::<&DefineTableStatement>::new();
 
-    for tb in tables.iter() {
+    for tb in tbs.iter() {
+        match tb.kind {
+            TableType::Normal => tables.push(tb),
+            TableType::Relation(_) => relations.push(tb),
+            TableType::Any =>
+                return Err(schema_error("TableType::Any is not yet supported").into())
+        }
+    }
+
+    // FIXME: cleaner loop by looping tbs and relations separately. make a big map, where we
+    // store all the fields, so we can add the relations to these objects later.
+
+    for tb in tables.into_iter() {
         let tb_name = tb.name.to_string();
         let first_tb_name = tb_name.clone();
         let second_tb_name = tb_name.clone();
@@ -1056,7 +1061,6 @@ pub async fn process_tbs(
             .map(|(k, _)| k.clone())
             .collect::<Vec<String>>();
 
-        // Add table query
         let mut single_query_fd = Field::new(
             tb_name_query.to_singular(),
             TypeRef::named(&tb_name_gql),
@@ -1076,7 +1080,10 @@ pub async fn process_tbs(
         }
         add_to_obj!(query, single_query_fd);
 
-        // Add tableById query
+        // =======================================================
+        // Add singleById query
+        // =======================================================
+
         add_to_obj!(query, Field::new(
                 format!("{}ById", tb_name_query.to_singular()),
                 TypeRef::named(&tb_name_gql),
@@ -1090,7 +1097,10 @@ pub async fn process_tbs(
             .argument(input!(ID_NON_NULL))
         );
 
-        // Add tableByIndex queries
+        // =======================================================
+        // Add singleByIndex queries
+        // =======================================================
+
         for (idx_name, fd_names) in indexes.iter() {
             let mut single_query_fd = Field::new(
                 format!("{}By{}", tb_name_query.to_singular(), idx_name),
