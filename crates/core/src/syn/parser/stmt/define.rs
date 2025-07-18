@@ -5,7 +5,7 @@ use crate::api::middleware::RequestMiddleware;
 use crate::sql::access_type::JwtAccessVerify;
 use crate::sql::index::HnswParams;
 use crate::sql::statements::define::config::api::ApiConfig;
-use crate::sql::statements::define::config::graphql::{GraphQLConfig, TableConfig};
+use crate::sql::statements::define::config::graphql::{CursorConfig, GraphQLConfig, IntrospectionConfig, LimitsConfig, TableConfig};
 use crate::sql::statements::define::config::ConfigInner;
 use crate::sql::statements::define::{ApiAction, DefineBucketStatement, DefineConfigStatement};
 use crate::sql::statements::DefineApiStatement;
@@ -1550,7 +1550,9 @@ impl Parser<'_> {
         use graphql::{FunctionsConfig, TablesConfig};
         let mut tmp_tables = Option::<TablesConfig>::None;
         let mut tmp_fncs = Option::<FunctionsConfig>::None;
-        let mut tmp_cursor = false;
+        let mut tmp_cursor = Option::<CursorConfig>::None;
+        let mut tmp_intro = Option::<IntrospectionConfig>::None;
+        let mut tmp_limits = Option::<LimitsConfig>::None;
         loop {
             match self.peek_kind() {
                 t!("NONE") => {
@@ -1603,7 +1605,43 @@ impl Parser<'_> {
                 }
                 t!("CURSOR") => {
                     self.pop_peek();
-                    tmp_cursor = true;
+                    if self.eat(t!("AUTO")) {
+                        tmp_cursor = Some(CursorConfig::Auto);
+                    } else if self.eat(t!("NONE")) {
+                        tmp_cursor = Some(CursorConfig::None);
+                    } else if self.eat(t!("RELATION")) {
+                        tmp_cursor = Some(CursorConfig::Relation);
+                    } else {
+                        unexpected!(self, self.peek(), "`NONE`, `AUTO` or `RELATION`");
+                    }
+                }
+                t!("INTROSPECTION") => {
+                    self.pop_peek();
+                    if self.eat(t!("AUTO")) {
+                        tmp_intro = Some(IntrospectionConfig::Auto);
+                    } else if self.eat(t!("NONE")) {
+                        tmp_intro = Some(IntrospectionConfig::None);
+                    } else {
+                        unexpected!(self, self.peek(), "`NONE` or `AUTO`");
+                    }
+                }
+                t!("LIMIT") => {
+                    self.pop_peek();
+
+                    let next = self.next();
+                    match next.kind {
+                        t!("TO") => {
+                            tmp_limits =
+                                Some(LimitsConfig::To(self.parse_graphql_limit_configs()?));
+                        }
+                        t!("NONE") => {
+                            tmp_limits = Some(LimitsConfig::None);
+                        }
+                        t!("AUTO") => {
+                            tmp_limits = Some(LimitsConfig::Auto);
+                        }
+                        _ => unexpected!(self, next, "`NONE`, `AUTO`, `TO`"),
+                    }
                 }
                 _ => break,
             }
@@ -1612,7 +1650,9 @@ impl Parser<'_> {
         Ok(GraphQLConfig {
             tables: tmp_tables.unwrap_or_default(),
             functions: tmp_fncs.unwrap_or_default(),
-            cursor: tmp_cursor,
+            cursor: tmp_cursor.unwrap_or(CursorConfig::Auto),
+            introspection: tmp_intro.unwrap_or(IntrospectionConfig::Auto),
+            limits: tmp_limits.unwrap_or(LimitsConfig::Auto),
         })
     }
 
@@ -1631,6 +1671,38 @@ impl Parser<'_> {
             if !self.eat(t!(",")) {
                 break;
             }
+        }
+        Ok(acc)
+    }
+
+    fn parse_graphql_limit_configs(&mut self) -> ParseResult<Vec<graphql::LimitConfig>> {
+        let mut acc = vec![];
+        loop {
+            let config = match self.peek_kind() {
+                t!("COMPLEXITY") => {
+                    self.pop_peek();
+                    let value: usize = self.next_token_value()?;
+                    graphql::LimitConfig::Complexity(value)
+                }
+                t!("DEPTH") => {
+                    self.pop_peek();
+                    let value: usize = self.next_token_value()?;
+                    graphql::LimitConfig::Depth(value)
+                }
+                t!("RECURSIVE_DEPTH") => {
+                    self.pop_peek();
+                    let value: usize = self.next_token_value()?;
+                    graphql::LimitConfig::RecursiveDepth(value)
+                }
+                t!("DIRECTIVES") => {
+                    self.pop_peek();
+                    let value: usize = self.next_token_value()?;
+                    graphql::LimitConfig::Directives(value)
+                }
+                // If the next token is not a known limit keyword, we are done parsing limits.
+                _ => break,
+            };
+            acc.push(config);
         }
         Ok(acc)
     }

@@ -51,7 +51,7 @@ pub static RESERVED_KEYWORD: phf::Set<UniCase<&'static str>> = phf_set! {
 };
 
 pub fn could_be_reserved(s: &str) -> bool {
-	RESERVED_KEYWORD.contains(&UniCase::ascii(s))
+    RESERVED_KEYWORD.contains(&UniCase::ascii(s))
 }
 
 /// A map for mapping keyword strings to a tokenkind,
@@ -92,6 +92,7 @@ pub(crate) static KEYWORDS: phf::Map<UniCase<&'static str>, TokenKind> = phf_map
 	UniCase::ascii("CLASS") => TokenKind::Keyword(Keyword::Class),
 	UniCase::ascii("COMMENT") => TokenKind::Keyword(Keyword::Comment),
 	UniCase::ascii("COMMIT") => TokenKind::Keyword(Keyword::Commit),
+	UniCase::ascii("COMPLEXITY") => TokenKind::Keyword(Keyword::Complexity),
 	UniCase::ascii("CONCURRENTLY") => TokenKind::Keyword(Keyword::Concurrently),
 	UniCase::ascii("CONFIG") => TokenKind::Keyword(Keyword::Config),
 	UniCase::ascii("CONTENT") => TokenKind::Keyword(Keyword::Content),
@@ -103,10 +104,12 @@ pub(crate) static KEYWORDS: phf::Map<UniCase<&'static str>, TokenKind> = phf_map
 	UniCase::ascii("DEFAULT") => TokenKind::Keyword(Keyword::Default),
 	UniCase::ascii("DEFINE") => TokenKind::Keyword(Keyword::Define),
 	UniCase::ascii("DELETE") => TokenKind::Keyword(Keyword::Delete),
+	UniCase::ascii("DEPTH") => TokenKind::Keyword(Keyword::Depth),
 	UniCase::ascii("DESCENDING") => TokenKind::Keyword(Keyword::Descending),
 	UniCase::ascii("DESC") => TokenKind::Keyword(Keyword::Descending),
 	UniCase::ascii("DIFF") => TokenKind::Keyword(Keyword::Diff),
 	UniCase::ascii("DIMENSION") => TokenKind::Keyword(Keyword::Dimension),
+	UniCase::ascii("DIRECTIVES") => TokenKind::Keyword(Keyword::Directives),
 	UniCase::ascii("DISTANCE") => TokenKind::Keyword(Keyword::Distance),
 	UniCase::ascii("DIST") => TokenKind::Keyword(Keyword::Distance),
 	UniCase::ascii("DOC_IDS_CACHE") => TokenKind::Keyword(Keyword::DocIdsCache),
@@ -206,6 +209,7 @@ pub(crate) static KEYWORDS: phf::Map<UniCase<&'static str>, TokenKind> = phf_map
 	UniCase::ascii("RELATE") => TokenKind::Keyword(Keyword::Relate),
 	UniCase::ascii("RELATION") => TokenKind::Keyword(Keyword::Relation),
 	UniCase::ascii("REBUILD") => TokenKind::Keyword(Keyword::Rebuild),
+	UniCase::ascii("RECURSIVE_DEPTH") => TokenKind::Keyword(Keyword::RecursiveDepth),
 	UniCase::ascii("REFERENCE") => TokenKind::Keyword(Keyword::Reference),
 	UniCase::ascii("REFRESH") => TokenKind::Keyword(Keyword::Refresh),
 	UniCase::ascii("REMOVE") => TokenKind::Keyword(Keyword::Remove),
@@ -269,6 +273,7 @@ pub(crate) static KEYWORDS: phf::Map<UniCase<&'static str>, TokenKind> = phf_map
 	UniCase::ascii("ANYINSIDE") => TokenKind::Keyword(Keyword::AnyInside),
 	UniCase::ascii("INSIDE") => TokenKind::Keyword(Keyword::Inside),
 	UniCase::ascii("INTERSECTS") => TokenKind::Keyword(Keyword::Intersects),
+	UniCase::ascii("INTROSPECTION") => TokenKind::Keyword(Keyword::Introspection),
 	UniCase::ascii("NONEINSIDE") => TokenKind::Keyword(Keyword::NoneInside),
 	UniCase::ascii("NOTINSIDE") => TokenKind::Keyword(Keyword::NotInside),
 	UniCase::ascii("OR") => TokenKind::Keyword(Keyword::OrKw),

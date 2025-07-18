@@ -1,3 +1,5 @@
+use super::mac::pop_glued;
+use crate::syn::error::SyntaxError;
 use crate::{
 	sql::{
 		language::Language, Bytes, Datetime, Duration, File, Ident, Param, Regex, Strand, Table,
@@ -188,6 +190,24 @@ impl TokenValue for Regex {
 			_ => unexpected!(parser, peek, "a regex"),
 		}
 	}
+}
+
+impl TokenValue for usize {
+    fn from_token(parser: &mut Parser<'_>) -> ParseResult<Self> {
+        let token = parser.peek();
+        match token.kind {
+            TokenKind::Digits => {
+                parser.pop_peek();
+                let str_val = parser.lexer.span_str(token.span);
+                let v = str_val.parse::<usize>().map_err(|e| {
+                    SyntaxError::new(format!("failed to parse `{}` as a positive number: {}", str_val, e))
+                })?;
+
+                Ok(v)
+            }
+            _ => unexpected!(parser, token, "a positive number"),
+        }
+    }
 }
 
 impl Parser<'_> {

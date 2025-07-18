@@ -12,6 +12,7 @@ use crate::gql::utils::{pluralize, GQLTx, GqlTypeRefUtils, GqlValueUtils, KindUt
 use crate::gql::{cursor, utils};
 use crate::kvs::Transaction;
 use crate::sql::order::{OrderList, Ordering};
+use crate::sql::statements::define::config::graphql::CursorConfig;
 use crate::sql::statements::{DefineTableStatement, SelectStatement};
 use crate::sql::{self, Array, Ident, Index, Operator, Order, Part, Table, TableType, Values};
 use crate::sql::{Cond, Fields};
@@ -29,7 +30,6 @@ use async_graphql::dynamic::{InputValue, Union};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use inflector::Inflector;
-
 
 fn dummy_resolver() -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
     move |_ctx: ResolverContext| {
@@ -617,7 +617,7 @@ macro_rules! parse_field {
         $fd:ident,
         $tb_name:ident,
         $types:ident,
-        $cursor:ident,
+        $cursor:expr,
         $idx_map:ident,
         $query_vec:ident,
         $nested_objs_map:ident,
@@ -677,7 +677,8 @@ macro_rules! parse_field {
         }
 
         // Query field
-        let fd_q = match $cursor && matches!(kind_non_optional, Kind::Array(_, _)) {
+        let fd_q = match matches!($cursor, CursorConfig::Auto)
+                            && matches!(kind_non_optional, Kind::Array(_, _)) {
             true => {
                 let kind = kind.inner_kind().unwrap();
                 let ty_ref = kind_to_type(kind.clone(), $types, path.as_slice())?;
@@ -835,7 +836,7 @@ pub async fn process_tbs(
     tx: &Transaction,
     ns: &str,
     db: &str,
-    cursor: bool,
+    cursor: CursorConfig,
 ) -> Result<(Object, Object), GqlError> {
     // Type::Any is not supported. FIXME: throw error in the future.
     let (tables, relations): (Vec<&DefineTableStatement>, Vec<&DefineTableStatement>) = tbs
@@ -934,7 +935,7 @@ pub async fn process_tbs(
 
         //todo?: das hier nur n mal machen. Also nur dann wenn nicht vec ins > 1, bzw schon in map
         // possible performance improvements by skipping fields for prev relations
-        if cursor {
+        if matches!(cursor, CursorConfig::Auto | CursorConfig::Relation) {
             for rel in relations.iter().filter(|stmt| {
                 match &stmt.kind {
                     TableType::Relation(r) => match &r.from {
@@ -968,7 +969,7 @@ pub async fn process_tbs(
 
                 for fd in fds.iter().filter(|fd| {
                     // for cursor pagination, we only need the edge fields
-                    cursor && !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
+                    !matches!(fd.name.to_string().as_str(), "in" | "out" | "id")
                 }) {
                     parse_field!(
                         fd,
@@ -1116,7 +1117,7 @@ pub async fn process_tbs(
 
         let tb_name_plural = pluralize(tb_name_query.clone());
 
-        if cursor {
+        if matches!(cursor, CursorConfig::Auto) {
             add_to_obj!(query,
                 cursor_pagination!(
                     types,
@@ -1238,6 +1239,8 @@ pub async fn process_tbs(
             types.push(Type::InputObject(obj_u));
         }
     }
+
+    // TODO: handle relations outside of cursor=yes(auto)
     // if !cursor {
     //     for rel in relations.iter() {
     //         let rel_name = rel.name.to_string();

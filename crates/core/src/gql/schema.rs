@@ -17,7 +17,7 @@ use crate::kvs::LockType;
 use crate::kvs::TransactionType;
 use crate::sql;
 use crate::sql::kind::Literal;
-use crate::sql::statements::define::config::graphql::{FunctionsConfig, TablesConfig};
+use crate::sql::statements::define::config::graphql::{FunctionsConfig, IntrospectionConfig, LimitConfig, LimitsConfig, TablesConfig};
 use crate::sql::Kind;
 use crate::sql::Value as SqlValue;
 use crate::sql::{Geometry, Ident};
@@ -34,6 +34,18 @@ use inflector::Inflector;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde_json::Number;
+
+const DEFAULT_COMPLEXITY: usize = 100;
+const DEFAULT_DEPTH: usize = 10;
+const DEFAULT_RECURSIVE_DEPTH: usize = 32;
+const DEFAULT_DIRECTIVES: usize = 10;
+
+struct Limits {
+    complexity: usize,
+    depth: usize,
+    recursive_depth: usize,
+    directives: usize,
+}
 
 pub async fn generate_schema(
     datastore: &Arc<Datastore>,
@@ -414,11 +426,71 @@ pub async fn generate_schema(
         .implement("Record");
     schema = schema.register(relation_interface);
 
-    // let payload_interface = Interface::new("Payload")
-    //     .field(InterfaceField::new("success", TypeRef::named_nn(TypeRef::BOOLEAN))
-    //         .description("Did the operation succeed?")
-    //     );
+    // =======================================================
+    // Configuration
+    // =======================================================
+    macro_rules! validate {
+        (
+            $val:expr,
+            $msg:expr
+        ) => {
+            if $val < 1 {
+                return Err(schema_error(format!("{} limit must be at least 1", $msg)));
+            }
+        };
+    }
 
+    match config.limits {
+        LimitsConfig::None => {}
+        LimitsConfig::Auto => {
+            schema = schema.limit_complexity(DEFAULT_COMPLEXITY);
+            schema = schema.limit_depth(DEFAULT_DEPTH);
+            schema = schema.limit_recursive_depth(DEFAULT_RECURSIVE_DEPTH);
+            schema = schema.limit_directives(DEFAULT_DIRECTIVES);
+        }
+        LimitsConfig::To(user_limits) => {
+            let mut limits = Limits {
+                complexity: DEFAULT_COMPLEXITY,
+                depth: DEFAULT_DEPTH,
+                recursive_depth: DEFAULT_RECURSIVE_DEPTH,
+                directives: DEFAULT_DIRECTIVES,
+            };
+            for limit in user_limits.into_iter() {
+                match limit {
+                    LimitConfig::Complexity(c) => {
+                        validate!(c, "complexity");
+                        limits.complexity = c;
+                    }
+                    LimitConfig::Depth(d) => {
+                        validate!(d, "depth");
+                        limits.depth = d;
+                    }
+                    LimitConfig::RecursiveDepth(rd) => {
+                        validate!(rd, "recursive depth");
+                        limits.recursive_depth = rd;
+                    }
+                    LimitConfig::Directives(d) => {
+                        validate!(d, "directives");
+                        limits.directives = d;
+                    }
+                }
+            }
+
+            schema = schema.limit_complexity(limits.complexity);
+            schema = schema.limit_depth(limits.depth);
+            schema = schema.limit_recursive_depth(limits.recursive_depth);
+            schema = schema.limit_directives(limits.directives);
+        }
+    }
+
+    match config.introspection {
+        IntrospectionConfig::None => { schema = schema.disable_introspection() }
+        IntrospectionConfig::Auto => {}
+    }
+
+    // =======================================================
+    // Finalize schema
+    // =======================================================
 
     schema
         .data(gtx)
