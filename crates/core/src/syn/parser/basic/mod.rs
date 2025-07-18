@@ -12,8 +12,6 @@ use crate::{
 	},
 };
 
-use super::mac::pop_glued;
-
 mod number;
 
 /// A trait for parsing single tokens with a specific value.
