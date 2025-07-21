@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::error::{schema_error, GqlError};
+use super::error::GqlError;
 use super::ext::IntoExt;
 use super::schema::{gql_to_sql_kind, sql_value_to_gql_value};
 use crate::gql::cursor::{make_list_resolver, make_object_resolver, make_value_resolver, ConnectionContext, ConnectionKind, EdgeContext};
@@ -19,6 +19,7 @@ use crate::sql::{self, Ident, Index, Operator, Order, Part, Table, TableType};
 use crate::sql::{Cond, Fields};
 use crate::sql::{Expression, Value as SqlValue};
 use crate::sql::{Idiom, Kind};
+use crate::{add_to_obj, description};
 use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::Field;
 use async_graphql::dynamic::TypeRef;
@@ -30,32 +31,7 @@ use async_graphql::Name;
 use async_graphql::Value as GqlValue;
 use inflector::Inflector;
 
-/// Generates a description string for a field definition.
-///
-/// This macro checks if the field definition has a comment and returns it as a formatted string.
-/// If the comment is not present, it returns an empty string or a provided default description.
-///
-/// # Parameters
-/// - `$fd`: The field definition to check for a comment.
-/// - `$desc`: (optional) A default description to return if the field definition does not have a comment.
-/// # Returns
-/// - A formatted string containing the comment or the default description.
-macro_rules! description {
-    ($fd:ident) => {
-        if let Some(ref c) = $fd.comment {
-            format!("{c}")
-        } else {
-            "".to_string()
-        }
-    };
-    ($fd:ident, $desc:expr) => {
-        if let Some(ref c) = $fd.comment {
-            format!("{c}")
-        } else {
-            $desc.to_string()
-        }
-    };
-}
+
 
 /// Generates an input value for ordering options based on the provided name.
 ///
@@ -552,39 +528,7 @@ macro_rules! define_obj {
     };
 }
 
-/// This macro is used to add a field to an object, typically a mutation or query object.
-/// It allows for adding fields with a specific operation type (like "create", "update", or "delete")
-/// and an object that implements the `type_name` method.
-/// It can also be used to add a field without an operation type.
-/// # Parameters
-/// - `$root`: The root object to which the field is added (e.g., mutation or query).
-/// - `$op`: (optional) The operation type, such as "create", "update", or "delete".
-/// - `$obj`: The object to add, which should implement the `type_name` method.
-/// - `$tb_name`: (optional) The table name, used for naming conventions and descriptions.
-macro_rules! add_to_obj {
-    (
-        $root:ident,
-        $op:literal,
-        $obj:expr,
-        $tb_name:expr
-    ) => {
-        $root = $root.field(
-            Field::new(
-                format!("{}{}", $op, $tb_name.to_pascal_case()),
-                TypeRef::named($obj.type_name()),
-                dummy_resolver(), //TODO: implement resolver
-            )
-            .description(format!("{}s a record of the `{}` table.", $op.to_pascal_case(), $tb_name))
-            .argument(input_input!($op.to_pascal_case(), $tb_name))
-        );
-    };
-    (
-        $root:ident,
-        $obj:expr
-    ) => {
-        $root = $root.field($obj);
-    };
-}
+
 
 /// This macro is used to parse a field definition and add it to the object map.
 /// It handles different kinds of fields, including nested fields and array fields.
@@ -837,7 +781,9 @@ pub async fn process_tbs(
             TableType::Normal => tables.push(tb),
             TableType::Relation(_) => relations.push(tb),
             TableType::Any =>
-                return Err(schema_error("TableType::Any is not yet supported").into())
+            //FIXME: table event is any
+                trace!("TableType::Any is not yet supported, skipping table: {}", tb.name),
+            // return Err(schema_error("TableType::Any is not yet supported").into())
         }
     }
 
