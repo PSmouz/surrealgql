@@ -121,10 +121,12 @@ impl GqlTypeRefUtils for TypeRef {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GQLTx {
     opt: Options,
     ctx: Context,
+    sess: Session,
+    kvs: Arc<Datastore>,
 }
 
 impl GQLTx {
@@ -147,7 +149,25 @@ impl GQLTx {
         Ok(GQLTx {
             ctx: ctx.freeze(),
             opt: kvs.setup_options(sess),
+            sess: sess.clone(),
+            kvs: kvs.clone(),
         })
+    }
+
+    pub fn session(&self) -> &Session {
+        &self.sess
+    }
+
+    pub fn context(&self) -> &Context {
+        &self.ctx
+    }
+
+    pub fn options(&self) -> &Options {
+        &self.opt
+    }
+
+    pub fn kvs(&self) -> &Arc<Datastore> {
+        &self.kvs
     }
 
     pub async fn get_record_field(

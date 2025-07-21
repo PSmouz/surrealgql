@@ -5,6 +5,7 @@ use super::error::{resolver_error, GqlError};
 #[cfg(debug_assertions)]
 use super::ext::ValidatorExt;
 use crate::dbs::Session;
+use crate::gql::auth::process_acs;
 use crate::gql::cursor::{make_value_resolver, PageInfo};
 use crate::gql::error::{internal_error, schema_error, type_error};
 use crate::gql::ext::{NamedContainer, TryIntoExt};
@@ -29,7 +30,6 @@ use async_graphql::dynamic::{FieldFuture, Object};
 use async_graphql::dynamic::{InputObject, InputValue, Scalar, TypeRef};
 use async_graphql::Name;
 use async_graphql::Value as GqlValue;
-use geo::{Coord, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use inflector::Inflector;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
@@ -91,6 +91,8 @@ pub async fn generate_schema(
         }
     };
 
+    let acs = tx.all_db_accesses(ns, db).await?;
+
     match (&tbs, &fns) {
         (None, None) => return Err(GqlError::NotConfigured),
         (None, Some(fs)) if fs.is_empty() => {
@@ -131,6 +133,12 @@ pub async fn generate_schema(
     if let Some(fns) = fns {
         query = process_fns(fns, query, &mut types).await?;
     }
+
+    mutation = process_acs(
+        acs,
+        mutation,
+        &mut types,
+    ).await?;
 
     // trace!("current Query object for schema: {:?}", query);
 
