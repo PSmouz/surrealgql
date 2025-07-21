@@ -119,7 +119,7 @@ argon2.workspace = true
 async-channel.workspace = true
 async-executor.workspace = true
 async-graphql = { workspace = true, default-features = false, features = [
-    "dynamic-schema", "graphiql"
+    "dynamic-schema"
 ] }
 base64.workspace = true
 bcrypt.workspace = true
