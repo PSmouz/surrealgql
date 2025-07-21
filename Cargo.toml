@@ -50,7 +50,7 @@ argon2 = "0.5.2"
 arrayvec = "0.7.6"
 async-channel = "2.3.1"
 async-executor = "1.13.1"
-async-graphql = { version = "7.0.9", default-features = false }
+async-graphql = { version = "7.0.9", default-features = false, features = ["graphiql"] }
 async-graphql-axum = "=7.0.13"
 base64 = "0.21.5"
 bcrypt = "0.15.0"
