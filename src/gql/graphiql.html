@@ -168,7 +168,7 @@
         })
     );
 
-    function Settings() {
+    function Settings({changeFn, headers}) {
       return React.createElement(React.Fragment, null,
           React.createElement(
               'div',
@@ -195,7 +195,10 @@
               ),
               React.createElement(
                   "input",
-                  null
+                  {
+                    value: headers['surreal-ns'],
+                    onChange: (e) => changeFn('surreal-ns', e.target.value),
+                  }
               )
           ),
           React.createElement(
@@ -223,7 +226,10 @@
               ),
               React.createElement(
                   "input",
-                  null
+                  {
+                    value: headers['surreal-db'],
+                    onChange: (e) => changeFn('surreal-db', e.target.value),
+                  }
               )
           ),
           React.createElement(
@@ -251,7 +257,11 @@
               ),
               React.createElement(
                   "input",
-                  null
+                  {
+                    value: headers['auth'],
+                    onChange: (e) => changeFn('auth', e.target.value),
+                    placeholder: 'Basic base64(username:password) or Bearer token',
+                  }
               )
           )
       )
@@ -266,38 +276,33 @@
     };
 
     function App() {
-      // const [headers, setHeaders] = React.useState({});
-      // const [isDialogOpen, setIsDialogOpen] = React.useState(false);
-      // const [settings, setSettings] = React.useState({
-      //   ns: '',
-      //   db: '',
-      //   auth: ''
-      // });
-
-      // const handleSettingsChange = React.useCallback((newSettings) => {
-      //   const newHeaders = {
-      //     'surreal-ns': newSettings.ns || '',
-      //     'surreal-db': newSettings.db || '',
-      //     'Authorization': newSettings.auth ? `Basic ${btoa(newSettings.auth)}` : '',
-      //   };
-      //   setHeaders(newHeaders);
-      //   setSettings(newSettings);
-      // }, []);
       const [showSurreal, setShowSurreal] = React.useState(false);
+      const [headers, setHeaders] = React.useState({
+        'surreal-ns': '',
+        'surreal-db': '',
+        'auth': '',
+      });
 
       const handleShowDialog = () => {
         setShowSurreal(true);
       };
 
-      function handleOpenSurrealDialog(isOpen) {
+      const handleOpenSurrealDialog = (isOpen) => {
         if (!isOpen) {
           setShowSurreal(false);
         }
-      }
+      };
+
+      const handleHeaderChange = (key, value) => {
+        setHeaders(prevHeaders => ({
+          ...prevHeaders,
+          [key]: value,
+        }));
+      };
 
       const fetcher = createGraphiQLFetcher({
         url: createUrl('/graphql'),
-        // headers: headers,
+        headers,
         fetch: (url, opts) => fetch(url, {...opts, credentials: 'same-origin'}),
       });
 
@@ -351,7 +356,10 @@
                   ),
                   React.createElement(Dialog.Close, null)
               ),
-              React.createElement(Settings, null)
+              React.createElement(Settings, {
+                changeFn: handleHeaderChange,
+                headers
+              })
           )
       );
     }
