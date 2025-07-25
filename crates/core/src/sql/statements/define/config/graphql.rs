@@ -24,8 +24,8 @@ pub struct GraphQLConfig {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub enum TablesConfig {
-    #[default]
     None,
+    #[default]
     Auto,
     Include(Vec<TableConfig>),
     Exclude(Vec<TableConfig>),
@@ -44,8 +44,8 @@ pub struct TableConfig {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[non_exhaustive]
 pub enum FunctionsConfig {
-    #[default]
     None,
+    #[default]
     Auto,
     Include(Vec<Ident>),
     Exclude(Vec<Ident>),
