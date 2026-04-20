@@ -82,7 +82,8 @@ pub(crate) struct SchemaContext<'a> {
 /// - A **Query** root containing singular and connection fields for each table, plus custom
 ///   function fields.
 /// - An optional **Mutation** root containing CRUD operations for each table and authentication
-///   mutations (`signIn`, `signUp`).
+///   mutations (`signin`, `signinRoot`, `signinNS`, `signinDB`, `signinAccess`,
+///   `signup`, `signupAccess`, `authenticate`, and `invalidate`).
 /// - All supporting types: table Object types, filter/order inputs, scalars, geometry types, enums,
 ///   unions, and interfaces.
 ///
@@ -191,15 +192,13 @@ pub async fn generate_schema(
 		_ => {}
 	}
 
-	// Generate auth mutations (signIn/signUp) from access definitions
+	// Generate auth mutations from IAM capabilities and database access definitions
 	{
 		let accesses = tx.all_db_accesses(db_def.namespace_id, db_def.database_id, None).await?;
-		if !accesses.is_empty() {
-			let mut auth_mutation = mutation_obj.take().unwrap_or_else(|| Object::new("Mutation"));
-			auth_mutation =
-				add_auth_mutations(auth_mutation, &mut types, &accesses, ns, db, datastore);
-			mutation_obj = Some(auth_mutation);
-		}
+		let mut auth_mutation = mutation_obj.take().unwrap_or_else(|| Object::new("Mutation"));
+		auth_mutation =
+			add_auth_mutations(auth_mutation, &mut types, &accesses, ns, db, datastore)?;
+		mutation_obj = Some(auth_mutation);
 	}
 
 	if let Some(fns) = fns {

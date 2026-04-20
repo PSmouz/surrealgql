@@ -18,8 +18,9 @@
 //!   (create, update, upsert, delete, and relation `relate`) with typed input
 //!   and payload objects.
 //! - **Functions** ([`functions`]) -- exposes user-defined database functions as Query fields.
-//! - **Authentication** ([`auth`]) -- generates `signIn` / `signUp` mutations from database access
-//!   definitions.
+//! - **Authentication** ([`auth`]) -- generates GitHub-style auth mutations
+//!   (`signin`, `signinRoot`, `signinNS`, `signinDB`, `signinAccess`, `signup`,
+//!   `signupAccess`, `authenticate`, and `invalidate`).
 //! - **Relations** ([`relations`]) -- discovers relation tables and provides data structures for
 //!   relation field generation.
 //! - **Caching** ([`cache`]) -- caches generated schemas keyed by namespace, database, and GraphQL

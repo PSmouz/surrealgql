@@ -3770,6 +3770,9 @@ mod graphql_integration {
 					r#"
 					DEFINE CONFIG GRAPHQL AUTO;
 
+					DEFINE USER ns_owner ON NAMESPACE PASSWORD 'ns-secret' ROLES OWNER;
+					DEFINE USER db_owner ON DATABASE PASSWORD 'db-secret' ROLES OWNER;
+
 					DEFINE ACCESS user ON DATABASE TYPE RECORD
 						SIGNUP ( CREATE user SET email = $email, pass = crypto::argon2::generate($pass) )
 						SIGNIN ( SELECT * FROM user WHERE email = $email AND crypto::argon2::compare(pass, $pass) )
@@ -3792,7 +3795,7 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200, "body: {}", res.text().await?);
 		}
 
-		// Test schema introspection: signIn and signUp should appear in Mutation type
+		// Test schema introspection: the corrected auth mutation surface should be present.
 		{
 			let res = client
 				.post(gql_url)
@@ -3814,16 +3817,171 @@ mod graphql_integration {
 			let field_names: Vec<&str> =
 				fields.as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
 			assert!(
-				field_names.contains(&"signIn"),
-				"Mutation should have signIn field, got: {field_names:?}"
+				field_names.contains(&"signin"),
+				"Mutation should have signin field, got: {field_names:?}"
 			);
 			assert!(
-				field_names.contains(&"signUp"),
-				"Mutation should have signUp field, got: {field_names:?}"
+				field_names.contains(&"signinRoot"),
+				"Mutation should have signinRoot field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"signinNS"),
+				"Mutation should have signinNS field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"signinDB"),
+				"Mutation should have signinDB field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"signinAccess"),
+				"Mutation should have signinAccess field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"signup"),
+				"Mutation should have signup field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"signupAccess"),
+				"Mutation should have signupAccess field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"authenticate"),
+				"Mutation should have authenticate field, got: {field_names:?}"
+			);
+			assert!(
+				field_names.contains(&"invalidate"),
+				"Mutation should have invalidate field, got: {field_names:?}"
 			);
 		}
 
-		// Test signUp: create a new user via GraphQL mutation
+		// Test input/payload typing via introspection.
+		{
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": r#"{
+						mutationType: __type(name: "Mutation") {
+							fields {
+								name
+								args { name type { kind name ofType { kind name } } }
+								type { kind name ofType { kind name } }
+							}
+						}
+						signinInput: __type(name: "SigninInput") {
+							inputFields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+						signinAccessInput: __type(name: "SigninAccessInput") {
+							inputFields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+						signupAccessInput: __type(name: "SignupAccessInput") {
+							inputFields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+						signinAccessPayload: __type(name: "SigninAccessPayload") {
+							fields { name }
+						}
+						invalidatePayload: __type(name: "InvalidatePayload") {
+							fields { name }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "Introspection errors: {:?}", body["errors"]);
+
+			let fields = body["data"]["mutationType"]["fields"].as_array().unwrap();
+			let signin = fields.iter().find(|f| f["name"] == "signin").unwrap();
+			let signin_root = fields.iter().find(|f| f["name"] == "signinRoot").unwrap();
+			let signin_ns = fields.iter().find(|f| f["name"] == "signinNS").unwrap();
+			let signin_db = fields.iter().find(|f| f["name"] == "signinDB").unwrap();
+			let signin_access = fields.iter().find(|f| f["name"] == "signinAccess").unwrap();
+			let signup = fields.iter().find(|f| f["name"] == "signup").unwrap();
+			let signup_access = fields.iter().find(|f| f["name"] == "signupAccess").unwrap();
+			let authenticate = fields.iter().find(|f| f["name"] == "authenticate").unwrap();
+			let invalidate = fields.iter().find(|f| f["name"] == "invalidate").unwrap();
+
+			assert_eq!(signin["type"]["kind"], "NON_NULL");
+			assert_eq!(signin["type"]["ofType"]["name"], "SigninPayload");
+			assert_eq!(signin_root["type"]["ofType"]["name"], "SigninRootPayload");
+			assert_eq!(signin_ns["type"]["ofType"]["name"], "SigninNSPayload");
+			assert_eq!(signin_db["type"]["ofType"]["name"], "SigninDBPayload");
+			assert_eq!(signin_access["type"]["ofType"]["name"], "SigninAccessPayload");
+			assert_eq!(signup["type"]["ofType"]["name"], "SignupPayload");
+			assert_eq!(signup_access["type"]["ofType"]["name"], "SignupAccessPayload");
+			assert_eq!(authenticate["type"]["ofType"]["name"], "AuthenticatePayload");
+			assert_eq!(invalidate["type"]["ofType"]["name"], "InvalidatePayload");
+
+			let signin_args = signin["args"].as_array().unwrap();
+			assert_eq!(signin_args.len(), 1);
+			assert_eq!(signin_args[0]["name"], "input");
+			assert_eq!(signin_args[0]["type"]["kind"], "NON_NULL");
+			assert_eq!(signin_args[0]["type"]["ofType"]["name"], "SigninInput");
+
+			let signin_input_fields =
+				body["data"]["signinInput"]["inputFields"].as_array().unwrap();
+			let signin_field_names: Vec<&str> =
+				signin_input_fields.iter().map(|field| field["name"].as_str().unwrap()).collect();
+			assert!(signin_field_names.contains(&"namespace"));
+			assert!(signin_field_names.contains(&"database"));
+			assert!(signin_field_names.contains(&"access"));
+			assert!(signin_field_names.contains(&"username"));
+			assert!(signin_field_names.contains(&"password"));
+			assert!(signin_field_names.contains(&"variables"));
+			assert!(!signin_field_names.contains(&"input"));
+
+			let signin_access_input_fields =
+				body["data"]["signinAccessInput"]["inputFields"].as_array().unwrap();
+			let signin_access_field_names: Vec<&str> = signin_access_input_fields
+				.iter()
+				.map(|field| field["name"].as_str().unwrap())
+				.collect();
+			assert_eq!(
+				signin_access_field_names,
+				vec!["namespace", "database", "access", "variables"]
+			);
+
+			let signup_access_input_fields =
+				body["data"]["signupAccessInput"]["inputFields"].as_array().unwrap();
+			let signup_access_field_names: Vec<&str> = signup_access_input_fields
+				.iter()
+				.map(|field| field["name"].as_str().unwrap())
+				.collect();
+			assert_eq!(
+				signup_access_field_names,
+				vec!["namespace", "database", "access", "variables"]
+			);
+
+			let payload_fields = body["data"]["signinAccessPayload"]["fields"].as_array().unwrap();
+			let payload_field_names: Vec<&str> =
+				payload_fields.iter().map(|field| field["name"].as_str().unwrap()).collect();
+			assert!(payload_field_names.contains(&"success"));
+			assert!(payload_field_names.contains(&"message"));
+			assert!(payload_field_names.contains(&"token"));
+
+			assert_eq!(invalidate["args"].as_array().unwrap().len(), 0);
+			let invalidate_payload_fields =
+				body["data"]["invalidatePayload"]["fields"].as_array().unwrap();
+			let invalidate_payload_field_names: Vec<&str> = invalidate_payload_fields
+				.iter()
+				.map(|field| field["name"].as_str().unwrap())
+				.collect();
+			assert!(invalidate_payload_field_names.contains(&"success"));
+			assert!(invalidate_payload_field_names.contains(&"message"));
+		}
+
+		// Test signupAccess: create a new user via a dedicated access mutation.
 		let signup_token;
 		{
 			let res = client
@@ -3831,8 +3989,12 @@ mod graphql_integration {
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signUp(access: USER, variables: { email: "alice@example.com", pass: "secret123" }) {
+						signupAccess(input: {
+							access: "user"
+							variables: { email: "alice@example.com", pass: "secret123" }
+						}) {
 							success
+							message
 							token
 						}
 					}"#})
@@ -3842,16 +4004,16 @@ mod graphql_integration {
 				.await?;
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
-			assert!(body["errors"].is_null(), "SignUp errors: {:?}", body["errors"]);
-			assert_eq!(body["data"]["signUp"]["success"], true);
-			let token = body["data"]["signUp"]["token"].as_str().unwrap();
+			assert!(body["errors"].is_null(), "signupAccess errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["signupAccess"]["success"], true);
+			assert_eq!(body["data"]["signupAccess"]["message"], "Registration succeeded.");
+			let token = body["data"]["signupAccess"]["token"].as_str().unwrap();
 			assert!(!token.is_empty(), "SignUp should return a non-empty JWT token");
-			// JWT tokens have 3 parts separated by dots
 			assert_eq!(token.split('.').count(), 3, "Token should be a valid JWT format");
 			signup_token = token.to_string();
 		}
 
-		// Test that the signup token works for authentication
+		// Test that the sign-up token works for authenticated queries.
 		{
 			let res = client
 				.post(gql_url)
@@ -3868,16 +4030,19 @@ mod graphql_integration {
 			);
 		}
 
-		// Test signIn: authenticate with the newly created user
-		let signin_token;
+		// Test generic signIn using an access method.
 		{
 			let res = client
 				.post(gql_url)
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signIn(access: USER, variables: { email: "alice@example.com", pass: "secret123" }) {
+						signin(input: {
+							access: "user"
+							variables: { email: "alice@example.com", pass: "secret123" }
+						}) {
 							success
+							message
 							token
 						}
 					}"#})
@@ -3887,17 +4052,133 @@ mod graphql_integration {
 				.await?;
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
-			assert!(body["errors"].is_null(), "SignIn errors: {:?}", body["errors"]);
-			assert_eq!(body["data"]["signIn"]["success"], true);
-			let token = body["data"]["signIn"]["token"].as_str().unwrap();
+			assert!(body["errors"].is_null(), "Generic signin errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["signin"]["success"], true);
+			assert_eq!(body["data"]["signin"]["message"], "Authentication succeeded.");
+			let token = body["data"]["signin"]["token"].as_str().unwrap();
+			assert_eq!(token.split('.').count(), 3);
+		}
+
+		// Test signinAccess with the newly created user.
+		let signin_token;
+		{
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": r#"mutation {
+						signinAccess(input: {
+							access: "user"
+							variables: { email: "alice@example.com", pass: "secret123" }
+						}) {
+							success
+							message
+							token
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "signinAccess errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["signinAccess"]["success"], true);
+			assert_eq!(body["data"]["signinAccess"]["message"], "Authentication succeeded.");
+			let token = body["data"]["signinAccess"]["token"].as_str().unwrap();
 			assert!(!token.is_empty(), "SignIn should return a non-empty JWT token");
 			assert_eq!(token.split('.').count(), 3, "Token should be a valid JWT format");
 			signin_token = token.to_string();
 		}
 
-		// Test that the signin token works for querying data
+		// Test authenticate with a valid token.
 		{
-			// First create a post using root to have some data
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": format!(r#"mutation {{
+						authenticate(input: {{ token: "{}" }}) {{
+							success
+							message
+							token
+						}}
+					}}"#, signin_token)})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "Authenticate errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["authenticate"]["success"], true);
+			assert_eq!(body["data"]["authenticate"]["message"], "The token is valid.");
+			assert_eq!(body["data"]["authenticate"]["token"], signin_token);
+		}
+
+		// Test root, namespace, and database sign-in flows.
+		{
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": format!(r#"mutation {{
+						signinRoot(input: {{ username: "{USER}", password: "{PASS}" }}) {{
+							success
+							token
+						}}
+						signinNS(input: {{ username: "ns_owner", password: "ns-secret" }}) {{
+							success
+							token
+						}}
+						signinDB(input: {{ username: "db_owner", password: "db-secret" }}) {{
+							success
+							token
+						}}
+					}}"#)})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "Scoped sign-in errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["signinRoot"]["success"], true);
+			assert_eq!(body["data"]["signinNS"]["success"], true);
+			assert_eq!(body["data"]["signinDB"]["success"], true);
+			assert_eq!(body["data"]["signinRoot"]["token"].as_str().unwrap().split('.').count(), 3);
+			assert_eq!(body["data"]["signinNS"]["token"].as_str().unwrap().split('.').count(), 3);
+			assert_eq!(body["data"]["signinDB"]["token"].as_str().unwrap().split('.').count(), 3);
+		}
+
+		// Test invalidate exposes no input.
+		{
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": r#"mutation {
+						invalidate {
+							success
+							message
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "Invalidate errors: {:?}", body["errors"]);
+			assert_eq!(body["data"]["invalidate"]["success"], true);
+			assert_eq!(
+				body["data"]["invalidate"]["message"],
+				"The current session has been invalidated."
+			);
+		}
+
+		// Test that the sign-in token works for querying data.
+		{
 			let res = client
 				.post(sql_url)
 				.basic_auth(USER, Some(PASS))
@@ -3926,15 +4207,17 @@ mod graphql_integration {
 			assert_eq!(posts[0]["title"], "Hello");
 		}
 
-		// Test signIn with wrong credentials: should return a generic auth error
-		// that does NOT leak specific details about why authentication failed
+		// Test signin with wrong credentials: should return a generic auth error.
 		{
 			let res = client
 				.post(gql_url)
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signIn(access: USER, variables: { email: "alice@example.com", pass: "wrongpassword" }) {
+						signin(input: {
+							access: "user"
+							variables: { email: "alice@example.com", pass: "wrongpassword" }
+						}) {
 							success
 							token
 						}
@@ -3945,27 +4228,58 @@ mod graphql_integration {
 				.await?;
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
-			assert!(body["errors"].is_array(), "SignIn with wrong password should return errors");
+			assert!(body["errors"].is_array(), "signin with wrong password should return errors");
 			let error_msg = body["errors"][0]["message"].as_str().unwrap_or("");
 			assert!(
 				error_msg.contains("problem with authentication"),
 				"Error should be a generic auth error, got: {error_msg}"
 			);
-			// Ensure the error does NOT leak specific IAM details
 			assert!(
 				!error_msg.contains("SELECT") && !error_msg.contains("argon2"),
 				"Auth error should not leak internal details, got: {error_msg}"
 			);
 		}
 
-		// Test signIn with non-existent access method: should return an error
+		// Test signin with non-existent access method: should still return a generic auth error.
 		{
 			let res = client
 				.post(gql_url)
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signIn(access: NONEXISTENT, variables: { email: "alice@example.com", pass: "secret123" }) {
+						signin(input: {
+							access: "nonexistent_access"
+							variables: { email: "alice@example.com", pass: "secret123" }
+						}) {
+							success
+							token
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_array(), "Expected auth errors for unknown access");
+			let error_msg = body["errors"][0]["message"].as_str().unwrap_or("");
+			assert!(
+				error_msg.contains("problem with authentication"),
+				"Unknown access should still be generic, got: {error_msg}"
+			);
+		}
+
+		// Test generic signup: should still work and return a token.
+		{
+			let res = client
+				.post(gql_url)
+				.basic_auth(USER, Some(PASS))
+				.body(
+					json!({"query": r#"mutation {
+						signup(input: {
+							access: "user"
+							variables: { email: "bob@example.com", pass: "bobpass" }
+						}) {
 							success
 							token
 						}
@@ -3977,88 +4291,15 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
 			assert!(
-				body["errors"].is_array(),
-				"SignIn with non-existent access should return errors"
+				body["errors"].is_null(),
+				"Generic signup should succeed: {:?}",
+				body["errors"]
 			);
-		}
-
-		// Test signUp with duplicate email: should still work (creates another user record)
-		{
-			let res = client
-				.post(gql_url)
-				.basic_auth(USER, Some(PASS))
-				.body(
-					json!({"query": r#"mutation {
-						signUp(access: USER, variables: { email: "bob@example.com", pass: "bobpass" }) {
-							success
-							token
-						}
-					}"#})
-					.to_string(),
-				)
-				.send()
-				.await?;
-			assert_eq!(res.status(), 200);
-			let body = res.json::<serde_json::Value>().await?;
-			assert!(body["errors"].is_null(), "Second signUp should succeed: {:?}", body["errors"]);
-			let token = body["data"]["signUp"]["token"].as_str().unwrap();
+			let token = body["data"]["signup"]["token"].as_str().unwrap();
 			assert!(!token.is_empty());
 		}
 
-		// Test signIn field arguments via introspection
-		{
-			let res = client
-				.post(gql_url)
-				.basic_auth(USER, Some(PASS))
-				.body(
-					json!({"query": r#"{
-						__type(name: "Mutation") {
-							fields {
-								name
-								args { name type { name kind ofType { name } } }
-								type { name kind ofType { name } }
-							}
-						}
-					}"#})
-					.to_string(),
-				)
-				.send()
-				.await?;
-			assert_eq!(res.status(), 200);
-			let body = res.json::<serde_json::Value>().await?;
-			assert!(body["errors"].is_null(), "Introspection errors: {:?}", body["errors"]);
-			let fields = body["data"]["__type"]["fields"].as_array().unwrap();
-			let sign_in = fields.iter().find(|f| f["name"] == "signIn").unwrap();
-			let sign_up = fields.iter().find(|f| f["name"] == "signUp").unwrap();
-
-			// signIn should return AuthenticationPayload! (NON_NULL object)
-			assert_eq!(sign_in["type"]["kind"], "NON_NULL");
-			assert_eq!(sign_in["type"]["ofType"]["name"], "AuthenticationPayload");
-
-			// signUp should return AuthenticationPayload! (NON_NULL object)
-			assert_eq!(sign_up["type"]["kind"], "NON_NULL");
-			assert_eq!(sign_up["type"]["ofType"]["name"], "AuthenticationPayload");
-
-			// signIn should have 'access' and 'variables' arguments
-			let sign_in_args = sign_in["args"].as_array().unwrap();
-			let arg_names: Vec<&str> =
-				sign_in_args.iter().map(|a| a["name"].as_str().unwrap()).collect();
-			assert!(arg_names.contains(&"access"), "signIn should have 'access' arg");
-			assert!(arg_names.contains(&"variables"), "signIn should have 'variables' arg");
-
-			// access should be AccessMethod! (NON_NULL)
-			let access_arg = sign_in_args.iter().find(|a| a["name"] == "access").unwrap();
-			assert_eq!(access_arg["type"]["kind"], "NON_NULL");
-			assert_eq!(access_arg["type"]["ofType"]["name"], "AccessMethod");
-
-			// variables should be JSON! (NON_NULL)
-			let variables_arg = sign_in_args.iter().find(|a| a["name"] == "variables").unwrap();
-			assert_eq!(variables_arg["type"]["kind"], "NON_NULL");
-			assert_eq!(variables_arg["type"]["ofType"]["name"], "JSON");
-		}
-
-		// Test that when no signup clause exists, signUp is not available
-		// (This test uses a separate ns/db with signin-only access)
+		// Test that when no signup clause exists, only the sign-up mutations are absent.
 		{
 			let ns2 = Ulid::new().to_string();
 			let db2 = Ulid::new().to_string();
@@ -4107,12 +4348,28 @@ mod graphql_integration {
 			let field_names: Vec<&str> =
 				fields.as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
 			assert!(
-				field_names.contains(&"signIn"),
-				"Mutation should have signIn field when signin clause exists"
+				field_names.contains(&"signin"),
+				"Mutation should have signin field when signin clause exists"
 			);
 			assert!(
-				!field_names.contains(&"signUp"),
-				"Mutation should NOT have signUp when no signup clause exists, got: {field_names:?}"
+				field_names.contains(&"signinAccess"),
+				"Mutation should have signinAccess when signin clause exists"
+			);
+			assert!(field_names.contains(&"signinRoot"), "Mutation should still have signinRoot");
+			assert!(field_names.contains(&"signinNS"), "Mutation should still have signinNS");
+			assert!(field_names.contains(&"signinDB"), "Mutation should still have signinDB");
+			assert!(
+				field_names.contains(&"authenticate"),
+				"Mutation should still have authenticate"
+			);
+			assert!(field_names.contains(&"invalidate"), "Mutation should still have invalidate");
+			assert!(
+				!field_names.contains(&"signup"),
+				"Mutation should NOT have signup when no signup clause exists, got: {field_names:?}"
+			);
+			assert!(
+				!field_names.contains(&"signupAccess"),
+				"Mutation should NOT have signupAccess, got: {field_names:?}"
 			);
 		}
 
@@ -5181,14 +5438,17 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200, "body: {}", res.text().await?);
 		}
 
-		// Test: signIn with wrong credentials should return generic error
+		// Test: signin with wrong credentials should return generic error
 		{
 			let res = client
 				.post(gql_url)
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signIn(access: USER, variables: { email: "nobody@test.com", pass: "wrong" }) {
+						signin(input: {
+							access: "user"
+							variables: { email: "nobody@test.com", pass: "wrong" }
+						}) {
 							success
 							token
 						}
@@ -5216,14 +5476,17 @@ mod graphql_integration {
 			);
 		}
 
-		// Test: signIn with non-existent access method should fail at GraphQL enum validation
+		// Test: signIn with non-existent access method should still stay generic
 		{
 			let res = client
 				.post(gql_url)
 				.basic_auth(USER, Some(PASS))
 				.body(
 					json!({"query": r#"mutation {
-						signIn(access: NONEXISTENT_ACCESS, variables: { email: "test", pass: "test" }) {
+						signin(input: {
+							access: "nonexistent_access"
+							variables: { email: "test", pass: "test" }
+						}) {
 							success
 							token
 						}
@@ -5237,8 +5500,8 @@ mod graphql_integration {
 			assert!(body["errors"].is_array());
 			let error_msg = body["errors"][0]["message"].as_str().unwrap_or("");
 			assert!(
-				error_msg.contains("enumeration type \"AccessMethod\""),
-				"Invalid enum value should be reported by GraphQL validation, got: {error_msg}"
+				error_msg.contains("problem with authentication"),
+				"Unknown access should still be generic, got: {error_msg}"
 			);
 			assert!(
 				!error_msg.contains("SELECT")
