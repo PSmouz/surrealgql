@@ -1227,10 +1227,10 @@ mod graphql_integration {
 			let body = res.json::<serde_json::Value>().await?;
 			let fields = body["data"]["__type"]["fields"].as_array().unwrap();
 			let dept_field = fields.iter().find(|f| f["name"] == "dept").unwrap();
-			// The type should be the department table type (NON_NULL wrapper)
+			// Record-link output fields are nullable by default and resolve to the target type.
 			let type_info = &dept_field["type"];
-			// non-null wraps the named type
-			assert_eq!(type_info["kind"], "NON_NULL");
+			assert_eq!(type_info["kind"], "OBJECT");
+			assert_eq!(type_info["name"], "Department");
 		}
 
 		Ok(())
@@ -3740,6 +3740,101 @@ mod graphql_integration {
 
 		assert_eq!(name_field["description"], "Person display name");
 		assert_eq!(age_field["description"], "Person age");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn output_fields_are_nullable_by_default() -> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server) = common::start_server_without_auth().await.unwrap();
+		let gql_url = &format!("http://{addr}/graphql");
+		let sql_url = &format!("http://{addr}/sql");
+
+		let mut headers = reqwest::header::HeaderMap::new();
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		headers.insert("surreal-ns", ns.parse()?);
+		headers.insert("surreal-db", db.parse()?);
+		headers.insert(header::ACCEPT, "application/json".parse()?);
+		let client = Client::builder()
+			.connect_timeout(Duration::from_secs(10))
+			.default_headers(headers)
+			.build()?;
+
+		{
+			let res = client
+				.post(sql_url)
+				.body(
+					r#"
+					DEFINE CONFIG GRAPHQL AUTO;
+					DEFINE TABLE person SCHEMAFUL;
+					DEFINE FIELD name ON person TYPE string;
+					DEFINE FIELD tags ON person TYPE array<string>;
+				"#,
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200, "body: {}", res.text().await?);
+		}
+
+		let res = client
+			.post(gql_url)
+			.body(
+				json!({"query": r#"{
+					queryType: __type(name: "Query") {
+						fields {
+							name
+							type {
+								kind
+								name
+								ofType {
+									kind
+									name
+								}
+							}
+						}
+					}
+					personType: __type(name: "Person") {
+						fields {
+							name
+							type {
+								kind
+								name
+								ofType {
+									kind
+									name
+								}
+							}
+						}
+					}
+				}"#})
+				.to_string(),
+			)
+			.send()
+			.await?;
+		assert_eq!(res.status(), 200);
+
+		let body = res.json::<serde_json::Value>().await?;
+		assert!(body["errors"].is_null(), "Unexpected errors: {:?}", body["errors"]);
+
+		let person_fields = body["data"]["personType"]["fields"].as_array().unwrap();
+		let id_field = person_fields.iter().find(|f| f["name"] == "id").unwrap();
+		let name_field = person_fields.iter().find(|f| f["name"] == "name").unwrap();
+		let tags_field = person_fields.iter().find(|f| f["name"] == "tags").unwrap();
+
+		assert_eq!(id_field["type"]["kind"], "NON_NULL");
+		assert_eq!(id_field["type"]["ofType"]["name"], "ID");
+
+		assert_eq!(name_field["type"]["kind"], "SCALAR");
+		assert_eq!(name_field["type"]["name"], "String");
+
+		assert_eq!(tags_field["type"]["kind"], "OBJECT");
+		assert_eq!(tags_field["type"]["name"], "PersonTagsConnection");
+
+		let query_fields = body["data"]["queryType"]["fields"].as_array().unwrap();
+		let persons_field = query_fields.iter().find(|f| f["name"] == "persons").unwrap();
+		assert_eq!(persons_field["type"]["kind"], "NON_NULL");
+		assert_eq!(persons_field["type"]["ofType"]["name"], "PersonConnection");
 
 		Ok(())
 	}

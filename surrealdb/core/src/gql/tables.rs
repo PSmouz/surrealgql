@@ -590,11 +590,9 @@ fn make_nested_object_type(
 					TypeRef::named_nn(&child.type_name),
 					types,
 				);
-				connection_type_ref(&connection_type_name, child.optional)
-			} else if child.optional {
-				TypeRef::named(&child.type_name)
+				TypeRef::named(&connection_type_name)
 			} else {
-				TypeRef::named_nn(&child.type_name)
+				TypeRef::named(&child.type_name)
 			};
 
 			if child.is_array {
@@ -635,7 +633,7 @@ fn make_nested_object_type(
 			};
 			let enum_scope = format!("{}_{}", node.type_name, child.sql_name);
 			let list_item = list_item_kind(&kind);
-			let fd_type = if let Some((item_kind, optional)) = &list_item {
+			let fd_type = if let Some((item_kind, _optional)) = &list_item {
 				let node_type = kind_to_type_with_enum_prefix(
 					item_kind.clone(),
 					types,
@@ -652,9 +650,14 @@ fn make_nested_object_type(
 					node_type,
 					types,
 				);
-				connection_type_ref(&connection_type_name, *optional)
+				TypeRef::named(&connection_type_name)
 			} else {
-				kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?
+				unwrap_type(kind_to_type_with_enum_prefix(
+					kind.clone(),
+					types,
+					false,
+					Some(&enum_scope),
+				)?)
 			};
 
 			if let Some((item_kind, _optional)) = list_item {
@@ -1158,12 +1161,8 @@ fn relation_objects_to_connection(
 	make_relation_connection_value(&out?, args)
 }
 
-fn connection_type_ref(type_name: &str, optional: bool) -> TypeRef {
-	if optional {
-		TypeRef::named(type_name)
-	} else {
-		TypeRef::named_nn(type_name)
-	}
+fn non_null_list_of_nullable(type_name: &str) -> TypeRef {
+	TypeRef::NonNull(Box::new(TypeRef::List(Box::new(TypeRef::named(type_name)))))
 }
 
 fn list_item_kind(kind: &Kind) -> Option<(Kind, bool)> {
@@ -1214,6 +1213,7 @@ fn make_named_connection_types(
 	types: &mut Vec<Type>,
 ) -> (String, String) {
 	let node_list_type_name = unwrap_type(node_type.clone()).to_string();
+	let node_field_type = unwrap_type(node_type);
 
 	let edge = Object::new(&edge_type_name)
 		.description(edge_description(description_name))
@@ -1228,7 +1228,7 @@ fn make_named_connection_types(
 			.directive(semantic_non_null_directive()),
 		)
 		.field(
-			Field::new("node", node_type.clone(), |ctx| {
+			Field::new("node", node_field_type, |ctx| {
 				FieldFuture::new(async move {
 					let edge = ctx.parent_value.try_downcast_ref::<ConnectionEdge>()?;
 					Ok(Some(edge.node.to_field_value()))
@@ -1257,7 +1257,7 @@ fn make_named_connection_types(
 			.directive(semantic_non_null_directive()),
 		)
 		.field(
-			Field::new("nodes", TypeRef::named_nn_list_nn(&node_list_type_name), |ctx| {
+			Field::new("nodes", non_null_list_of_nullable(&node_list_type_name), |ctx| {
 				FieldFuture::new(async move {
 					let connection = ctx.parent_value.try_downcast_ref::<Connection>()?;
 					let nodes = connection
@@ -1437,6 +1437,7 @@ fn make_relation_connection_types(
 ) -> Result<(), GqlError> {
 	let node_type = TypeRef::named_nn(&relation.node_type_name);
 	let node_list_type_name = unwrap_type(node_type.clone()).to_string();
+	let node_field_type = unwrap_type(node_type);
 
 	let mut edge = Object::new(&relation.edge_type_name)
 		.description(edge_description(&relation.field_name))
@@ -1451,7 +1452,7 @@ fn make_relation_connection_types(
 			.directive(semantic_non_null_directive()),
 		)
 		.field(
-			Field::new("node", node_type.clone(), |ctx| {
+			Field::new("node", node_field_type, |ctx| {
 				FieldFuture::new(async move {
 					let edge = ctx.parent_value.try_downcast_ref::<ConnectionEdge>()?;
 					Ok(Some(edge.node.to_field_value()))
@@ -1504,11 +1505,9 @@ fn make_relation_connection_types(
 					TypeRef::named_nn(&nested.type_name),
 					types,
 				);
-				connection_type_ref(&connection_type_name, nested.optional)
-			} else if nested.optional {
-				TypeRef::named(&nested.type_name)
+				TypeRef::named(&connection_type_name)
 			} else {
-				TypeRef::named_nn(&nested.type_name)
+				TypeRef::named(&nested.type_name)
 			};
 
 			let mut field = if nested.is_array {
@@ -1560,7 +1559,7 @@ fn make_relation_connection_types(
 
 		let enum_scope = format!("{}_{}", relation.relation_table_name.as_str(), sql_field_name);
 		let list_item = list_item_kind(kind);
-		let fd_type = if let Some((item_kind, optional)) = &list_item {
+		let fd_type = if let Some((item_kind, _optional)) = &list_item {
 			let node_type =
 				kind_to_type_with_enum_prefix(item_kind.clone(), types, false, Some(&enum_scope))?;
 			let connection_type_name =
@@ -1574,9 +1573,14 @@ fn make_relation_connection_types(
 				node_type,
 				types,
 			);
-			connection_type_ref(&connection_type_name, *optional)
+			TypeRef::named(&connection_type_name)
 		} else {
-			kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?
+			unwrap_type(kind_to_type_with_enum_prefix(
+				kind.clone(),
+				types,
+				false,
+				Some(&enum_scope),
+			)?)
 		};
 
 		let mut field = if let Some((item_kind, _optional)) = list_item {
@@ -1654,7 +1658,7 @@ fn make_relation_connection_types(
 			.directive(semantic_non_null_directive()),
 		)
 		.field(
-			Field::new("nodes", TypeRef::named_nn_list_nn(&node_list_type_name), |ctx| {
+			Field::new("nodes", non_null_list_of_nullable(&node_list_type_name), |ctx| {
 				FieldFuture::new(async move {
 					let connection = ctx.parent_value.try_downcast_ref::<Connection>()?;
 					let nodes = connection
@@ -2146,11 +2150,9 @@ fn build_table_type(
 					TypeRef::named_nn(&nested.type_name),
 					types,
 				);
-				connection_type_ref(&connection_type_name, nested.optional)
-			} else if nested.optional {
-				TypeRef::named(&nested.type_name)
+				TypeRef::named(&connection_type_name)
 			} else {
-				TypeRef::named_nn(&nested.type_name)
+				TypeRef::named(&nested.type_name)
 			};
 
 			if !nested.is_array {
@@ -2209,7 +2211,7 @@ fn build_table_type(
 		// Handle regular fields
 		let enum_scope = format!("{}_{}", tb_name_str, sql_field_name);
 		let list_item = list_item_kind(kind);
-		let fd_type = if let Some((item_kind, optional)) = &list_item {
+		let fd_type = if let Some((item_kind, _optional)) = &list_item {
 			let node_type =
 				kind_to_type_with_enum_prefix(item_kind.clone(), types, false, Some(&enum_scope))?;
 			let connection_type_name =
@@ -2222,9 +2224,14 @@ fn build_table_type(
 				node_type,
 				types,
 			);
-			connection_type_ref(&connection_type_name, *optional)
+			TypeRef::named(&connection_type_name)
 		} else {
-			kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?
+			unwrap_type(kind_to_type_with_enum_prefix(
+				kind.clone(),
+				types,
+				false,
+				Some(&enum_scope),
+			)?)
 		};
 		if list_item.is_none() {
 			orderable = orderable.item(

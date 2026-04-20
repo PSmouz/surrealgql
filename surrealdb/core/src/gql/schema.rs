@@ -1663,3 +1663,44 @@ pub(crate) fn geometry_to_gql_object(g: &SurGeometry) -> Result<GqlValue, GqlErr
 
 	Ok(GqlValue::Object(map))
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn sdl_marks_required_db_fields_as_semantically_non_null() {
+		let datastore = Arc::new(Datastore::new("memory").await.unwrap());
+		let session = Session::owner().with_ns("test").with_db("test");
+
+		datastore
+			.execute(
+				r#"
+				DEFINE CONFIG GRAPHQL AUTO;
+				DEFINE TABLE person SCHEMAFUL;
+				DEFINE FIELD name ON person TYPE string;
+			"#,
+				&session,
+				None,
+			)
+			.await
+			.unwrap();
+
+		let schema = generate_schema(
+			&datastore,
+			&session,
+			GraphQLConfig {
+				tables: GraphQLTablesConfig::Auto,
+				functions: GraphQLFunctionsConfig::None,
+				depth_limit: None,
+				complexity_limit: None,
+				introspection: GraphQLIntrospectionConfig::Auto,
+			},
+		)
+		.await
+		.unwrap();
+
+		let sdl = schema.sdl();
+		assert!(sdl.contains("name: String @semanticNonNull"), "SDL was:\n{sdl}");
+	}
+}
