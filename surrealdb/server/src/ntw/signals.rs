@@ -27,9 +27,16 @@ pub fn graceful_shutdown(
 			Ok(signal) => {
 				warn!(target: super::LOG, "{signal} received. Waiting for a graceful shutdown. A second signal will force an immediate shutdown.");
 			}
-			_ => {
-				error!(target: super::LOG, "Failed to listen to shutdown signal. Terminating immediately.");
-				canceller.cancel();
+			Err(err) => {
+				warn!(
+					target: super::LOG,
+					"Failed to listen to shutdown signal ({err}). Falling back to cancellation-token-only shutdown."
+				);
+				canceller.cancelled().await;
+				http_handle.shutdown();
+				rpc::shutdown(state);
+				telemetry::shutdown();
+				return;
 			}
 		}
 		// Spawn a task to gracefully shutdown

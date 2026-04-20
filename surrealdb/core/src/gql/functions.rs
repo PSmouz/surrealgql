@@ -13,6 +13,7 @@ use std::sync::Arc;
 use async_graphql::dynamic::{Field, FieldFuture, FieldValue, InputValue, Object, Type};
 
 use super::GqlError;
+use super::naming;
 use super::schema::{gql_to_sql_kind_with_scope, sql_value_to_gql_value_with_kind};
 use super::utils::execute_plan;
 use crate::catalog::FunctionDefinition;
@@ -98,7 +99,7 @@ pub async fn process_fns(
 							// interface resolution; typed `record<T>` do not.
 							let field_val = match &fnd1.returns {
 								Some(Kind::Record(ts)) if ts.is_empty() => {
-									field_val.with_type(rid.table)
+									field_val.with_type(naming::table_type_name(&rid.table))
 								}
 								_ => field_val,
 							};

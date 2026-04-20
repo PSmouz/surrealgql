@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::error::{GqlError, resolver_error};
+use super::naming;
 use super::tables::{CachedRecord, filter_name_from_table, parse_filter_arg};
 use super::utils::{GqlValueUtils, execute_plan};
-use crate::catalog::{FieldDefinition, TableDefinition};
+use crate::catalog::{FieldDefinition, TableDefinition, TableType};
 use crate::dbs::Session;
 use crate::expr::field::Selector;
 use crate::expr::plan::TopLevelExpr;
@@ -95,6 +96,9 @@ pub(crate) fn process_subscriptions(
 
 	let mut subscription = Subscription::new("Subscription");
 	for tb in tbs {
+		if matches!(tb.table_type, TableType::Relation(_)) {
+			continue;
+		}
 		let fds = table_fields
 			.get(tb.name.as_str())
 			.cloned()
@@ -111,10 +115,11 @@ fn make_table_subscription_field(
 ) -> SubscriptionField {
 	let tb_name = tb.name.clone();
 	let tb_name_str = tb_name.clone().into_string();
+	let gql_type_name = naming::table_type_name(&tb_name_str);
 	let table_filter_name = filter_name_from_table(&tb_name);
 	let selectable_fields = selectable_top_level_fields(&fds);
 
-	SubscriptionField::new(tb_name_str.clone(), TypeRef::named(&tb_name_str), move |ctx| {
+	SubscriptionField::new(tb_name_str.clone(), TypeRef::named(&gql_type_name), move |ctx| {
 		let tb_name = tb_name.clone();
 		let fds = fds.clone();
 		let selectable_fields = selectable_fields.clone();
@@ -155,8 +160,7 @@ fn make_table_subscription_field(
 	})
 	.description(format!("LIVE query notifications for `{}`", tb.name))
 	.argument(InputValue::new("id", TypeRef::named(TypeRef::ID)))
-	.argument(InputValue::new("filter", TypeRef::named(&table_filter_name)))
-	.argument(InputValue::new("where", TypeRef::named(&table_filter_name)))
+	.argument(InputValue::new("filterBy", TypeRef::named(&table_filter_name)))
 	.argument(InputValue::new("fetch", TypeRef::named_nn_list(TypeRef::STRING)))
 }
 

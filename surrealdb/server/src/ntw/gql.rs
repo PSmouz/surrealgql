@@ -7,7 +7,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::http::header::SEC_WEBSOCKET_PROTOCOL;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::{SinkExt, StreamExt, future};
@@ -24,7 +24,14 @@ use crate::rpc::RpcState;
 pub fn router() -> Router<Arc<RpcState>> {
 	let service = GraphQLService::new();
 	let cache = service.cache();
-	Router::new().route("/graphql", get(ws_handler).post_service(service)).layer(Extension(cache))
+	Router::new()
+		.route("/graphql", get(ws_handler).post_service(service))
+		.route("/graphiql", get(graphiql_handler))
+		.layer(Extension(cache))
+}
+
+async fn graphiql_handler() -> impl IntoResponse {
+	Html(include_str!("graphiql.html"))
 }
 
 #[instrument(skip_all)]

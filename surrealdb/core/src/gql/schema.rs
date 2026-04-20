@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::{
-	Enum, Field, FieldFuture, FieldValue, InputObject, InputValue, Interface, InterfaceField,
-	Object, Scalar, Schema, Type, TypeRef, Union,
+	Directive, Enum, EnumItem, Field, FieldFuture, FieldValue, InputObject, InputValue, Interface,
+	InterfaceField, Object, Scalar, Schema, Type, TypeRef, Union,
 };
 use async_graphql::{Name, Value as GqlValue};
 use rust_decimal::Decimal;
@@ -36,6 +36,7 @@ use super::auth::add_auth_mutations;
 use super::error::{GqlError, resolver_error};
 #[cfg(debug_assertions)]
 use super::ext::ValidatorExt;
+use super::naming;
 use crate::catalog::providers::{AuthorisationProvider, DatabaseProvider, TableProvider};
 use crate::catalog::{
 	DatabaseId, GraphQLConfig, GraphQLFunctionsConfig, GraphQLIntrospectionConfig,
@@ -57,6 +58,10 @@ use crate::val::{
 	Value as SurValue,
 };
 
+pub(crate) fn semantic_non_null_directive() -> Directive {
+	Directive::new("semanticNonNull")
+}
+
 /// Shared context for accessing table metadata during schema generation.
 ///
 /// Groups the transaction, namespace/database identifiers, and datastore
@@ -74,8 +79,8 @@ pub(crate) struct SchemaContext<'a> {
 /// definitions for the namespace/database specified in `session`, then builds
 /// a dynamic `async_graphql::Schema` with:
 ///
-/// - A **Query** root containing list and get fields for each table, plus custom function fields
-///   and a generic `_get` field.
+/// - A **Query** root containing singular and connection fields for each table, plus custom
+///   function fields.
 /// - An optional **Mutation** root containing CRUD operations for each table and authentication
 ///   mutations (`signIn`, `signUp`).
 /// - All supporting types: table Object types, filter/order inputs, scalars, geometry types, enums,
@@ -191,7 +196,8 @@ pub async fn generate_schema(
 		let accesses = tx.all_db_accesses(db_def.namespace_id, db_def.database_id, None).await?;
 		if !accesses.is_empty() {
 			let mut auth_mutation = mutation_obj.take().unwrap_or_else(|| Object::new("Mutation"));
-			auth_mutation = add_auth_mutations(auth_mutation, &accesses, ns, db, datastore);
+			auth_mutation =
+				add_auth_mutations(auth_mutation, &mut types, &accesses, ns, db, datastore);
 			mutation_obj = Some(auth_mutation);
 		}
 	}
@@ -283,20 +289,20 @@ pub async fn generate_schema(
 
 	scalar_debug_validated!(
 		schema,
-		"uuid",
+		"Uuid",
 		Kind::Uuid,
 		"String encoded UUID",
 		"https://datatracker.ietf.org/doc/html/rfc4122"
 	);
 
-	scalar_debug_validated!(schema, "decimal", Kind::Decimal);
-	scalar_debug_validated!(schema, "number", Kind::Number);
-	scalar_debug_validated!(schema, "null", Kind::Null);
-	scalar_debug_validated!(schema, "datetime", Kind::Datetime);
-	scalar_debug_validated!(schema, "duration", Kind::Duration);
-	scalar_debug_validated!(schema, "bytes", Kind::Bytes);
-	scalar_debug_validated!(schema, "object", Kind::Object);
-	scalar_debug_validated!(schema, "any", Kind::Any);
+	scalar_debug_validated!(schema, "Decimal", Kind::Decimal);
+	scalar_debug_validated!(schema, "Number", Kind::Number);
+	scalar_debug_validated!(schema, "Null", Kind::Null);
+	scalar_debug_validated!(schema, "Datetime", Kind::Datetime);
+	scalar_debug_validated!(schema, "Duration", Kind::Duration);
+	scalar_debug_validated!(schema, "Bytes", Kind::Bytes);
+	scalar_debug_validated!(schema, "Object", Kind::Object);
+	scalar_debug_validated!(schema, "Any", Kind::Any);
 
 	// JSON scalar: accepts arbitrary JSON values (including objects and arrays)
 	// as input arguments. Used for dynamic data like auth variables.
@@ -304,6 +310,64 @@ pub async fn generate_schema(
 		Scalar::new("JSON")
 			.description("Arbitrary JSON value (object, array, string, number, or boolean)"),
 	));
+
+	schema = schema.register(
+		Enum::new("OrderDirection")
+			.item(EnumItem::new("ASC").description("Sort results in ascending order."))
+			.item(EnumItem::new("DESC").description("Sort results in descending order."))
+			.description("Supported ordering directions for generated GraphQL connections."),
+	);
+
+	schema = schema.register(
+		Object::new("PageInfo")
+			.description("Information about the current page of a generated GraphQL connection.")
+			.field(
+				Field::new("hasNextPage", TypeRef::named_nn(TypeRef::BOOLEAN), |ctx| {
+					FieldFuture::new(async move {
+						let page_info =
+							ctx.parent_value.try_downcast_ref::<crate::gql::PageInfo>()?;
+						Ok(Some(FieldValue::value(page_info.has_next_page)))
+					})
+				})
+				.description("Whether more items are available when paginating forwards.")
+				.directive(semantic_non_null_directive()),
+			)
+			.field(
+				Field::new("hasPreviousPage", TypeRef::named_nn(TypeRef::BOOLEAN), |ctx| {
+					FieldFuture::new(async move {
+						let page_info =
+							ctx.parent_value.try_downcast_ref::<crate::gql::PageInfo>()?;
+						Ok(Some(FieldValue::value(page_info.has_previous_page)))
+					})
+				})
+				.description("Whether more items are available when paginating backwards.")
+				.directive(semantic_non_null_directive()),
+			)
+			.field(
+				Field::new("startCursor", TypeRef::named(TypeRef::STRING), |ctx| {
+					FieldFuture::new(async move {
+						let page_info =
+							ctx.parent_value.try_downcast_ref::<crate::gql::PageInfo>()?;
+						Ok(Some(FieldValue::value(
+							page_info.start_cursor.clone().map_or(GqlValue::Null, GqlValue::from),
+						)))
+					})
+				})
+				.description("The cursor for the first item in the current page."),
+			)
+			.field(
+				Field::new("endCursor", TypeRef::named(TypeRef::STRING), |ctx| {
+					FieldFuture::new(async move {
+						let page_info =
+							ctx.parent_value.try_downcast_ref::<crate::gql::PageInfo>()?;
+						Ok(Some(FieldValue::value(
+							page_info.end_cursor.clone().map_or(GqlValue::Null, GqlValue::from),
+						)))
+					})
+				})
+				.description("The cursor for the last item in the current page."),
+			),
+	);
 
 	let id_interface =
 		Interface::new("record").field(InterfaceField::new("id", TypeRef::named_nn(TypeRef::ID)));
@@ -397,7 +461,7 @@ pub(crate) fn sql_value_to_gql_value_with_kind(
 /// Produces `table:key` where the key is the raw value (no backtick/angle-bracket
 /// escaping). This is the format GraphQL clients expect, e.g. `"person:alice"`,
 /// `"item:1"`.
-fn record_id_to_raw(t: &SurRecordId) -> String {
+pub(crate) fn record_id_to_raw(t: &SurRecordId) -> String {
 	let key_str = match &t.key {
 		SurRecordIdKey::Number(n) => n.to_string(),
 		SurRecordIdKey::String(s) => s.clone(),
@@ -430,26 +494,23 @@ fn sanitize_gql_identifier_component(raw: &str) -> String {
 }
 
 fn literal_enum_item_name(scope: Option<&str>, literal: &str) -> String {
-	let literal_component = sanitize_gql_identifier_component(literal);
 	match scope {
-		Some(s) if !s.is_empty() => {
-			let scope_component = sanitize_gql_identifier_component(s);
-			format!("{scope_component}_{literal_component}")
-		}
-		_ => format!("VALUE_{literal_component}"),
+		Some(_) => naming::to_screaming_snake_case(literal),
+		_ => format!("VALUE_{}", naming::to_screaming_snake_case(literal)),
 	}
 }
 
 fn literal_enum_type_name(scope: Option<&str>, literals: &[String]) -> String {
-	let parts: Vec<String> =
-		literals.iter().map(|s| sanitize_gql_identifier_component(s)).collect();
-	let joined = parts.join("_OR_");
 	match scope {
-		Some(s) if !s.is_empty() => {
-			let scope_component = sanitize_gql_identifier_component(s);
-			format!("{scope_component}_ENUM_{joined}")
+		Some(s) if !s.is_empty() => naming::enum_type_name(s),
+		_ => {
+			let joined = literals
+				.iter()
+				.map(|literal| naming::to_screaming_snake_case(literal))
+				.collect::<Vec<_>>()
+				.join("Or");
+			format!("Literal{joined}Enum")
 		}
-		_ => format!("Literal_{joined}"),
 	}
 }
 
@@ -521,32 +582,44 @@ pub fn kind_to_type_with_enum_prefix(
 ) -> Result<TypeRef, GqlError> {
 	let optional = kind.can_be_none();
 	let out_ty = match kind {
-		Kind::Any => TypeRef::named("any"),
-		Kind::None => TypeRef::named("none"),
-		Kind::Null => TypeRef::named("null"),
+		Kind::Any => TypeRef::named("Any"),
+		Kind::None => TypeRef::named("Null"),
+		Kind::Null => TypeRef::named("Null"),
 		Kind::Bool => TypeRef::named(TypeRef::BOOLEAN),
-		Kind::Bytes => TypeRef::named("bytes"),
-		Kind::Datetime => TypeRef::named("datetime"),
-		Kind::Decimal => TypeRef::named("decimal"),
-		Kind::Duration => TypeRef::named("duration"),
+		Kind::Bytes => TypeRef::named("Bytes"),
+		Kind::Datetime => TypeRef::named("Datetime"),
+		Kind::Decimal => TypeRef::named("Decimal"),
+		Kind::Duration => TypeRef::named("Duration"),
 		Kind::Float => TypeRef::named(TypeRef::FLOAT),
 		Kind::Int => TypeRef::named(TypeRef::INT),
-		Kind::Number => TypeRef::named("number"),
-		Kind::Object => TypeRef::named("object"),
+		Kind::Number => TypeRef::named("Number"),
+		Kind::Object => TypeRef::named("Object"),
 		Kind::Regex => return Err(schema_error("Kind::Regex is not yet supported")),
 		Kind::String => TypeRef::named(TypeRef::STRING),
-		Kind::Uuid => TypeRef::named("uuid"),
-		Kind::Table(ref _t) => TypeRef::named(kind.to_sql()),
+		Kind::Uuid => TypeRef::named("Uuid"),
+		Kind::Table(mut tables) => match tables.len() {
+			0 => TypeRef::named(TypeRef::STRING),
+			1 => TypeRef::named(naming::table_type_name(
+				tables.pop().expect("single table in table kind").as_str(),
+			)),
+			_ => TypeRef::named(TypeRef::STRING),
+		},
 		Kind::Record(mut tables) => match tables.len() {
 			0 => TypeRef::named("record"),
-			1 => TypeRef::named(tables.pop().expect("single table in record kind").into_string()),
+			1 => TypeRef::named(naming::table_type_name(
+				tables.pop().expect("single table in record kind").as_str(),
+			)),
 			_ => {
-				let ty_name = tables.join("_or_");
+				let ty_name = tables
+					.iter()
+					.map(|table| naming::table_type_name(table.as_str()))
+					.collect::<Vec<_>>()
+					.join("Or");
 
 				let mut tmp_union = Union::new(ty_name.clone())
 					.description(format!("A record which is one of: {}", tables.join(", ")));
 				for n in tables {
-					tmp_union = tmp_union.possible_type(n.into_string());
+					tmp_union = tmp_union.possible_type(naming::table_type_name(n.as_str()));
 				}
 
 				types.push(Type::Union(tmp_union));
@@ -599,7 +672,7 @@ pub fn kind_to_type_with_enum_prefix(
 
 			// If nothing remains after stripping None/Null, it's just a nullable null.
 			if ks.is_empty() {
-				return Ok(TypeRef::named("null"));
+				return Ok(TypeRef::named("Null"));
 			}
 
 			// If only one kind remains after stripping None/Null, delegate directly
@@ -1396,7 +1469,7 @@ pub(crate) fn register_geometry_types(types: &mut Vec<Type>) {
 				 `coordinates` for coordinate-based types, `geometries` for GeometryCollection.",
 			)
 			.field(InputValue::new("type", TypeRef::named_nn("GeometryType")))
-			.field(InputValue::new("coordinates", TypeRef::named("any")))
+			.field(InputValue::new("coordinates", TypeRef::named("Any")))
 			.field(InputValue::new("geometries", TypeRef::named_list("GeometryInput"))),
 	));
 }
