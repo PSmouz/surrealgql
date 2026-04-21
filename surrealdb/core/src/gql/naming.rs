@@ -52,10 +52,22 @@ pub(crate) fn to_camel_case(name: &str) -> String {
 pub(crate) fn to_screaming_snake_case(name: &str) -> String {
 	let mut out = String::new();
 	let mut last_was_underscore = false;
+	let chars = name.chars().collect::<Vec<_>>();
 
-	for c in name.chars() {
+	for (idx, c) in chars.iter().copied().enumerate() {
 		if c.is_ascii_alphanumeric() {
-			if c.is_ascii_uppercase() && !out.is_empty() && !last_was_underscore {
+			let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+			let next = chars.get(idx + 1).copied();
+			let should_split_before_upper = c.is_ascii_uppercase()
+				&& !out.is_empty()
+				&& !last_was_underscore
+				&& prev.is_some_and(|prev| {
+					prev.is_ascii_lowercase()
+						|| prev.is_ascii_digit()
+						|| (prev.is_ascii_uppercase()
+							&& next.is_some_and(|next| next.is_ascii_lowercase()))
+				});
+			if should_split_before_upper {
 				out.push('_');
 			}
 			out.push(c.to_ascii_uppercase());
@@ -223,7 +235,10 @@ mod tests {
 		assert_eq!(to_pascal_case("person_profile"), "PersonProfile");
 		assert_eq!(to_camel_case("person_profile"), "personProfile");
 		assert_eq!(to_screaming_snake_case("personProfile"), "PERSON_PROFILE");
+		assert_eq!(to_screaming_snake_case("VILLA"), "VILLA");
 		assert_eq!(to_screaming_snake_case("favorite-id"), "FAVORITE_ID");
+		assert_eq!(to_screaming_snake_case("enum-1"), "ENUM_1");
+		assert_eq!(to_screaming_snake_case("check_in"), "CHECK_IN");
 	}
 
 	#[test]
@@ -237,6 +252,10 @@ mod tests {
 	#[test]
 	fn builds_graphql_type_names() {
 		assert_eq!(table_type_name("person"), "Person");
+		assert_eq!(
+			nested_type_name(&["home", "information", "items", "items"]),
+			"HomeInformationItemsItems"
+		);
 		assert_eq!(relation_type_name("likes"), "LikesRelation");
 		assert_eq!(relation_connection_type_name("likes"), "LikesRelationConnection");
 		assert_eq!(relation_edge_type_name("likes"), "LikesRelationEdge");

@@ -419,7 +419,7 @@ fn kind_is_array_of_objects(kind: &Kind) -> bool {
 fn object_kind_metadata(kind: Option<&Kind>, is_array: bool) -> Option<bool> {
 	match kind {
 		None => Some(true),
-		Some(Kind::Object) if !is_array => Some(false),
+		Some(Kind::Object) => Some(false),
 		Some(Kind::Array(inner, _)) if is_array && matches!(**inner, Kind::Object) => Some(false),
 		Some(Kind::Either(ks)) => {
 			let has_none = ks.iter().any(|k| matches!(k, Kind::None | Kind::Null));

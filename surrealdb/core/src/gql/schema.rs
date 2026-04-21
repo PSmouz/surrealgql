@@ -1014,6 +1014,10 @@ pub(crate) fn gql_to_sql_kind_with_scope(
 				}
 			}
 			GqlValue::String(s) => {
+				if let Ok(decimal) = Decimal::from_str_exact(s) {
+					return Ok(SurValue::Number(SurNumber::Decimal(decimal)));
+				}
+
 				let decimal_expr: Expr = syn::expr(s)?.into();
 
 				match decimal_expr {
@@ -1672,6 +1676,14 @@ pub(crate) fn geometry_to_gql_object(g: &SurGeometry) -> Result<GqlValue, GqlErr
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn literal_enum_item_names_preserve_expected_tokens() {
+		assert_eq!(literal_enum_item_name(Some("home_type"), "VILLA"), "VILLA");
+		assert_eq!(literal_enum_item_name(Some("test_type"), "enum-1"), "ENUM_1");
+		assert_eq!(literal_enum_item_name(Some("test_type"), "check_in"), "CHECK_IN");
+		assert_eq!(literal_enum_item_name(Some("test_type"), "123"), "VALUE_123");
+	}
 
 	#[tokio::test]
 	async fn sdl_marks_required_db_fields_as_semantically_non_null() {
