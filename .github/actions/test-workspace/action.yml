@@ -1,0 +1,32 @@
+name: 'Test workspace'
+description: 'Run workspace tests'
+
+inputs:
+  save-cache:
+    description: 'Whether to save the cargo cache'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup environment
+      uses: ./.github/actions/setup-environment
+      with:
+        save-cache: ${{ inputs.save-cache }}
+        targets: wasm32-wasip2
+
+    - name: Install wasm32-wasip2 target
+      shell: bash
+      run: rustup target add wasm32-wasip2
+
+    - name: Install tools
+      uses: ./.github/actions/install-tools
+      with:
+        preset: test
+
+    - name: Test workspace
+      shell: bash
+      run: cargo make ci-workspace-test
+
+

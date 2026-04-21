@@ -3,10 +3,10 @@
     "A scalable, distributed, collaborative, document-graph database, for the realtime web";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11-small";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11-small";
     flake-utils.url = "github:numtide/flake-utils/v1.0.0";
     crane = {
-      url = "github:ipetkov/crane/v0.20.0";
+      url = "github:ipetkov/crane/v0.23.0";
     };
     fenix = {
       url = "github:nix-community/fenix";
@@ -86,6 +86,7 @@
             spec =
               import ./pkg/nix/spec/${target}.nix { inherit pkgs target util; };
           in import ./pkg/nix/drv/binary.nix {
+            inherit (pkgs) lib;
             inherit pkgs util spec crane;
             rustToolchain = mkRustToolchain { inherit target; };
           }) util.platforms);
@@ -117,7 +118,7 @@
             depsBuildBuild = buildSpec.depsBuildBuild or [ ]
               ++ [ rustToolchain ] ++ (with pkgs; [ nixfmt cargo-watch wasm-pack pre-commit cargo-make]);
 
-            inherit (util) SURREAL_BUILD_METADATA;
+            inherit (util) SURREAL_BUILD_VERSION SURREAL_BUILD_METADATA;
           })) util.platforms);
 
         # nix run

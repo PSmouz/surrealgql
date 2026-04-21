@@ -1,0 +1,80 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+      workspace-tests:
+        informational: true
+        flags:
+          - workspace-tests
+      language-tests:
+        informational: true
+        flags:
+          - language-tests
+    patch:
+      default:
+        informational: true
+      workspace-tests:
+        informational: true
+        flags:
+          - workspace-tests
+      language-tests:
+        informational: true
+        flags:
+          - language-tests
+
+comment:
+  behavior: default
+
+flags:
+  workspace-tests:
+    paths:
+      - surrealdb/
+      - src/
+      - surrealism/
+      - surrealml/
+      - tests/
+    carryforward: true
+  language-tests:
+    paths:
+      - surrealdb/
+      - surrealism/
+      - surrealml/
+      - tests/
+    carryforward: true
+
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: auto
+        informational: true
+      - type: patch
+        target: auto
+        informational: true
+
+  individual_components:
+    - component_id: surrealdb_core
+      name: surrealdb-core
+      paths:
+        - surrealdb/core/**
+
+    - component_id: surrealdb_types
+      name: surrealdb-types
+      paths:
+        - surrealdb/types/**
+
+    - component_id: surrealdb_sdk
+      name: surrealdb-sdk
+      paths:
+        - surrealdb/**
+
+    - component_id: surrealdb_bin
+      name: surrealdb-bin
+      paths:
+        - src/**
+
+    - component_id: surrealdb_tests
+      name: integration-tests
+      paths:
+        - tests/**

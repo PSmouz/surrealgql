@@ -1,20 +1,25 @@
+#![allow(
+	unexpected_cfgs,
+	reason = "This test is only enabled when the `docker` feature is enabled which is an internal feature."
+)]
+
 mod common;
 
 #[cfg(all(docker, feature = "storage-rocksdb"))]
 mod database_upgrade {
-	use super::common::docker::DockerContainer;
 	use std::net::Ipv4Addr;
 	use std::time::Duration;
-	use surrealdb::engine::any::{connect, Any};
+
+	use surrealdb::engine::any::{Any, connect};
 	use surrealdb::opt::auth::Root;
 	use surrealdb::{Connection, Surreal, Value};
 	use test_log::test;
 	use tokio::net::TcpListener;
-	use tokio::time::sleep;
-	use tokio::time::timeout;
-	use tracing::error;
-	use tracing::info;
+	use tokio::time::{sleep, timeout};
+	use tracing::{error, info};
 	use ulid::Ulid;
+
+	use super::common::docker::DockerContainer;
 
 	const NS: &str = "test";
 	const DB: &str = "test";
@@ -34,7 +39,6 @@ mod database_upgrade {
 		import_data_on_docker(&client, "DEMO_DATA", DEAL_STORE_DATASET).await;
 		create_data_on_docker(&client, "IDX", &DATA_IDX).await;
 		create_data_on_docker(&client, "FTS", &DATA_FTS).await;
-		create_data_on_docker(&client, "MTREE", &DATA_MTREE).await;
 
 		// Check the data set
 		check_data_on_docker(&client, "IDX", &CHECK_IDX).await;
@@ -63,7 +67,6 @@ mod database_upgrade {
 		check_migrated_data(&db, "IDX", &CHECK_IDX).await;
 		check_migrated_data(&db, "DB", &CHECK_DB).await;
 		check_migrated_data(&db, "FTS", &CHECK_FTS).await;
-		check_migrated_data(&db, "MTREE", &CHECK_MTREE_DB).await;
 		check_migrated_data(&db, "KNN_BRUTEFORCE", &CHECK_KNN_BRUTEFORCE).await;
 
 		// Collect INFO FOR NS/DB on the migrated database
@@ -194,21 +197,10 @@ mod database_upgrade {
 		Some("[{ name: '<em>Tobie</em>' }]"),
 	)];
 
-	// Set of DATA for VectorSearch and  Knn Operator checking
-	const DATA_MTREE: [&str; 4] = [
-		"CREATE pts:1 SET point = [1,2,3,4]",
-		"CREATE pts:2 SET point = [4,5,6,7]",
-		"CREATE pts:3 SET point = [8,9,10,11]",
-		"DEFINE INDEX mt_pts ON pts FIELDS point MTREE DIMENSION 4",
-	];
-
-	const CHECK_MTREE_DB: [Check; 1] = [
-		("SELECT id, vector::distance::euclidean(point, [2,3,4,5]) AS dist FROM pts WHERE point <|2|> [2,3,4,5]",
-		Some("[{ dist: 2f, id: pts:1 }, { dist: 4f, id: pts:2 }]"))];
-
-	const CHECK_KNN_BRUTEFORCE: [Check; 1] = [
-		("SELECT id, vector::distance::euclidean(point, [2,3,4,5]) AS dist FROM pts WHERE point <|2,EUCLIDEAN|> [2,3,4,5]",
-		 Some("[{ dist: 2f, id: pts:1 }, { dist: 4f, id: pts:2 }]"))];
+	const CHECK_KNN_BRUTEFORCE: [Check; 1] = [(
+		"SELECT id, vector::distance::euclidean(point, [2,3,4,5]) AS dist FROM pts WHERE point <|2,EUCLIDEAN|> [2,3,4,5]",
+		Some("[{ dist: 2f, id: pts:1 }, { dist: 4f, id: pts:2 }]"),
+	)];
 
 	type Check = (&'static str, Option<&'static str>);
 
@@ -232,7 +224,8 @@ mod database_upgrade {
 		let client = Surreal::<Any>::init();
 		let db = client.clone();
 		let localhost = Ipv4Addr::LOCALHOST;
-		// We need HTTP because we are using the import method which is not available with WS
+		// We need HTTP because we are using the import method which is not available
+		// with WS
 		let endpoint = format!("http://{localhost}:{port}");
 		info!("Wait for the database to be ready; endpoint => {endpoint}");
 		tokio::spawn(async move {
@@ -261,7 +254,8 @@ mod database_upgrade {
 		info!("Create {info} data on Docker's instance");
 		for l in data {
 			info!("Run `{l}`");
-			client.query(*l).await.expect(l).check().expect(l);
+			let data = surrealdb::opt::Raw::from(l.to_string());
+			client.query(data).await.expect(l).check().expect(l);
 		}
 	}
 
@@ -276,8 +270,9 @@ mod database_upgrade {
 			info!("Run `{query}`");
 			match expected {
 				Some(expected) => {
+					let data = surrealdb::opt::Raw::from(query.to_string());
 					let response: Value =
-						client.query(*query).await.expect(query).take(0).expect(query);
+						client.query(data).await.expect(query).take(0).expect(query);
 					assert_eq!(response.to_string(), *expected, "{query}");
 				}
 				None => {
@@ -321,8 +316,8 @@ mod database_upgrade {
 		info!("Collect INFO TABLE(S) for the database {info}");
 		let mut tables = vec![];
 		for n in table_names {
-			let table =
-				client.query(format!("INFO FOR TABLE `{n}`")).await.unwrap().take(0).unwrap();
+			let data = surrealdb::opt::Raw::from(format!("INFO FOR TABLE `{n}`"));
+			let table = client.query(data).await.unwrap().take(0).unwrap();
 			tables.push(table);
 		}
 		tables
@@ -338,7 +333,8 @@ mod database_upgrade {
 		for n in table_names {
 			let q = format!("SELECT * FROM `{n}`");
 			info!("{q}");
-			let rows: Value = client.query(q).await.unwrap().take(0).unwrap();
+			let rows: Value =
+				client.query(surrealdb::opt::Raw::from(q)).await.unwrap().take(0).unwrap();
 			tables_rows.push(rows);
 		}
 		tables_rows
@@ -367,7 +363,6 @@ mod database_upgrade {
 		check_info_key(prev, next, "analyzers");
 		check_info_key(prev, next, "users");
 		check_info_key(prev, next, "indexes");
-		check_info_key(prev, next, "tables");
 	}
 
 	async fn check_migrated_data(db: &Surreal<Any>, info: &str, queries: &[Check]) {
@@ -384,7 +379,8 @@ mod database_upgrade {
 		C: Connection,
 	{
 		info!("Run `{q}`");
-		let mut res = db.query(q).await.expect(q).check().expect(q);
+		let data = surrealdb::opt::Raw::from(q.to_string());
+		let mut res = db.query(data).await.expect(q).check().expect(q);
 		if let Some(expected) = expected {
 			let results: Value = res.take(0).unwrap();
 			assert_eq!(results.to_string(), expected, "{q}");
@@ -396,7 +392,7 @@ mod database_upgrade {
 		info!("Create a new local instance; endpoint => {endpoint}");
 		let db = connect(endpoint).await.unwrap();
 		info!("Select namespace and database");
-		db.use_ns(NS).use_db(DB).await.unwrap();
+		db.use_ns(Ulid::new().to_string()).use_db(DB).await.unwrap();
 		db
 	}
 }

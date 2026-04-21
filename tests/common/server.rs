@@ -1,12 +1,14 @@
-use rand::{thread_rng, Rng};
-use rcgen::CertifiedKey;
-use std::collections::btree_set::Iter;
 use std::collections::HashMap;
+use std::collections::btree_set::Iter;
 use std::error::Error;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::{env, fs};
+
+use rand::{Rng, thread_rng};
+use rcgen::CertifiedKey;
+use tempfile::TempDir;
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info};
@@ -73,8 +75,8 @@ impl Child {
 		output
 	}
 
-	/// Read the child's stdout concatenated with its stderr. Returns Ok if the child
-	/// returns successfully, Err otherwise.
+	/// Read the child's stdout concatenated with its stderr. Returns Ok if the
+	/// child returns successfully, Err otherwise.
 	pub fn output(&mut self) -> Result<String, String> {
 		let status = self.inner.as_mut().map(|child| child.wait().unwrap()).unwrap();
 		let buffer = self.stdout_and_stderr();
@@ -226,24 +228,10 @@ pub async fn start_server_with_import_file(path: &str) -> Result<(String, Child)
 	.await
 }
 
-pub async fn start_server_gql() -> Result<(String, Child), Box<dyn Error>> {
+pub async fn start_server_with_versioning() -> Result<(String, Child), Box<dyn Error>> {
 	start_server(StartServerArguments {
-		vars: Some(HashMap::from([(
-			"SURREAL_CAPS_ALLOW_EXPERIMENTAL".to_string(),
-			"graphql".to_string(),
-		)])),
-		..Default::default()
-	})
-	.await
-}
-
-pub async fn start_server_gql_without_auth() -> Result<(String, Child), Box<dyn Error>> {
-	start_server(StartServerArguments {
+		path: Some("memory?versioned=true".to_string()),
 		auth: false,
-		vars: Some(HashMap::from([(
-			"SURREAL_CAPS_ALLOW_EXPERIMENTAL".to_string(),
-			"graphql".to_string(),
-		)])),
 		..Default::default()
 	})
 	.await
@@ -273,10 +261,10 @@ pub async fn start_server(
 
 		let CertifiedKey {
 			cert,
-			key_pair,
+			signing_key,
 		} = rcgen::generate_simple_self_signed(Vec::new()).unwrap();
 		fs::write(&crt_path, cert.pem()).unwrap();
-		fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+		fs::write(&key_path, signing_key.serialize_pem()).unwrap();
 
 		extra_args.push_str(format!(" --web-crt {crt_path} --web-key {key_path}").as_str());
 	}
@@ -297,7 +285,9 @@ pub async fn start_server(
 		let port: u16 = rng.gen_range(13000..24000);
 		let addr = format!("127.0.0.1:{port}");
 
-		let start_args = format!("start --bind {addr} {path} --no-banner --log trace --user {USER} --pass {PASS} {extra_args}");
+		let start_args = format!(
+			"start --bind {addr} {path} --no-banner --log trace --user {USER} --pass {PASS} {extra_args}"
+		);
 
 		info!("starting server with args: {start_args}");
 
@@ -322,7 +312,7 @@ pub async fn start_server(
 				continue;
 			}
 
-			if run(&format!("isready --conn http://{addr}")).output().is_ok() {
+			if run(&format!("isready --endpoint http://{addr}")).output().is_ok() {
 				info!("Server ready!");
 				return Ok((addr, server));
 			}

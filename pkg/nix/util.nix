@@ -3,8 +3,6 @@
 rec {
   inherit systems system;
 
-  config = import ./config.nix;
-
   supportedPlatforms = let
     specDir = builtins.readDir ./spec;
     nixExt = ".nix";
@@ -59,23 +57,7 @@ rec {
 
   packageName = cargoToml.package.name;
 
-  fdbPackage = fdbPackages:
-    let
-      fdbPkgVersion = builtins.replaceStrings [ "." ] [ "" ] config.fdbVersion;
-    in fdbPackages."foundationdb${fdbPkgVersion}";
-
-  fdbSupported = fdbPackages:
-    let
-      package = fdbPackage fdbPackages;
-      fdbSystems = package.meta.platforms or [ ];
-    in builtins.elem system fdbSystems;
-
-  features = cargoToml.features // {
-    storage-fdb = let
-      fdbFeatureVersion =
-        builtins.replaceStrings [ "." ] [ "_" ] config.fdbVersion;
-    in [ "surrealdb/kv-fdb-${fdbFeatureVersion}" ];
-  };
+  features = cargoToml.features;
 
   buildMetadata = with lib.strings;
     let
@@ -86,11 +68,15 @@ rec {
       dot = optionalString hasDateRev ".";
     in "${date}${dot}${shortRev}";
 
+  # The base version from Cargo.toml, used as default for SURREAL_BUILD_VERSION
+  baseVersion = cargoToml.workspace.package.version;
+
   version = with lib.strings;
     let
       hasBuildMetadata = buildMetadata != "";
       plus = optionalString hasBuildMetadata "+";
-    in "${cargoToml.package.version}${plus}${buildMetadata}";
+    in "${baseVersion}${plus}${buildMetadata}";
 
+  SURREAL_BUILD_VERSION = baseVersion;
   SURREAL_BUILD_METADATA = buildMetadata;
 }

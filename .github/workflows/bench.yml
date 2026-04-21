@@ -17,6 +17,9 @@ defaults:
   run:
     shell: bash
 
+env:
+  BRANCH_NAME: "${{ github.head_ref || github.ref_name }}"
+
 #
 # The bench jobs will:
 # 1. Run the benchmark and save the results as a baseline named "current"
@@ -28,6 +31,9 @@ defaults:
 # 5. Upload the current benchmark results as a new baseline and update the latest baseline for the current branch
 #
 
+permissions: # added using https://github.com/step-security/secure-repo
+  contents: read
+
 jobs:
   # Disable Bench common until we can get it to run under 1h.
   # common:
@@ -35,11 +41,11 @@ jobs:
   #   runs-on: [runner-arm64-2xlarge]
   #   timeout-minutes: 60
   #   steps:
-  #     - name: Install stable toolchain
-  #       uses: dtolnay/rust-toolchain@stable
+  #     - name: Setup environment
+  #       uses: ./.github/actions/setup-environment
 
   #     - name: Configure AWS credentials
-  #       uses: aws-actions/configure-aws-credentials@97834a484a5ab3c40fa9e2eb40fcf8041105a573
+  #       uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37
   #       with:
   #         aws-region: us-east-1
 
@@ -50,7 +56,7 @@ jobs:
   #         cargo install --quiet --locked critcmp cargo-make
 
   #     - name: Checkout changes
-  #       uses: actions/checkout@v4
+  #       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
   #     - name: Run benchmark
   #       run: |
@@ -74,7 +80,7 @@ jobs:
   #         echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   #     - name: Save results as artifact
-  #       uses: actions/upload-artifact@v4
+  #       uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
   #       with:
   #         name: ${{ github.job }}-comparison.txt
   #         path: bench-results/${{ github.job }}-comparison.txt
@@ -91,7 +97,7 @@ jobs:
 
   engines:
     name: Benchmark engines
-    runs-on: [runner-arm64-2xlarge]
+    runs-on: [ runner-arm64-2xlarge ]
     timeout-minutes: 60
     permissions:
       id-token: write
@@ -117,18 +123,20 @@ jobs:
           #   features: "protocol-ws"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2 (Actions must be pinned by commit hash)
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          components: rustfmt
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (Actions must be pinned by commit hash)
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@97834a484a5ab3c40fa9e2eb40fcf8041105a573
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
           aws-region: us-east-1
 
@@ -137,13 +145,6 @@ jobs:
           sudo apt-get -qq -y update
           sudo apt-get -qq -y install clang curl
           cargo install --quiet --locked critcmp cargo-make
-
-      # Install FoundationDB if needed
-      - name: Setup FoundationDB
-        uses: foundationdb-rs/foundationdb-actions-install@v.2.2.0
-        if: ${{ matrix.target == 'lib-fdb' || matrix.target == 'sdk-fdb' }}
-        with:
-          version: "7.1.61"
 
       # Run SurrealDB in the background if needed
       - name: Build and start SurrealDB
@@ -182,10 +183,10 @@ jobs:
 
       - name: Copy results from AWS S3 bucket
         run: |
-          BRANCH_NAME=$(echo ${{ github.head_ref || github.ref_name }} | sed 's/[^a-zA-Z0-9]/-/g')
+          CLEAN_BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9]/-/g')
 
           aws s3 sync s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/main/latest bench-results-main || true
-          aws s3 sync s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$BRANCH_NAME/latest bench-results-previous || true
+          aws s3 sync s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$CLEAN_BRANCH_NAME/latest bench-results-previous || true
 
       - name: Compare current benchmark results vs baseline
         run: |
@@ -198,7 +199,7 @@ jobs:
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Save results as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0 (Actions must be pinned by commit hash)
         with:
           name: ${{ matrix.target }}-comparison.txt
           path: bench-results/${{ matrix.target }}-comparison.txt
@@ -207,10 +208,10 @@ jobs:
         env:
           BENCH_FEATURES: "${{ matrix.features }}"
         run: |
-          BRANCH_NAME=$(echo ${{ github.head_ref || github.ref_name }} | sed 's/[^a-zA-Z0-9]/-/g')
+          CLEAN_BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9]/-/g')
 
           cargo make bench-${{ matrix.target }} -- --load-baseline current --save-baseline previous
           critcmp --export previous > bench-results/${{ matrix.target }}.json
 
-          aws s3 sync bench-results s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$BRANCH_NAME/${{ github.run_id }}
-          aws s3 sync bench-results s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$BRANCH_NAME/latest
+          aws s3 sync bench-results s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$CLEAN_BRANCH_NAME/${{ github.run_id }}
+          aws s3 sync bench-results s3://${{ secrets.AWS_S3_GITHUB_ACTIONS_BUCKET_NAME }}/bench-results/${{ github.job }}/$CLEAN_BRANCH_NAME/latest

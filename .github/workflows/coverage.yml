@@ -1,0 +1,60 @@
+name: Coverage
+
+run-name: "Coverage report for ${{ github.ref_name }}"
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to run coverage on'
+        required: false
+        default: 'main'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Generate coverage report
+    runs-on: [ runner-arm64-2xlarge ]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          save-cache: false
+
+      - name: Install tools
+        uses: ./.github/actions/install-tools
+        with:
+          tools: cargo-llvm-cov,cargo-nextest,cargo-make
+          # Use cargo install to avoid taiki-e/install-action needing sudo (unzip) on self-hosted runner
+          use-cargo-install: true
+
+      - name: Generate coverage report
+        run: cargo make ci-workspace-coverage-with-server
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: coverage-report-${{ github.ref_name }}-${{ github.sha }}
+          path: target/llvm-cov/html/
+          retention-days: 30
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # (Actions must be pinned by commit hash) v6.0.0
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          flags: workspace-tests
+          name: coverage
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
