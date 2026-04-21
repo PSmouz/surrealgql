@@ -24,6 +24,8 @@ mod graphql_integration {
 	use super::common;
 	use crate::common::{PASS, USER};
 
+	// --- Schema basics and config ---
+
 	#[test(tokio::test)]
 	async fn basic() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_without_auth().await.unwrap();
@@ -138,7 +140,7 @@ mod graphql_integration {
 							}
 						],
 						"pageInfo": {
-							"endCursor": body["data"]["foos"]["pageInfo"]["endCursor"].clone()
+							"endCursor": "Zm9vOjE"
 						}
 					}
 				}
@@ -179,6 +181,44 @@ mod graphql_integration {
 								"val": 43
 							}
 						]
+					}
+				}
+			});
+			assert_eq!(expected, body)
+		}
+
+		// test last / before cursor
+		{
+			let first_page = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query{foos(first: 1, orderBy: { field: ID, direction: ASC }){pageInfo{endCursor}}}"#})
+						.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(first_page.status(), 200);
+			let first_page = first_page.json::<serde_json::Value>().await?;
+			let before = first_page["data"]["foos"]["pageInfo"]["endCursor"].as_str().unwrap();
+
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": format!("query{{foos(last: 1, before: \"{before}\", orderBy: {{ field: ID, direction: ASC }}){{nodes{{id val}} pageInfo{{hasNextPage hasPreviousPage}}}}}}")})
+						.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let expected = json!({
+				"data": {
+					"foos": {
+						"nodes": [],
+						"pageInfo": {
+							"hasNextPage": true,
+							"hasPreviousPage": false
+						}
 					}
 				}
 			});
@@ -1361,7 +1401,7 @@ mod graphql_integration {
 							}
 						}
 					}"#})
-					.to_string(),
+						.to_string(),
 				)
 				.send()
 				.await?;
@@ -1844,6 +1884,8 @@ mod graphql_integration {
 		Ok(())
 	}
 
+	// --- Filters and ordering ---
+
 	#[test(tokio::test)]
 	async fn filters() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_without_auth().await.unwrap();
@@ -1875,12 +1917,19 @@ mod graphql_integration {
 					DEFINE FIELD created ON product TYPE datetime;
 					DEFINE FIELD deleted_at ON product TYPE option<datetime>;
 					DEFINE FIELD tags ON product TYPE array<string>;
+					DEFINE FIELD details ON product TYPE object;
+					DEFINE FIELD details.meta ON product TYPE object;
+					DEFINE FIELD details.meta.slug ON product TYPE string;
+					DEFINE FIELD variants ON product TYPE array<object>;
+					DEFINE FIELD variants[*] ON product TYPE object;
+					DEFINE FIELD variants[*].sku ON product TYPE string;
+					DEFINE FIELD variants[*].stock ON product TYPE int;
 
-					CREATE product:1 SET name = "Alpha Widget", price = 9.99, quantity = 100, created = d"2024-01-15T00:00:00Z", tags = ["sale", "featured"];
-					CREATE product:2 SET name = "Beta Widget", price = 19.99, quantity = 50, created = d"2024-03-20T00:00:00Z", tags = ["featured"];
-					CREATE product:3 SET name = "Gamma Tool", price = 29.99, quantity = 200, created = d"2024-06-01T00:00:00Z", tags = ["tooling", "graphql"];
-					CREATE product:4 SET name = "Delta Tool", price = 4.99, quantity = 10, created = d"2024-09-10T00:00:00Z", deleted_at = d"2024-09-15T00:00:00Z", tags = ["sale", "tooling"];
-					CREATE product:5 SET name = "Epsilon Widget", price = 49.99, quantity = 0, created = d"2025-01-05T00:00:00Z", tags = ["luxury"];
+					CREATE product:1 SET name = "Alpha Widget", price = 9.99, quantity = 100, created = d"2024-01-15T00:00:00Z", tags = ["sale", "featured"], details = { meta: { slug: "alpha-widget" } }, variants = [{ sku: "alpha-red", stock: 5 }, { sku: "alpha-blue", stock: 0 }];
+					CREATE product:2 SET name = "Beta Widget", price = 19.99, quantity = 50, created = d"2024-03-20T00:00:00Z", tags = ["featured"], details = { meta: { slug: "beta-widget" } }, variants = [{ sku: "beta-core", stock: 1 }];
+					CREATE product:3 SET name = "Gamma Tool", price = 29.99, quantity = 200, created = d"2024-06-01T00:00:00Z", tags = ["tooling", "graphql"], details = { meta: { slug: "gamma-tool" } }, variants = [{ sku: "gamma-pro", stock: 7 }];
+					CREATE product:4 SET name = "Delta Tool", price = 4.99, quantity = 10, created = d"2024-09-10T00:00:00Z", deleted_at = d"2024-09-15T00:00:00Z", tags = ["sale", "tooling"], details = { meta: { slug: "delta-tool" } }, variants = [{ sku: "delta-mini", stock: 2 }];
+					CREATE product:5 SET name = "Epsilon Widget", price = 49.99, quantity = 0, created = d"2025-01-05T00:00:00Z", tags = ["luxury"], details = { meta: { slug: "epsilon-widget" } }, variants = [{ sku: "epsilon-gold", stock: 0 }];
 				"#,
 				)
 				.send()
@@ -2212,6 +2261,133 @@ mod graphql_integration {
 			assert_eq!(products[1]["id"], "product:4");
 		}
 
+		// --- nested object filters recurse through embedded objects ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						products(filterBy: { details: { meta: { slug: { eq: "gamma-tool" } } } }) {
+							nodes { id }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 1);
+			assert_eq!(products[0]["id"], "product:3");
+		}
+
+		// --- object-array list filters support some / every / none ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						products(
+							filterBy: {
+								variants: { some: { sku: { eq: "alpha-red" }, stock: { gt: 0 } } }
+							}
+						) {
+							nodes { id }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 1);
+			assert_eq!(products[0]["id"], "product:1");
+		}
+
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						products(
+							filterBy: {
+								variants: { every: { stock: { gte: 1 } } }
+							},
+							orderBy: { field: ID, direction: ASC }
+						) {
+							nodes { id }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 3);
+			assert_eq!(products[0]["id"], "product:2");
+			assert_eq!(products[1]["id"], "product:3");
+			assert_eq!(products[2]["id"], "product:4");
+		}
+
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						products(
+							filterBy: {
+								variants: { none: { stock: { gt: 0 } } }
+							},
+							orderBy: { field: ID, direction: ASC }
+						) {
+							nodes { id }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 1);
+			assert_eq!(products[0]["id"], "product:5");
+		}
+
+		// --- nested boolean composition can mix and/or/not with nested filters ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						products(
+							filterBy: {
+								and: [
+									{ details: { meta: { slug: { contains: "widget" } } } }
+									{ or: [{ price: { lt: 15 } }, { quantity: { eq: 0 } }] }
+									{ not: { tags: { some: { eq: "featured" } } } }
+								]
+							}
+						) {
+							nodes { id }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 1);
+			assert_eq!(products[0]["id"], "product:5");
+		}
+
 		// --- filter introspection exposes the richer operator surface ---
 		{
 			let res = client
@@ -2222,6 +2398,12 @@ mod graphql_integration {
 							inputFields { name }
 						}
 						productTagsFilter: __type(name: "ProductTagsListFilterInput") {
+							inputFields { name }
+						}
+						productVariantsFilter: __type(name: "ProductVariantsListFilterInput") {
+							inputFields { name }
+						}
+						productVariantsItemFilter: __type(name: "ProductVariantsFilterInput") {
 							inputFields { name }
 						}
 					}"#})
@@ -2246,10 +2428,27 @@ mod graphql_integration {
 			assert!(tags_names.contains(&"every"));
 			assert!(tags_names.contains(&"none"));
 			assert!(tags_names.contains(&"containsAny"));
+
+			let variants_fields =
+				body["data"]["productVariantsFilter"]["inputFields"].as_array().unwrap();
+			let variants_names: Vec<&str> =
+				variants_fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+			assert!(variants_names.contains(&"some"));
+			assert!(variants_names.contains(&"every"));
+			assert!(variants_names.contains(&"none"));
+
+			let variant_item_fields =
+				body["data"]["productVariantsItemFilter"]["inputFields"].as_array().unwrap();
+			let variant_item_names: Vec<&str> =
+				variant_item_fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+			assert!(variant_item_names.contains(&"sku"));
+			assert!(variant_item_names.contains(&"stock"));
 		}
 
 		Ok(())
 	}
+
+	// --- Nested objects and embedded arrays ---
 
 	#[test(tokio::test)]
 	async fn nested_objects() -> Result<(), Box<dyn std::error::Error>> {
@@ -2268,7 +2467,7 @@ mod graphql_integration {
 			.default_headers(headers)
 			.build()?;
 
-		// Set up schema with nested objects and array-of-objects
+		// Set up schema with nested objects, array-of-objects, and recursive object arrays.
 		{
 			let res = client
 				.post(sql_url)
@@ -2283,10 +2482,39 @@ mod graphql_integration {
 					DEFINE FIELD time.updatedAt ON item TYPE datetime;
 					DEFINE FIELD time.audit ON item TYPE object;
 					DEFINE FIELD time.audit.reviewedAt ON item TYPE datetime;
+					DEFINE FIELD details ON item TYPE object;
+					DEFINE FIELD details.title ON item TYPE string;
+					DEFINE FIELD details.meta ON item TYPE object;
+					DEFINE FIELD details.meta.slug ON item TYPE string;
+					DEFINE FIELD pricing ON item TYPE object;
+					DEFINE FIELD pricing.base ON item TYPE object;
+					DEFINE FIELD pricing.base.amount ON item TYPE decimal;
+					DEFINE FIELD pricing.fees ON item TYPE object;
+					DEFINE FIELD pricing.fees.cleaning ON item TYPE decimal;
 					DEFINE FIELD tags ON item TYPE array<object>;
 					DEFINE FIELD tags.* ON item TYPE object;
 					DEFINE FIELD tags.*.label ON item TYPE string;
 					DEFINE FIELD tags.*.priority ON item TYPE int;
+					DEFINE FIELD groups ON item TYPE array<object>;
+					DEFINE FIELD groups[*] ON item TYPE object;
+					DEFINE FIELD groups[*].title ON item TYPE string;
+					DEFINE FIELD groups[*].items ON item TYPE array<object>;
+					DEFINE FIELD groups[*].items[*] ON item TYPE object;
+					DEFINE FIELD groups[*].items[*].title ON item TYPE string;
+					DEFINE FIELD groups[*].items[*].entries ON item TYPE array<object>;
+					DEFINE FIELD groups[*].items[*].entries[*] ON item TYPE object;
+					DEFINE FIELD groups[*].items[*].entries[*].label ON item TYPE string;
+					DEFINE FIELD groups[*].items[*].entries[*].icon ON item TYPE option<string>;
+					DEFINE FIELD collections ON item TYPE array<object>;
+					DEFINE FIELD collections[*] ON item TYPE object;
+					DEFINE FIELD collections[*].title ON item TYPE string;
+					DEFINE FIELD collections[*].items ON item TYPE array<object>;
+					DEFINE FIELD collections[*].items[*] ON item TYPE object;
+					DEFINE FIELD collections[*].items[*].title ON item TYPE string;
+					DEFINE FIELD collections[*].items[*].entries ON item TYPE array<object>;
+					DEFINE FIELD collections[*].items[*].entries[*] ON item TYPE object;
+					DEFINE FIELD collections[*].items[*].entries[*].title ON item TYPE string;
+					DEFINE FIELD collections[*].items[*].entries[*].note ON item TYPE option<string>;
 
 					DEFINE TABLE article SCHEMAFULL;
 					DEFINE FIELD title ON article TYPE string;
@@ -2309,15 +2537,38 @@ mod graphql_integration {
 					CREATE item:alpha SET
 						name = "Alpha",
 						time = { createdAt: d"2024-01-15T10:00:00Z", updatedAt: d"2024-06-01T12:00:00Z", audit: { reviewedAt: d"2024-06-02T09:00:00Z" } },
+						details = { title: "Alpha listing", meta: { slug: "alpha-listing" } },
+						pricing = { base: { amount: 99.5dec }, fees: { cleaning: 10dec } },
 						tags = [
 							{ label: "urgent", priority: 1 },
 							{ label: "review", priority: 3 }
-						];
-					CREATE item:beta SET
-						name = "Beta",
-						time = { createdAt: d"2024-03-20T08:00:00Z", updatedAt: d"2024-07-10T16:00:00Z", audit: { reviewedAt: d"2024-07-11T10:00:00Z" } },
-						tags = [
-							{ label: "feature", priority: 2 }
+						],
+						groups = [
+							{
+								title: "Policies",
+								items: [
+									{
+										title: "Check-in",
+										entries: [
+											{ label: "After 3 PM", icon: "CLOCK" },
+											{ label: "Before 11 AM", icon: "CLOCK" }
+										]
+									}
+								]
+							}
+						],
+						collections = [
+							{
+								title: "Nearby",
+								items: [
+									{
+										title: "Airport",
+										entries: [
+											{ title: "IBZ", note: "18 min drive" }
+										]
+									}
+								]
+							}
 						];
 				"#,
 				)
@@ -2325,24 +2576,82 @@ mod graphql_integration {
 				.await?;
 			assert_eq!(res.status(), 200);
 		}
+		{
+			let res = client
+				.post(sql_url)
+				.body(
+					r#"
+					CREATE item:beta SET
+						name = "Beta",
+						time = { createdAt: d"2024-03-20T08:00:00Z", updatedAt: d"2024-07-10T16:00:00Z", audit: { reviewedAt: d"2024-07-11T10:00:00Z" } },
+						details = { title: "Beta listing", meta: { slug: "beta-listing" } },
+						pricing = { base: { amount: 49.5dec }, fees: { cleaning: 0dec } },
+						tags = [
+							{ label: "feature", priority: 2 }
+						],
+						groups = [],
+						collections = [];
+				"#,
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+		}
 
-		// --- Test 1: Query nested object sub-fields (time { createdAt, updatedAt }) ---
+		// --- Test 1: Query nested object sub-fields and embedded object trees ---
 		{
 			let res = client
 				.post(gql_url)
 				.body(
 					json!({
 						"query": r#"query {
-							items(orderBy: { field: ID, direction: ASC }) {
-								nodes {
-									id
-									name
-									time {
-										createdAt
-										updatedAt
-										audit {
-											reviewedAt
-										}
+							alpha: item(id: "alpha") {
+								id
+								name
+								time {
+									createdAt
+									updatedAt
+									audit {
+										reviewedAt
+									}
+								}
+								details {
+									title
+									meta {
+										slug
+									}
+								}
+								pricing {
+									base {
+										amount
+									}
+									fees {
+										cleaning
+									}
+								}
+							}
+							beta: item(id: "beta") {
+								id
+								name
+								time {
+									createdAt
+									updatedAt
+									audit {
+										reviewedAt
+									}
+								}
+								details {
+									title
+									meta {
+										slug
+									}
+								}
+								pricing {
+									base {
+										amount
+									}
+									fees {
+										cleaning
 									}
 								}
 							}
@@ -2355,33 +2664,41 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
 			assert!(body["errors"].is_null(), "Expected no errors, got: {:?}", body["errors"]);
-			let items = body["data"]["items"]["nodes"].as_array().unwrap();
-			assert_eq!(items.len(), 2);
+			let alpha = &body["data"]["alpha"];
+			let beta = &body["data"]["beta"];
 
 			// First item
-			assert_eq!(items[0]["id"], "item:alpha");
-			assert_eq!(items[0]["name"], "Alpha");
+			assert_eq!(alpha["id"], "item:alpha");
+			assert_eq!(alpha["name"], "Alpha");
 			assert!(
-				items[0]["time"]["createdAt"].as_str().unwrap().contains("2024-01-15"),
+				alpha["time"]["createdAt"].as_str().unwrap().contains("2024-01-15"),
 				"Expected createdAt to contain 2024-01-15, got: {}",
-				items[0]["time"]["createdAt"]
+				alpha["time"]["createdAt"]
 			);
 			assert!(
-				items[0]["time"]["updatedAt"].as_str().unwrap().contains("2024-06-01"),
+				alpha["time"]["updatedAt"].as_str().unwrap().contains("2024-06-01"),
 				"Expected updatedAt to contain 2024-06-01, got: {}",
-				items[0]["time"]["updatedAt"]
+				alpha["time"]["updatedAt"]
 			);
-			assert!(
-				items[0]["time"]["audit"]["reviewedAt"].as_str().unwrap().contains("2024-06-02")
-			);
+			assert!(alpha["time"]["audit"]["reviewedAt"].as_str().unwrap().contains("2024-06-02"));
+			assert_eq!(alpha["details"]["title"], "Alpha listing");
+			assert_eq!(alpha["details"]["meta"]["slug"], "alpha-listing");
+			assert_eq!(alpha["pricing"]["base"]["amount"], "99.5");
+			assert_eq!(alpha["pricing"]["fees"]["cleaning"], "10");
 
 			// Second item
-			assert_eq!(items[1]["id"], "item:beta");
-			assert_eq!(items[1]["name"], "Beta");
-			assert!(items[1]["time"]["createdAt"].as_str().unwrap().contains("2024-03-20"),);
+			assert_eq!(beta["id"], "item:beta");
+			assert_eq!(beta["name"], "Beta");
+			assert!(beta["time"]["createdAt"].as_str().unwrap().contains("2024-03-20"));
+			assert!(beta["time"]["updatedAt"].as_str().unwrap().contains("2024-07-10"));
+			assert!(beta["time"]["audit"]["reviewedAt"].as_str().unwrap().contains("2024-07-11"));
+			assert_eq!(beta["details"]["title"], "Beta listing");
+			assert_eq!(beta["details"]["meta"]["slug"], "beta-listing");
+			assert_eq!(beta["pricing"]["base"]["amount"], "49.5");
+			assert_eq!(beta["pricing"]["fees"]["cleaning"], "0");
 		}
 
-		// --- Test 2: Query array-of-object sub-fields (tags { label, priority }) ---
+		// --- Test 2: Query array-of-object sub-fields and connection shape ---
 		{
 			let res = client
 				.post(gql_url)
@@ -2392,9 +2709,22 @@ mod graphql_integration {
 								nodes {
 									id
 									tags {
+										totalCount
 										nodes {
 											label
 											priority
+										}
+										edges {
+											cursor
+											node {
+												label
+											}
+										}
+										pageInfo {
+											hasNextPage
+											hasPreviousPage
+											startCursor
+											endCursor
 										}
 									}
 								}
@@ -2412,12 +2742,15 @@ mod graphql_integration {
 			assert_eq!(items.len(), 2);
 
 			// First item has two tags
+			assert_eq!(items[0]["tags"]["totalCount"], 2);
 			let tags0 = items[0]["tags"]["nodes"].as_array().unwrap();
 			assert_eq!(tags0.len(), 2);
 			assert_eq!(tags0[0]["label"], "urgent");
 			assert_eq!(tags0[0]["priority"], 1);
 			assert_eq!(tags0[1]["label"], "review");
 			assert_eq!(tags0[1]["priority"], 3);
+			assert_eq!(items[0]["tags"]["edges"].as_array().unwrap().len(), 2);
+			assert_eq!(items[0]["tags"]["pageInfo"]["hasNextPage"], false);
 
 			// Second item has one tag
 			let tags1 = items[1]["tags"]["nodes"].as_array().unwrap();
@@ -2438,6 +2771,11 @@ mod graphql_integration {
 									name
 									time {
 										createdAt
+									}
+									details {
+										meta {
+											slug
+										}
 									}
 									tags {
 										nodes {
@@ -2461,6 +2799,8 @@ mod graphql_integration {
 			// time should only have createdAt (not updatedAt)
 			assert!(items[0]["time"]["createdAt"].is_string());
 			assert!(items[0]["time"].get("updatedAt").is_none());
+			assert_eq!(items[0]["details"]["meta"]["slug"], "alpha-listing");
+			assert!(items[0]["details"].get("title").is_none());
 
 			// tags should only have label (not priority)
 			let tags = items[0]["tags"]["nodes"].as_array().unwrap();
@@ -2468,7 +2808,7 @@ mod graphql_integration {
 			assert!(tags[0].get("priority").is_none());
 		}
 
-		// --- Test 4: Single record fetch with nested objects ---
+		// --- Test 4: Single record fetch with nested objects and recursive arrays ---
 		{
 			let res = client
 				.post(gql_url)
@@ -2485,10 +2825,56 @@ mod graphql_integration {
 										reviewedAt
 									}
 								}
+								details {
+									title
+									meta {
+										slug
+									}
+								}
+								pricing {
+									base {
+										amount
+									}
+									fees {
+										cleaning
+									}
+								}
 								tags {
 									nodes {
 										label
 										priority
+									}
+								}
+								groups(first: 1) {
+									nodes {
+										title
+										items(first: 1) {
+											nodes {
+												title
+												entries(first: 2) {
+													nodes {
+														label
+														icon
+													}
+												}
+											}
+										}
+									}
+								}
+								collections(first: 1) {
+									nodes {
+										title
+										items(first: 1) {
+											nodes {
+												title
+												entries(first: 1) {
+													nodes {
+														title
+														note
+													}
+												}
+											}
+										}
 									}
 								}
 							}
@@ -2506,19 +2892,34 @@ mod graphql_integration {
 			assert_eq!(item["name"], "Alpha");
 			assert!(item["time"]["createdAt"].as_str().unwrap().contains("2024-01-15"));
 			assert!(item["time"]["audit"]["reviewedAt"].as_str().unwrap().contains("2024-06-02"));
+			assert_eq!(item["details"]["title"], "Alpha listing");
+			assert_eq!(item["details"]["meta"]["slug"], "alpha-listing");
+			assert_eq!(item["pricing"]["base"]["amount"], "99.5");
+			assert_eq!(item["pricing"]["fees"]["cleaning"], "10");
 			let tags = item["tags"]["nodes"].as_array().unwrap();
 			assert_eq!(tags.len(), 2);
 			assert_eq!(tags[0]["label"], "urgent");
+			assert_eq!(item["groups"]["nodes"][0]["title"], "Policies");
+			assert_eq!(item["groups"]["nodes"][0]["items"]["nodes"][0]["title"], "Check-in");
+			assert_eq!(
+				item["groups"]["nodes"][0]["items"]["nodes"][0]["entries"]["nodes"][0]["label"],
+				"After 3 PM"
+			);
+			assert_eq!(item["collections"]["nodes"][0]["title"], "Nearby");
+			assert_eq!(
+				item["collections"]["nodes"][0]["items"]["nodes"][0]["entries"]["nodes"][0]["title"],
+				"IBZ"
+			);
 		}
 
-		// --- Test 5: Schema introspection shows generated nested types ---
+		// --- Test 5: Schema introspection shows generated nested object types ---
 		{
 			let res = client
 				.post(gql_url)
 				.body(
 					json!({
 						"query": r#"query {
-							__type(name: "ItemTime") {
+							itemTime: __type(name: "ItemTime") {
 								name
 								fields {
 									name
@@ -2527,6 +2928,21 @@ mod graphql_integration {
 										kind
 									}
 								}
+							}
+							itemDetails: __type(name: "ItemDetails") {
+								fields { name }
+							}
+							itemDetailsMeta: __type(name: "ItemDetailsMeta") {
+								fields { name }
+							}
+							itemPricing: __type(name: "ItemPricing") {
+								fields { name }
+							}
+							itemPricingBase: __type(name: "ItemPricingBase") {
+								fields { name }
+							}
+							itemPricingFees: __type(name: "ItemPricingFees") {
+								fields { name }
 							}
 						}"#
 					})
@@ -2537,7 +2953,7 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
 			assert!(body["errors"].is_null(), "Expected no errors, got: {:?}", body["errors"]);
-			let ty = &body["data"]["__type"];
+			let ty = &body["data"]["itemTime"];
 			assert_eq!(ty["name"], "ItemTime");
 			let fields = ty["fields"].as_array().unwrap();
 			let field_names: Vec<&str> =
@@ -2545,6 +2961,18 @@ mod graphql_integration {
 			assert!(field_names.contains(&"createdAt"), "Expected createdAt field");
 			assert!(field_names.contains(&"updatedAt"), "Expected updatedAt field");
 			assert!(field_names.contains(&"audit"), "Expected audit field");
+			for type_name in [
+				"itemDetails",
+				"itemDetailsMeta",
+				"itemPricing",
+				"itemPricingBase",
+				"itemPricingFees",
+			] {
+				assert!(
+					body["data"][type_name]["fields"].is_array(),
+					"Expected generated type {type_name}"
+				);
+			}
 		}
 
 		// --- Test 6: Schema introspection shows generated nested child object types ---
@@ -2554,7 +2982,7 @@ mod graphql_integration {
 				.body(
 					json!({
 						"query": r#"query {
-							__type(name: "ItemTimeAudit") {
+							itemTimeAudit: __type(name: "ItemTimeAudit") {
 								name
 								fields {
 									name
@@ -2569,7 +2997,7 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
 			assert!(body["errors"].is_null(), "Expected no errors, got: {:?}", body["errors"]);
-			let ty = &body["data"]["__type"];
+			let ty = &body["data"]["itemTimeAudit"];
 			assert_eq!(ty["name"], "ItemTimeAudit");
 			let fields = ty["fields"].as_array().unwrap();
 			let field_names: Vec<&str> =
@@ -2577,14 +3005,14 @@ mod graphql_integration {
 			assert!(field_names.contains(&"reviewedAt"), "Expected reviewedAt field");
 		}
 
-		// --- Test 7: Schema introspection for array element type ---
+		// --- Test 7: Schema introspection for array element and recursive path-specific types ---
 		{
 			let res = client
 				.post(gql_url)
 				.body(
 					json!({
 						"query": r#"query {
-							__type(name: "ItemTags") {
+							itemTags: __type(name: "ItemTags") {
 								name
 								fields {
 									name
@@ -2594,6 +3022,18 @@ mod graphql_integration {
 									}
 								}
 							}
+							itemGroups: __type(name: "ItemGroups") {
+								fields { name }
+							}
+							itemGroupsItems: __type(name: "ItemGroupsItems") {
+								fields { name }
+							}
+							itemGroupsItemsEntries: __type(name: "ItemGroupsItemsEntries") {
+								fields { name }
+							}
+							itemCollectionsItemsEntries: __type(name: "ItemCollectionsItemsEntries") {
+								fields { name }
+							}
 						}"#
 					})
 					.to_string(),
@@ -2603,13 +3043,51 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 			let body = res.json::<serde_json::Value>().await?;
 			assert!(body["errors"].is_null(), "Expected no errors, got: {:?}", body["errors"]);
-			let ty = &body["data"]["__type"];
+			let ty = &body["data"]["itemTags"];
 			assert_eq!(ty["name"], "ItemTags");
 			let fields = ty["fields"].as_array().unwrap();
 			let field_names: Vec<&str> =
 				fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
 			assert!(field_names.contains(&"label"), "Expected label field");
 			assert!(field_names.contains(&"priority"), "Expected priority field");
+
+			let groups_type_fields = body["data"]["itemGroups"]["fields"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|f| f["name"].as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert!(groups_type_fields.contains(&"title"));
+			assert!(groups_type_fields.contains(&"items"));
+
+			let groups_items_fields = body["data"]["itemGroupsItems"]["fields"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|f| f["name"].as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert!(groups_items_fields.contains(&"title"));
+			assert!(groups_items_fields.contains(&"entries"));
+
+			let groups_entries_fields = body["data"]["itemGroupsItemsEntries"]["fields"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|f| f["name"].as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert!(groups_entries_fields.contains(&"label"));
+			assert!(groups_entries_fields.contains(&"icon"));
+			assert!(!groups_entries_fields.contains(&"title"));
+
+			let collection_entries_fields = body["data"]["itemCollectionsItemsEntries"]["fields"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|f| f["name"].as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert!(collection_entries_fields.contains(&"title"));
+			assert!(collection_entries_fields.contains(&"note"));
+			assert!(!collection_entries_fields.contains(&"label"));
 		}
 
 		// --- Test 8: Optional nested object fields handled gracefully ---
@@ -2698,6 +3176,7 @@ mod graphql_integration {
 							items(
 								filterBy: {
 									time: { audit: { reviewedAt: { gt: "2024-07-01T00:00:00Z" } } }
+									details: { meta: { slug: { eq: "beta-listing" } } }
 									tags: { some: { label: { eq: "feature" }, priority: { eq: 2 } } }
 								}
 							) {
@@ -2719,6 +3198,60 @@ mod graphql_integration {
 			assert_eq!(items.len(), 1);
 			assert_eq!(items[0]["id"], "item:beta");
 			assert_eq!(items[0]["name"], "Beta");
+		}
+
+		// --- Test 10: Nested connection pagination supports first/after on embedded arrays ---
+		{
+			let first_page = client
+				.post(gql_url)
+				.body(
+					json!({
+						"query": r#"query {
+							item(id: "alpha") {
+								tags(first: 1) {
+									nodes { label }
+									pageInfo { endCursor hasNextPage hasPreviousPage }
+								}
+							}
+						}"#
+					})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(first_page.status(), 200);
+			let first_page = first_page.json::<serde_json::Value>().await?;
+			assert!(first_page["errors"].is_null());
+			let tag_connection = &first_page["data"]["item"]["tags"];
+			assert_eq!(tag_connection["nodes"][0]["label"], "urgent");
+			assert_eq!(tag_connection["pageInfo"]["hasNextPage"], true);
+			assert_eq!(tag_connection["pageInfo"]["hasPreviousPage"], false);
+			let after = tag_connection["pageInfo"]["endCursor"].as_str().unwrap();
+
+			let second_page = client
+				.post(gql_url)
+				.body(
+					json!({
+						"query": format!(r#"query {{
+							item(id: "alpha") {{
+								tags(first: 1, after: "{after}") {{
+									nodes {{ label }}
+									pageInfo {{ hasNextPage hasPreviousPage }}
+								}}
+							}}
+						}}"#)
+					})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(second_page.status(), 200);
+			let second_page = second_page.json::<serde_json::Value>().await?;
+			assert!(second_page["errors"].is_null());
+			let tag_connection = &second_page["data"]["item"]["tags"];
+			assert_eq!(tag_connection["nodes"][0]["label"], "review");
+			assert_eq!(tag_connection["pageInfo"]["hasNextPage"], false);
+			assert_eq!(tag_connection["pageInfo"]["hasPreviousPage"], true);
 		}
 
 		Ok(())
@@ -3053,6 +3586,8 @@ mod graphql_integration {
 		Ok(())
 	}
 
+	// --- Mutations and auth ---
+
 	#[test(tokio::test)]
 	async fn mutations() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_without_auth().await.unwrap();
@@ -3080,6 +3615,12 @@ mod graphql_integration {
 					DEFINE TABLE item SCHEMAFUL;
 					DEFINE FIELD name ON item TYPE string;
 					DEFINE FIELD price ON item TYPE int;
+					DEFINE FIELD meta ON item TYPE object;
+					DEFINE FIELD meta.code ON item TYPE string;
+					DEFINE FIELD tags ON item TYPE array<object>;
+					DEFINE FIELD tags[*] ON item TYPE object;
+					DEFINE FIELD tags[*].label ON item TYPE string;
+					DEFINE FIELD tags[*].weight ON item TYPE int;
 					DEFINE TABLE person SCHEMAFUL;
 					DEFINE FIELD name ON person TYPE string;
 					DEFINE TABLE post SCHEMAFUL;
@@ -3099,13 +3640,21 @@ mod graphql_integration {
 				.post(gql_url)
 				.body(
 					json!({"query": r#"mutation {
-						createItem(input: { id: "1", name: "Widget", price: 100 }) {
+						createItem(input: {
+							id: "1",
+							name: "Widget",
+							price: 100,
+							meta: { code: "W-1" },
+							tags: [{ label: "core", weight: 1 }, { label: "sale", weight: 2 }]
+						}) {
 							success
 							message
 							item {
 								id
 								name
 								price
+								meta { code }
+								tags { nodes { label weight } }
 							}
 						}
 					}"#})
@@ -3122,6 +3671,9 @@ mod graphql_integration {
 			assert_eq!(item["id"], "item:1");
 			assert_eq!(item["name"], "Widget");
 			assert_eq!(item["price"], 100);
+			assert_eq!(item["meta"]["code"], "W-1");
+			assert_eq!(item["tags"]["nodes"][0]["label"], "core");
+			assert_eq!(item["tags"]["nodes"][1]["weight"], 2);
 		}
 
 		// --- Test 2: createItem (auto-generated id) ---
@@ -3130,12 +3682,19 @@ mod graphql_integration {
 				.post(gql_url)
 				.body(
 					json!({"query": r#"mutation {
-						createItem(input: { name: "Gadget", price: 200 }) {
+						createItem(input: {
+							name: "Gadget",
+							price: 200,
+							meta: { code: "G-1" },
+							tags: [{ label: "feature", weight: 3 }]
+						}) {
 							success
 							item {
 								id
 								name
 								price
+								meta { code }
+								tags { nodes { label weight } }
 							}
 						}
 					}"#})
@@ -3151,6 +3710,8 @@ mod graphql_integration {
 			assert!(item["id"].as_str().unwrap().starts_with("item:"));
 			assert_eq!(item["name"], "Gadget");
 			assert_eq!(item["price"], 200);
+			assert_eq!(item["meta"]["code"], "G-1");
+			assert_eq!(item["tags"]["nodes"][0]["label"], "feature");
 		}
 
 		// --- Test 3: updateItem ---
@@ -3159,12 +3720,19 @@ mod graphql_integration {
 				.post(gql_url)
 				.body(
 					json!({"query": r#"mutation {
-						updateItem(input: { id: "1", name: "Super Widget" }) {
+						updateItem(input: {
+							id: "1",
+							name: "Super Widget",
+							meta: { code: "W-2" },
+							tags: [{ label: "core", weight: 5 }]
+						}) {
 							success
 							item {
 								id
 								name
 								price
+								meta { code }
+								tags { nodes { label weight } }
 							}
 						}
 					}"#})
@@ -3180,6 +3748,8 @@ mod graphql_integration {
 			assert_eq!(item["name"], "Super Widget");
 			// price should be unchanged (MERGE, not CONTENT)
 			assert_eq!(item["price"], 100);
+			assert_eq!(item["meta"]["code"], "W-2");
+			assert_eq!(item["tags"]["nodes"][0]["weight"], 5);
 		}
 
 		// --- Test 4: upsertItem (existing record) ---
@@ -3188,12 +3758,20 @@ mod graphql_integration {
 				.post(gql_url)
 				.body(
 					json!({"query": r#"mutation {
-						upsertItem(input: { id: "1", name: "Mega Widget", price: 150 }) {
+						upsertItem(input: {
+							id: "1",
+							name: "Mega Widget",
+							price: 150,
+							meta: { code: "W-3" },
+							tags: [{ label: "premium", weight: 8 }]
+						}) {
 							success
 							item {
 								id
 								name
 								price
+								meta { code }
+								tags { nodes { label weight } }
 							}
 						}
 					}"#})
@@ -3208,6 +3786,8 @@ mod graphql_integration {
 			assert_eq!(item["id"], "item:1");
 			assert_eq!(item["name"], "Mega Widget");
 			assert_eq!(item["price"], 150);
+			assert_eq!(item["meta"]["code"], "W-3");
+			assert_eq!(item["tags"]["nodes"][0]["label"], "premium");
 		}
 
 		// --- Test 5: upsertItem (new record) ---
@@ -3216,12 +3796,20 @@ mod graphql_integration {
 				.post(gql_url)
 				.body(
 					json!({"query": r#"mutation {
-						upsertItem(input: { id: "99", name: "New Item", price: 50 }) {
+						upsertItem(input: {
+							id: "99",
+							name: "New Item",
+							price: 50,
+							meta: { code: "N-1" },
+							tags: [{ label: "new", weight: 1 }]
+						}) {
 							success
 							item {
 								id
 								name
 								price
+								meta { code }
+								tags { nodes { label weight } }
 							}
 						}
 					}"#})
@@ -3236,6 +3824,8 @@ mod graphql_integration {
 			assert_eq!(item["id"], "item:99");
 			assert_eq!(item["name"], "New Item");
 			assert_eq!(item["price"], 50);
+			assert_eq!(item["meta"]["code"], "N-1");
+			assert_eq!(item["tags"]["nodes"][0]["label"], "new");
 		}
 
 		// --- Test 6: deleteItem ---
@@ -3248,6 +3838,7 @@ mod graphql_integration {
 							success
 							item {
 								id
+								name
 							}
 						}
 					}"#})
@@ -3260,6 +3851,7 @@ mod graphql_integration {
 			assert!(body["errors"].is_null(), "Unexpected errors: {:?}", body["errors"]);
 			assert_eq!(body["data"]["deleteItem"]["success"], true);
 			assert_eq!(body["data"]["deleteItem"]["item"]["id"], "item:99");
+			assert_eq!(body["data"]["deleteItem"]["item"]["name"], "New Item");
 		}
 
 		// Verify deletion via query
@@ -3376,7 +3968,60 @@ mod graphql_integration {
 			assert_eq!(body["data"]["updateLikes"]["likes"]["rating"], 8);
 		}
 
-		// --- Test 9: Schema introspection shows mutation type ---
+		// --- Test 9: Relation delete mutation is executable and relation upsert stays introspectable ---
+		{
+			let like_lookup = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						person(id: "alice") {
+							likes {
+								edges {
+									id
+								}
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?
+				.json::<serde_json::Value>()
+				.await?;
+			let like_id = like_lookup["data"]["person"]["likes"]["edges"][0]["id"]
+				.as_str()
+				.unwrap()
+				.to_string();
+
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": format!(r#"mutation {{
+						deleteLikes(input: {{ id: "{like_id}" }}) {{
+							success
+							likes {{
+								id
+								rating
+							}}
+						}}
+					}}"#)})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(
+				body["errors"].is_null(),
+				"Unexpected deleteLikes errors: {:?}",
+				body["errors"]
+			);
+			assert_eq!(body["data"]["deleteLikes"]["success"], true);
+			assert_eq!(body["data"]["deleteLikes"]["likes"]["id"], like_id);
+			assert_eq!(body["data"]["deleteLikes"]["likes"]["rating"], 8);
+		}
+
+		// --- Test 10: Schema introspection shows mutation type ---
 		{
 			let res = client
 				.post(gql_url)
@@ -3418,7 +4063,7 @@ mod graphql_integration {
 			assert!(!field_names.contains(&"deleteManyItem"), "Unexpected deleteManyItem");
 		}
 
-		// --- Test 10: Input and payload introspection ---
+		// --- Test 11: Input and payload introspection ---
 		{
 			let res = client
 				.post(gql_url)
@@ -3456,6 +4101,8 @@ mod graphql_integration {
 			assert!(create_field_names.contains(&"id"), "CreateInput missing 'id'");
 			assert!(create_field_names.contains(&"name"), "CreateInput missing 'name'");
 			assert!(create_field_names.contains(&"price"), "CreateInput missing 'price'");
+			assert!(create_field_names.contains(&"meta"), "CreateInput missing 'meta'");
+			assert!(create_field_names.contains(&"tags"), "CreateInput missing 'tags'");
 
 			// UpdateItemInput should have all fields optional
 			let update_input = &body["data"]["updateInput"];
@@ -3553,7 +4200,7 @@ mod graphql_integration {
 			let res = client
 				.post(gql_url)
 				.body(
-						json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name, age } } } }"#})
+					json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name, age } } } }"#})
 						.to_string(),
 				)
 				.send()
@@ -3614,7 +4261,7 @@ mod graphql_integration {
 			let res = client
 				.post(gql_url)
 				.body(
-						json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name } } } }"#})
+					json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name } } } }"#})
 						.to_string(),
 				)
 				.send()
@@ -3671,7 +4318,7 @@ mod graphql_integration {
 			let res = client
 				.post(gql_url)
 				.body(
-						json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name, age } } } }"#})
+					json!({"query": r#"{ comment(id: "comment:1") { text, post { title, author { name, age } } } }"#})
 						.to_string(),
 				)
 				.send()
@@ -4746,6 +5393,8 @@ mod graphql_integration {
 	/// - Mutation results are cached for field resolution
 	/// - Relation record fields are resolved from cache
 	/// - Nested object fields are resolved from cache
+	// --- Cached record resolution ---
+
 	#[test(tokio::test)]
 	async fn cached_record_resolution() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_without_auth().await.unwrap();
@@ -6254,7 +6903,27 @@ mod graphql_integration {
 		{
 			let res = client
 				.post(gql_url)
-				.body(json!({"query": r#"query { tests { nodes { id type } } }"#}).to_string())
+				.body(
+					json!({"query": r#"query {
+						tests { nodes { id type } }
+						typeEnum: __type(name: "TestTypeEnum") {
+							enumValues { name }
+						}
+						createInput: __type(name: "CreateTestInput") {
+							inputFields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+						updateInput: __type(name: "UpdateTestInput") {
+							inputFields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+					}"#})
+					.to_string(),
+				)
 				.send()
 				.await?;
 			assert_eq!(res.status(), 200);
@@ -6266,6 +6935,81 @@ mod graphql_integration {
 			);
 			assert_eq!(body["data"]["tests"]["nodes"][0]["id"], "test:one");
 			assert_eq!(body["data"]["tests"]["nodes"][0]["type"], "ENUM_1");
+
+			let enum_values = body["data"]["typeEnum"]["enumValues"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.map(|value| value["name"].as_str().unwrap())
+				.collect::<Vec<_>>();
+			assert_eq!(enum_values, vec!["ENUM_1", "ENUM_2"]);
+
+			for input_name in ["createInput", "updateInput"] {
+				let input_fields = body["data"][input_name]["inputFields"].as_array().unwrap();
+				let type_field = input_fields.iter().find(|field| field["name"] == "type").unwrap();
+				let type_name = type_field["type"]["name"]
+					.as_str()
+					.or_else(|| type_field["type"]["ofType"]["name"].as_str())
+					.unwrap();
+				assert_eq!(type_name, "TestTypeEnum");
+			}
+		}
+
+		// Mutations should use the sanitized enum tokens rather than raw strings.
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"mutation {
+						createTest(input: { type: ENUM_2 }) {
+							success
+							test {
+								id
+								type
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(
+				body["errors"].is_null(),
+				"Expected sanitized enum mutation to succeed, got: {:?}",
+				body
+			);
+			assert_eq!(body["data"]["createTest"]["success"], true);
+			assert_eq!(body["data"]["createTest"]["test"]["type"], "ENUM_2");
+		}
+
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"mutation {
+						updateTest(input: { id: "one", type: ENUM_2 }) {
+							success
+							test {
+								id
+								type
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(
+				body["errors"].is_null(),
+				"Expected sanitized enum update to succeed, got: {:?}",
+				body
+			);
+			assert_eq!(body["data"]["updateTest"]["success"], true);
+			assert_eq!(body["data"]["updateTest"]["test"]["type"], "ENUM_2");
 		}
 
 		Ok(())
@@ -6642,6 +7386,8 @@ mod graphql_integration {
 		Ok(())
 	}
 
+	// --- Subscriptions ---
+
 	#[test(tokio::test)]
 	async fn subscriptions_live_query_stream() -> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server) = common::start_server_without_auth().await.unwrap();
@@ -6926,10 +7672,10 @@ mod graphql_integration {
 					}
 				}
 			})
-			.to_string()
-			.into(),
+				.to_string()
+				.into(),
 		))
-		.await?;
+			.await?;
 
 		// Allow the server to fully register the live query before mutating data
 		tokio::time::sleep(Duration::from_secs(1)).await;
@@ -7105,12 +7851,66 @@ mod graphql_integration {
 					}
 				}
 			})
+				.to_string()
+				.into(),
+		))
+			.await?;
+		ws.send(Message::Text(
+			json!({
+				"id": "person-updated",
+				"type": "subscribe",
+				"payload": {
+					"query": "subscription { personUpdated(id: \"person:alice\") { id person { id name } } }"
+				}
+			})
+			.to_string()
+			.into(),
+		))
+		.await?;
+		ws.send(Message::Text(
+			json!({
+				"id": "person-deleted",
+				"type": "subscribe",
+				"payload": {
+					"query": "subscription { personDeleted(id: \"person:bob\") { id person { id name } } }"
+				}
+			})
+			.to_string()
+			.into(),
+		))
+		.await?;
+		ws.send(Message::Text(
+			json!({
+				"id": "likes-updated",
+				"type": "subscribe",
+				"payload": {
+					"query": "subscription { likesUpdated { id likesRelation { id rating } } }"
+				}
+			})
+			.to_string()
+			.into(),
+		))
+		.await?;
+		ws.send(Message::Text(
+			json!({
+				"id": "likes-deleted",
+				"type": "subscribe",
+				"payload": {
+					"query": "subscription { likesDeleted { id likesRelation { id rating } } }"
+				}
+			})
 			.to_string()
 			.into(),
 		))
 		.await?;
 
 		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		{
+			let res =
+				client.post(sql_url).body(r#"CREATE person:bob SET name = 'Bob';"#).send().await?;
+			assert_eq!(res.status(), 200);
+		}
 
 		{
 			let res = client
@@ -7121,7 +7921,7 @@ mod graphql_integration {
 			assert_eq!(res.status(), 200);
 		}
 
-		let received = tokio::time::timeout(Duration::from_secs(10), async {
+		let related_event = tokio::time::timeout(Duration::from_secs(10), async {
 			while let Some(frame) = ws.next().await {
 				let Ok(frame) = frame else {
 					continue;
@@ -7141,7 +7941,85 @@ mod graphql_integration {
 		.await?
 		.ok_or_else(|| std::io::Error::other("subscription stream ended before relation event"))?;
 
-		assert_eq!(received["payload"]["data"]["likesRelated"]["likesRelation"]["rating"], 5);
+		let related_id =
+			related_event["payload"]["data"]["likesRelated"]["id"].as_str().unwrap().to_string();
+		assert_eq!(related_event["payload"]["data"]["likesRelated"]["likesRelation"]["rating"], 5);
+
+		{
+			let res = client
+				.post(sql_url)
+				.body(format!(
+					r#"
+						UPDATE person:alice SET name = 'Alice Updated';
+						UPDATE {related_id} SET rating = 7;
+						DELETE person:bob;
+						DELETE {related_id};
+					"#
+				))
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+		}
+
+		let mut got_person_updated = false;
+		let mut got_person_deleted = false;
+		let mut got_likes_updated = false;
+		let mut got_likes_deleted = false;
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while let Some(frame) = ws.next().await {
+				let Ok(frame) = frame else {
+					continue;
+				};
+				let Message::Text(text) = frame else {
+					continue;
+				};
+				let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+					continue;
+				};
+				if value["type"] != "next" {
+					continue;
+				}
+				match value["id"].as_str() {
+					Some("person-updated") => {
+						assert_eq!(value["payload"]["data"]["personUpdated"]["id"], "person:alice");
+						assert_eq!(
+							value["payload"]["data"]["personUpdated"]["person"]["name"],
+							"Alice Updated"
+						);
+						got_person_updated = true;
+					}
+					Some("person-deleted") => {
+						assert_eq!(value["payload"]["data"]["personDeleted"]["id"], "person:bob");
+						got_person_deleted = true;
+					}
+					Some("likes-updated") => {
+						assert_eq!(
+							value["payload"]["data"]["likesUpdated"]["likesRelation"]["rating"],
+							7
+						);
+						got_likes_updated = true;
+					}
+					Some("likes-deleted") => {
+						assert_eq!(value["payload"]["data"]["likesDeleted"]["id"], related_id);
+						got_likes_deleted = true;
+					}
+					_ => {}
+				}
+				if got_person_updated
+					&& got_person_deleted
+					&& got_likes_updated
+					&& got_likes_deleted
+				{
+					return;
+				}
+			}
+		})
+		.await?;
+
+		assert!(got_person_updated, "missing personUpdated event");
+		assert!(got_person_deleted, "missing personDeleted event");
+		assert!(got_likes_updated, "missing likesUpdated event");
+		assert!(got_likes_deleted, "missing likesDeleted event");
 		Ok(())
 	}
 }
