@@ -171,6 +171,7 @@ pub async fn generate_schema(
 
 	let mut mutation_obj: Option<Object> = None;
 	let mut subscription_obj = None;
+	let mut table_filter_registry = HashMap::new();
 
 	match tbs {
 		Some(ref tbs) if !tbs.is_empty() => {
@@ -182,12 +183,14 @@ pub async fn generate_schema(
 				&schema_ctx,
 				&relations,
 				&mut table_fields,
+				&mut table_filter_registry,
 			)
 			.await?;
 
 			// Generate mutations for all tables
 			mutation_obj = Some(process_mutations(tbs.clone(), &mut types, &schema_ctx).await?);
-			subscription_obj = process_subscriptions(&tbs[..], &table_fields);
+			subscription_obj =
+				process_subscriptions(&tbs[..], &table_fields, &table_filter_registry);
 		}
 		_ => {}
 	}
@@ -222,7 +225,9 @@ pub async fn generate_schema(
 		None
 	};
 
-	let mut schema = Schema::build("Query", mutation_name, subscription_name).register(query);
+	let mut schema = Schema::build("Query", mutation_name, subscription_name)
+		.register(query)
+		.data(Arc::new(table_filter_registry));
 
 	// Apply depth and complexity limits from the GraphQL config
 	if let Some(depth) = gql_config.depth_limit {

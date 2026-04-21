@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::error::{GqlError, resolver_error};
 use super::naming;
-use super::tables::{CachedRecord, filter_name_from_table, parse_filter_arg};
+use super::tables::{CachedRecord, TableFilterRegistry, filter_name_from_table, parse_filter_arg};
 use super::utils::{GqlValueUtils, execute_plan};
 use crate::catalog::{FieldDefinition, TableDefinition, TableType};
 use crate::dbs::Session;
@@ -89,6 +89,7 @@ impl NotificationRouter {
 pub(crate) fn process_subscriptions(
 	tbs: &[TableDefinition],
 	table_fields: &HashMap<String, Arc<[FieldDefinition]>>,
+	table_filter_registry: &TableFilterRegistry,
 ) -> Option<Subscription> {
 	if tbs.is_empty() {
 		return None;
@@ -103,7 +104,17 @@ pub(crate) fn process_subscriptions(
 			.get(tb.name.as_str())
 			.cloned()
 			.unwrap_or_else(|| Arc::<[FieldDefinition]>::from([]));
-		subscription = subscription.field(make_table_subscription_field(tb, fds));
+		let filter_spec = table_filter_registry.get(tb.name.as_str()).cloned().unwrap_or(
+			super::tables::FilterObjectSpec {
+				type_name: filter_name_from_table(&tb.name),
+				description: format!(
+					"Filter input for `{}` connections.",
+					naming::table_type_name(tb.name.as_str())
+				),
+				fields: Vec::new(),
+			},
+		);
+		subscription = subscription.field(make_table_subscription_field(tb, fds, filter_spec));
 	}
 
 	Some(subscription)
@@ -112,6 +123,7 @@ pub(crate) fn process_subscriptions(
 fn make_table_subscription_field(
 	tb: &TableDefinition,
 	fds: Arc<[FieldDefinition]>,
+	filter_spec: super::tables::FilterObjectSpec,
 ) -> SubscriptionField {
 	let tb_name = tb.name.clone();
 	let tb_name_str = tb_name.clone().into_string();
@@ -121,8 +133,8 @@ fn make_table_subscription_field(
 
 	SubscriptionField::new(tb_name_str.clone(), TypeRef::named(&gql_type_name), move |ctx| {
 		let tb_name = tb_name.clone();
-		let fds = fds.clone();
 		let selectable_fields = selectable_fields.clone();
+		let filter_spec = filter_spec.clone();
 		SubscriptionFieldFuture::new(async move {
 			let ds = ctx.data::<Arc<Datastore>>()?;
 			let sess = ctx.data::<Arc<Session>>()?;
@@ -135,7 +147,13 @@ fn make_table_subscription_field(
 
 			let live_sess = sess.as_ref().clone().with_rt(true);
 			let fields = projected_live_fields(&ctx, &selectable_fields);
-			let cond = parse_subscription_cond(args, &fds, &tb_name)?;
+			let table_filter_registry = ctx.data::<Arc<TableFilterRegistry>>()?;
+			let cond = parse_subscription_cond(
+				args,
+				&filter_spec,
+				&tb_name,
+				table_filter_registry.as_ref(),
+			)?;
 			let fetch = parse_fetch_arg(args)?;
 			let live_id =
 				start_table_live_query(ds, &live_sess, &tb_name, fields, cond, fetch).await?;
@@ -211,11 +229,12 @@ fn projected_live_fields(
 
 fn parse_subscription_cond(
 	args: &IndexMap<Name, GqlValue>,
-	fds: &[FieldDefinition],
+	filter_spec: &super::tables::FilterObjectSpec,
 	tb_name: &TableName,
+	table_filter_registry: &TableFilterRegistry,
 ) -> Result<Option<Cond>, async_graphql::Error> {
 	let id_cond = parse_id_cond(args, tb_name)?;
-	let where_cond = parse_filter_arg(args, fds, tb_name.as_str())
+	let where_cond = parse_filter_arg(args, filter_spec, table_filter_registry)
 		.map_err(|e| async_graphql::Error::new(e.to_string()))?;
 	Ok(combine_cond(id_cond, where_cond))
 }

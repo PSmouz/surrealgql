@@ -967,7 +967,34 @@ mod graphql_integration {
 			assert_eq!(edges[0]["rating"], 5);
 		}
 
-		// Test 4: Relation fields in list query context
+		// Test 4: Relation field filters can recurse into the related node
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						person(id: "alice") {
+							likes(filterBy: { node: { title: { contains: "Second" } } }) {
+								nodes {
+									id
+									title
+								}
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let likes = body["data"]["person"]["likes"]["nodes"].as_array().unwrap();
+			assert_eq!(likes.len(), 1);
+			assert_eq!(likes[0]["id"], "post:p2");
+			assert_eq!(likes[0]["title"], "Second Post");
+		}
+
+		// Test 5: Relation fields in list query context
 		{
 			let res = client
 				.post(gql_url)
@@ -1001,7 +1028,42 @@ mod graphql_integration {
 			assert_eq!(people[1]["likes"]["edges"].as_array().unwrap().len(), 1);
 		}
 
-		// Test 5: Schema introspection shows relation field on the source type
+		// Test 6: Root table filters can recurse through relation edges and target nodes
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						persons(
+							filterBy: {
+								likes: {
+									some: {
+										rating: { gte: 4 }
+										node: { title: { contains: "First" } }
+									}
+								}
+							}
+							orderBy: { field: NAME, direction: ASC }
+						) {
+							nodes {
+								id
+								name
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let people = body["data"]["persons"]["nodes"].as_array().unwrap();
+			assert_eq!(people.len(), 2);
+			assert_eq!(people[0]["id"], "person:alice");
+			assert_eq!(people[1]["id"], "person:bob");
+		}
+
+		// Test 7: Schema introspection shows relation field on the source type
 		{
 			let res = client
 				.post(gql_url)
@@ -1028,7 +1090,7 @@ mod graphql_integration {
 			);
 		}
 
-		// Test 6: Schema introspection omits reverse relation field on the target type
+		// Test 8: Schema introspection omits reverse relation field on the target type
 		{
 			let res = client
 				.post(gql_url)
@@ -1055,7 +1117,7 @@ mod graphql_integration {
 			);
 		}
 
-		// Test 7: Relation tables are not exposed as standalone GraphQL query/object types
+		// Test 9: Relation tables are not exposed as standalone GraphQL query/object types
 		{
 			let res = client
 				.post(gql_url)
@@ -1231,6 +1293,30 @@ mod graphql_integration {
 			let type_info = &dept_field["type"];
 			assert_eq!(type_info["kind"], "OBJECT");
 			assert_eq!(type_info["name"], "Department");
+		}
+
+		// Test 4: Record-link filters recurse into the linked table filter input
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						employees(filterBy: { dept: { name: { eq: "Engineering" } } }, orderBy: { field: NAME, direction: ASC }) {
+							nodes {
+								name
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let employees = body["data"]["employees"]["nodes"].as_array().unwrap();
+			assert_eq!(employees.len(), 2);
+			assert_eq!(employees[0]["name"], "Alice");
+			assert_eq!(employees[1]["name"], "Charlie");
 		}
 
 		Ok(())
@@ -1733,12 +1819,14 @@ mod graphql_integration {
 					DEFINE FIELD price ON product TYPE float;
 					DEFINE FIELD quantity ON product TYPE int;
 					DEFINE FIELD created ON product TYPE datetime;
+					DEFINE FIELD deleted_at ON product TYPE option<datetime>;
+					DEFINE FIELD tags ON product TYPE array<string>;
 
-					CREATE product:1 SET name = "Alpha Widget", price = 9.99, quantity = 100, created = d"2024-01-15T00:00:00Z";
-					CREATE product:2 SET name = "Beta Widget", price = 19.99, quantity = 50, created = d"2024-03-20T00:00:00Z";
-					CREATE product:3 SET name = "Gamma Tool", price = 29.99, quantity = 200, created = d"2024-06-01T00:00:00Z";
-					CREATE product:4 SET name = "Delta Tool", price = 4.99, quantity = 10, created = d"2024-09-10T00:00:00Z";
-					CREATE product:5 SET name = "Epsilon Widget", price = 49.99, quantity = 0, created = d"2025-01-05T00:00:00Z";
+					CREATE product:1 SET name = "Alpha Widget", price = 9.99, quantity = 100, created = d"2024-01-15T00:00:00Z", tags = ["sale", "featured"];
+					CREATE product:2 SET name = "Beta Widget", price = 19.99, quantity = 50, created = d"2024-03-20T00:00:00Z", tags = ["featured"];
+					CREATE product:3 SET name = "Gamma Tool", price = 29.99, quantity = 200, created = d"2024-06-01T00:00:00Z", tags = ["tooling", "graphql"];
+					CREATE product:4 SET name = "Delta Tool", price = 4.99, quantity = 10, created = d"2024-09-10T00:00:00Z", deleted_at = d"2024-09-15T00:00:00Z", tags = ["sale", "tooling"];
+					CREATE product:5 SET name = "Epsilon Widget", price = 49.99, quantity = 0, created = d"2025-01-05T00:00:00Z", tags = ["luxury"];
 				"#,
 				)
 				.send()
@@ -2014,6 +2102,96 @@ mod graphql_integration {
 			let products = body["data"]["products"]["nodes"].as_array().unwrap();
 			// after 2024-06-01: product:4, product:5
 			assert_eq!(products.len(), 2);
+		}
+
+		// --- between ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query { products(filterBy: { price: { between: { gte: 10, lte: 30 } } }) { nodes { id } } }"#})
+						.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 2);
+			assert_eq!(products[0]["id"], "product:2");
+			assert_eq!(products[1]["id"], "product:3");
+		}
+
+		// --- notIn / exists / isNull ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query { products(filterBy: { name: { notIn: ["Alpha Widget", "Beta Widget"] }, deletedAt: { exists: false, isNull: false } }) { nodes { id } } }"#})
+						.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 2);
+			assert_eq!(products[0]["id"], "product:3");
+			assert_eq!(products[1]["id"], "product:5");
+		}
+
+		// --- list semantics / containment ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query { products(filterBy: { tags: { some: { eq: "sale" }, containsAny: ["featured", "tooling"] } }, orderBy: { field: ID, direction: ASC }) { nodes { id } } }"#})
+						.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let products = body["data"]["products"]["nodes"].as_array().unwrap();
+			assert_eq!(products.len(), 2);
+			assert_eq!(products[0]["id"], "product:1");
+			assert_eq!(products[1]["id"], "product:4");
+		}
+
+		// --- filter introspection exposes the richer operator surface ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"query {
+						stringFilter: __type(name: "StringFilterInput") {
+							inputFields { name }
+						}
+						productTagsFilter: __type(name: "ProductTagsListFilterInput") {
+							inputFields { name }
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let string_fields = body["data"]["stringFilter"]["inputFields"].as_array().unwrap();
+			let string_names: Vec<&str> =
+				string_fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+			assert!(string_names.contains(&"notIn"));
+			assert!(string_names.contains(&"between") == false);
+			assert!(string_names.contains(&"like"));
+			assert!(string_names.contains(&"matches"));
+
+			let tags_fields = body["data"]["productTagsFilter"]["inputFields"].as_array().unwrap();
+			let tags_names: Vec<&str> =
+				tags_fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+			assert!(tags_names.contains(&"some"));
+			assert!(tags_names.contains(&"every"));
+			assert!(tags_names.contains(&"none"));
+			assert!(tags_names.contains(&"containsAny"));
 		}
 
 		Ok(())
@@ -2454,6 +2632,39 @@ mod graphql_integration {
 				"Expected meta to be null, got: {:?}",
 				article["meta"]
 			);
+		}
+
+		// --- Test 9: Nested-object and object-array filters recurse correctly ---
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({
+						"query": r#"query {
+							items(
+								filterBy: {
+									time: { audit: { reviewedAt: { gt: "2024-07-01T00:00:00Z" } } }
+									tags: { some: { label: { eq: "feature" }, priority: { eq: 2 } } }
+								}
+							) {
+								nodes {
+									id
+									name
+								}
+							}
+						}"#
+					})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert!(body["errors"].is_null(), "Expected no errors, got: {:?}", body["errors"]);
+			let items = body["data"]["items"]["nodes"].as_array().unwrap();
+			assert_eq!(items.len(), 1);
+			assert_eq!(items[0]["id"], "item:beta");
+			assert_eq!(items[0]["name"], "Beta");
 		}
 
 		Ok(())
@@ -6275,7 +6486,9 @@ mod graphql_integration {
 								intLit
 								floatLit
 								boolLit
-								arrLit
+								arrLit {
+									nodes
+								}
 							}
 						}
 					}"#})
@@ -6294,9 +6507,9 @@ mod graphql_integration {
 			assert_eq!(body["data"]["litnums"]["nodes"][0]["intLit"], 42);
 			assert_eq!(body["data"]["litnums"]["nodes"][0]["floatLit"], 3.5);
 			assert_eq!(body["data"]["litnums"]["nodes"][0]["boolLit"], true);
-			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"][0], 1);
-			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"][1], "ok");
-			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"][2], true);
+			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"]["nodes"][0], 1);
+			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"]["nodes"][1], "ok");
+			assert_eq!(body["data"]["litnums"]["nodes"][0]["arrLit"]["nodes"][2], true);
 		}
 
 		{
@@ -6316,7 +6529,9 @@ mod graphql_integration {
 								intLit
 								floatLit
 								boolLit
-								arrLit
+								arrLit {
+									nodes
+								}
 							}
 						}
 					}"#})
@@ -6334,9 +6549,9 @@ mod graphql_integration {
 			assert_eq!(body["data"]["createLitnum"]["litnum"]["intLit"], 42);
 			assert_eq!(body["data"]["createLitnum"]["litnum"]["floatLit"], 3.5);
 			assert_eq!(body["data"]["createLitnum"]["litnum"]["boolLit"], true);
-			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"][0], 1);
-			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"][1], "ok");
-			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"][2], true);
+			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"]["nodes"][0], 1);
+			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"]["nodes"][1], "ok");
+			assert_eq!(body["data"]["createLitnum"]["litnum"]["arrLit"]["nodes"][2], true);
 		}
 
 		{

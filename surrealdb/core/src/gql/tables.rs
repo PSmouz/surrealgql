@@ -60,12 +60,14 @@ use crate::catalog::providers::TableProvider;
 use crate::catalog::{FieldDefinition, TableDefinition, TableType};
 use crate::dbs::Session;
 use crate::expr::field::Selector;
+use crate::expr::lookup::{LookupKind, LookupSubject};
+use crate::expr::operator::BooleanOperator;
 use crate::expr::order::{OrderList, Ordering};
 use crate::expr::part::Part;
 use crate::expr::statements::SelectStatement;
 use crate::expr::{
-	self, BinaryOperator, Cond, Expr, Fields, Function, FunctionCall, Idiom, Kind, Limit, Literal,
-	LogicalPlan, Start, TopLevelExpr,
+	self, BinaryOperator, Cond, Dir, Expr, Fields, Function, FunctionCall, Idiom, Kind,
+	KindLiteral, Limit, Literal, LogicalPlan, Param, Start, TopLevelExpr,
 };
 use crate::gql::error::internal_error;
 use crate::gql::schema::{geometry_gql_type_name, kind_to_type_with_enum_prefix, unwrap_type};
@@ -222,12 +224,14 @@ fn parse_order_arg(
 /// Parse the optional `filterBy` argument from GraphQL query arguments.
 pub(crate) fn parse_filter_arg(
 	args: &IndexMap<Name, GqlValue>,
-	fds: &[FieldDefinition],
-	tb_name: &str,
+	filter_spec: &FilterObjectSpec,
+	table_filter_registry: &TableFilterRegistry,
 ) -> Result<Option<Cond>, GqlError> {
 	let filter = args.get("filterBy");
 	match filter {
-		Some(GqlValue::Object(o)) => Ok(Some(cond_from_filter(o, fds, tb_name)?)),
+		Some(GqlValue::Object(o)) => {
+			Ok(Some(cond_from_filter_spec(o, filter_spec, table_filter_registry)?))
+		}
 		Some(f) => {
 			error!(
 				"Found filter {f}, which should be object and should have \
@@ -1166,7 +1170,7 @@ fn non_null_list_of_nullable(type_name: &str) -> TypeRef {
 }
 
 fn list_item_kind(kind: &Kind) -> Option<(Kind, bool)> {
-	match kind {
+	match normalize_filter_kind(kind) {
 		Kind::Array(inner, _) => Some((inner.as_ref().clone(), false)),
 		Kind::Either(ks) => {
 			let has_none = ks.iter().any(|k| matches!(k, Kind::None | Kind::Null));
@@ -1717,6 +1721,7 @@ fn make_table_list_field(
 	fds: Arc<[FieldDefinition]>,
 	kvs: Arc<Datastore>,
 	connection_type_name: String,
+	filter_spec: FilterObjectSpec,
 ) -> Field {
 	let tb_name = tb.name.clone();
 	let tb_name_str = tb_name.clone().into_string();
@@ -1730,16 +1735,17 @@ fn make_table_list_field(
 		let fds = fds.clone();
 		let kvs = kvs.clone();
 		let node_type_name = node_type_name.clone();
+		let filter_spec = filter_spec.clone();
 		FieldFuture::new(async move {
 			let sess = ctx.data::<Arc<Session>>()?;
+			let table_filter_registry = ctx.data::<Arc<TableFilterRegistry>>()?;
 			let args = ctx.args.as_index_map();
 			trace!("received request with args: {args:?}");
 
 			let connection_args = parse_connection_args(args)?;
 			let version = parse_version_arg(args)?;
 			let order = parse_order_arg(args, &fds)?;
-			let tb_name_str_ref = tb_name.as_str();
-			let cond = parse_filter_arg(args, &fds, tb_name_str_ref)?;
+			let cond = parse_filter_arg(args, &filter_spec, table_filter_registry.as_ref())?;
 
 			trace!("parsed order: {order:?}");
 			trace!("parsed filter: {cond:?}");
@@ -1865,8 +1871,8 @@ struct TableGraphQLTypes {
 	orderable: Enum,
 	/// The order input object (e.g., `PersonOrder`).
 	order: InputObject,
-	/// The filter input object (e.g., `PersonFilterInput`).
-	filter: InputObject,
+	/// Recursive filter metadata used to compile `filterBy` arguments.
+	filter_spec: FilterObjectSpec,
 	/// The Relay connection type name for the table.
 	connection_type_name: String,
 }
@@ -1881,6 +1887,484 @@ struct RelationTypeContext {
 	filter_name: String,
 	node_type_name: String,
 	fds: Arc<[FieldDefinition]>,
+	edge_filter_spec: FilterObjectSpec,
+	root_filter_spec: RelationListFilterSpec,
+}
+
+#[derive(Clone)]
+pub(crate) struct FilterObjectSpec {
+	pub(crate) type_name: String,
+	pub(crate) description: String,
+	pub(crate) fields: Vec<FilterFieldSpec>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FilterFieldSpec {
+	gql_name: String,
+	description: String,
+	kind: FilterFieldKind,
+}
+
+#[derive(Clone)]
+enum FilterFieldKind {
+	Scalar(ScalarFilterSpec),
+	Object {
+		sql_name: String,
+		object: Box<FilterObjectSpec>,
+	},
+	TableObject {
+		sql_name: String,
+		table_name: String,
+		filter_type_name: String,
+	},
+	List {
+		sql_name: String,
+		list: Box<ListFilterSpec>,
+	},
+	Relation(Box<RelationListFilterSpec>),
+}
+
+#[derive(Clone)]
+struct ScalarFilterSpec {
+	sql_name: String,
+	kind: Kind,
+	enum_scope: Option<String>,
+	filter_name: String,
+}
+
+#[derive(Clone)]
+struct ListFilterSpec {
+	type_name: String,
+	description: String,
+	field_kind: Kind,
+	item: ListItemFilterSpec,
+}
+
+#[derive(Clone)]
+enum ListItemFilterSpec {
+	Scalar {
+		kind: Kind,
+		enum_scope: Option<String>,
+		filter_name: String,
+	},
+	Object(Box<FilterObjectSpec>),
+	TableObject {
+		table_name: String,
+		filter_type_name: String,
+	},
+}
+
+#[derive(Clone)]
+struct RelationListFilterSpec {
+	type_name: String,
+	description: String,
+	relation_table_name: TableName,
+	edge_filter: Box<FilterObjectSpec>,
+}
+
+pub(crate) type TableFilterRegistry = HashMap<String, FilterObjectSpec>;
+
+fn field_list_filter_name(type_name: &str, field_name: &str) -> String {
+	format!(
+		"{}{}ListFilterInput",
+		naming::to_pascal_case(type_name),
+		naming::to_pascal_case(field_name)
+	)
+}
+
+fn between_input_name(filter_name: &str) -> String {
+	format!("{filter_name}BetweenInput")
+}
+
+fn scalar_field_description(gql_field_name: &str) -> String {
+	format!("Filter by `{gql_field_name}`.")
+}
+
+fn build_scalar_filter_field_spec(
+	sql_name: String,
+	kind: Kind,
+	description: String,
+	types: &mut Vec<Type>,
+	enum_scope: Option<String>,
+) -> Result<FilterFieldSpec, GqlError> {
+	let gql_name = naming::to_camel_case(&sql_name);
+	let filter_name = ensure_scalar_filter_input_v2(&kind, types, enum_scope.as_deref())?;
+	Ok(FilterFieldSpec {
+		gql_name,
+		description,
+		kind: FilterFieldKind::Scalar(ScalarFilterSpec {
+			sql_name,
+			kind,
+			enum_scope,
+			filter_name,
+		}),
+	})
+}
+
+fn build_nested_filter_object_spec(
+	node: &NestedFieldNode,
+	types: &mut Vec<Type>,
+	registry: &TableFilterRegistry,
+) -> Result<FilterObjectSpec, GqlError> {
+	let type_name = naming::scalar_filter_input_name(&node.type_name);
+	let mut fields = Vec::new();
+	for child in node.children.values() {
+		let description =
+			child.comment.clone().unwrap_or_else(|| scalar_field_description(&child.gql_name));
+		if child.has_children() {
+			let object = build_nested_filter_object_spec(child, types, registry)?;
+			if child.is_array {
+				fields.push(FilterFieldSpec {
+					gql_name: child.gql_name.clone(),
+					description,
+					kind: FilterFieldKind::List {
+						sql_name: child.sql_name.clone(),
+						list: Box::new(ListFilterSpec {
+							type_name: field_list_filter_name(&node.type_name, &child.gql_name),
+							description: format!("List filter for `{}`.", child.gql_name),
+							field_kind: child
+								.kind
+								.clone()
+								.unwrap_or(Kind::Array(Box::new(Kind::Object), None)),
+							item: ListItemFilterSpec::Object(Box::new(object)),
+						}),
+					},
+				});
+			} else {
+				fields.push(FilterFieldSpec {
+					gql_name: child.gql_name.clone(),
+					description,
+					kind: FilterFieldKind::Object {
+						sql_name: child.sql_name.clone(),
+						object: Box::new(object),
+					},
+				});
+			}
+			continue;
+		}
+
+		let Some(kind) = child.kind.clone() else {
+			continue;
+		};
+		let enum_scope = Some(format!("{}_{}", node.type_name, child.sql_name));
+		if let Some((item_kind, _)) = list_item_kind(&kind) {
+			let item = match normalize_filter_kind(&item_kind) {
+				Kind::Record(ts) if ts.len() == 1 => ListItemFilterSpec::TableObject {
+					table_name: ts[0].to_string(),
+					filter_type_name: filter_name_from_table(ts[0].as_str()),
+				},
+				_ => ListItemFilterSpec::Scalar {
+					filter_name: ensure_scalar_filter_input_v2(
+						&item_kind,
+						types,
+						enum_scope.as_deref(),
+					)?,
+					kind: item_kind,
+					enum_scope,
+				},
+			};
+			fields.push(FilterFieldSpec {
+				gql_name: child.gql_name.clone(),
+				description,
+				kind: FilterFieldKind::List {
+					sql_name: child.sql_name.clone(),
+					list: Box::new(ListFilterSpec {
+						type_name: field_list_filter_name(&node.type_name, &child.gql_name),
+						description: format!("List filter for `{}`.", child.gql_name),
+						field_kind: kind,
+						item,
+					}),
+				},
+			});
+		} else if matches!(normalize_filter_kind(&kind), Kind::Record(ts) if ts.len() == 1) {
+			let Kind::Record(ts) = normalize_filter_kind(&kind) else {
+				unreachable!()
+			};
+			fields.push(FilterFieldSpec {
+				gql_name: child.gql_name.clone(),
+				description,
+				kind: FilterFieldKind::TableObject {
+					sql_name: child.sql_name.clone(),
+					table_name: ts[0].to_string(),
+					filter_type_name: filter_name_from_table(ts[0].as_str()),
+				},
+			});
+		} else {
+			fields.push(build_scalar_filter_field_spec(
+				child.sql_name.clone(),
+				kind,
+				description,
+				types,
+				enum_scope,
+			)?);
+		}
+	}
+
+	let _ = registry;
+	Ok(FilterObjectSpec {
+		type_name,
+		description: format!("Filter input for the nested `{}` object.", node.gql_name),
+		fields,
+	})
+}
+
+fn build_table_filter_spec(
+	tb_name_str: &str,
+	gql_type_name: &str,
+	fds: &[FieldDefinition],
+	relations: &[RelationInfo],
+	relation_type_contexts: &HashMap<String, RelationTypeContext>,
+	types: &mut Vec<Type>,
+	_registry: &TableFilterRegistry,
+) -> Result<FilterObjectSpec, GqlError> {
+	let nested_objects = detect_nested_objects(tb_name_str, fds);
+	let mut fields = Vec::new();
+	fields.push(build_scalar_filter_field_spec(
+		"id".to_string(),
+		Kind::Record(vec![]),
+		"Filter records by record id.".to_string(),
+		types,
+		None,
+	)?);
+
+	for fd in fds {
+		let Some(kind) = fd.field_kind.clone() else {
+			continue;
+		};
+		if fd.name.is_id() || fd.name.0.len() > 1 {
+			continue;
+		}
+
+		let sql_field_name = fd.name.to_sql();
+		let gql_field_name = naming::to_camel_case(&sql_field_name);
+		let description =
+			fd.comment.clone().unwrap_or_else(|| scalar_field_description(&gql_field_name));
+
+		if let Some(nested) = nested_objects.get(sql_field_name.as_str()) {
+			let object = build_nested_filter_object_spec(nested, types, _registry)?;
+			if nested.is_array {
+				fields.push(FilterFieldSpec {
+					gql_name: gql_field_name,
+					description,
+					kind: FilterFieldKind::List {
+						sql_name: sql_field_name,
+						list: Box::new(ListFilterSpec {
+							type_name: field_list_filter_name(gql_type_name, &nested.gql_name),
+							description: format!("List filter for `{}`.", nested.gql_name),
+							field_kind: kind,
+							item: ListItemFilterSpec::Object(Box::new(object)),
+						}),
+					},
+				});
+			} else {
+				fields.push(FilterFieldSpec {
+					gql_name: gql_field_name,
+					description,
+					kind: FilterFieldKind::Object {
+						sql_name: sql_field_name,
+						object: Box::new(object),
+					},
+				});
+			}
+			continue;
+		}
+
+		let enum_scope = Some(format!("{}_{}", tb_name_str, sql_field_name));
+		if let Some((item_kind, _)) = list_item_kind(&kind) {
+			let item = match normalize_filter_kind(&item_kind) {
+				Kind::Record(ts) if ts.len() == 1 => ListItemFilterSpec::TableObject {
+					table_name: ts[0].to_string(),
+					filter_type_name: filter_name_from_table(ts[0].as_str()),
+				},
+				_ => ListItemFilterSpec::Scalar {
+					filter_name: ensure_scalar_filter_input_v2(
+						&item_kind,
+						types,
+						enum_scope.as_deref(),
+					)?,
+					kind: item_kind,
+					enum_scope,
+				},
+			};
+			fields.push(FilterFieldSpec {
+				gql_name: gql_field_name.clone(),
+				description,
+				kind: FilterFieldKind::List {
+					sql_name: sql_field_name,
+					list: Box::new(ListFilterSpec {
+						type_name: field_list_filter_name(gql_type_name, &gql_field_name),
+						description: format!("List filter for `{gql_field_name}`."),
+						field_kind: kind,
+						item,
+					}),
+				},
+			});
+		} else if matches!(normalize_filter_kind(&kind), Kind::Record(ts) if ts.len() == 1) {
+			let Kind::Record(ts) = normalize_filter_kind(&kind) else {
+				unreachable!()
+			};
+			fields.push(FilterFieldSpec {
+				gql_name: gql_field_name,
+				description,
+				kind: FilterFieldKind::TableObject {
+					sql_name: sql_field_name,
+					table_name: ts[0].to_string(),
+					filter_type_name: filter_name_from_table(ts[0].as_str()),
+				},
+			});
+		} else {
+			fields.push(build_scalar_filter_field_spec(
+				sql_field_name,
+				kind,
+				description,
+				types,
+				enum_scope,
+			)?);
+		}
+	}
+
+	for rel in relations {
+		let rel_name = rel.table_name.clone().into_string();
+		let Some(rel_ctx) = relation_type_contexts.get(&rel_name) else {
+			continue;
+		};
+		if rel.from_tables.contains(&tb_name_str.to_string()) {
+			fields.push(FilterFieldSpec {
+				gql_name: rel_ctx.field_name.clone(),
+				description: format!("Filter via outgoing `{}` relations.", rel_ctx.field_name),
+				kind: FilterFieldKind::Relation(Box::new(rel_ctx.root_filter_spec.clone())),
+			});
+		}
+	}
+
+	Ok(FilterObjectSpec {
+		type_name: filter_name_from_table(tb_name_str),
+		description: format!("Filter input for `{gql_type_name}` connections."),
+		fields,
+	})
+}
+
+fn build_relation_edge_filter_spec(
+	relation_name: &str,
+	field_name: &str,
+	fds: &[FieldDefinition],
+	node_table_name: Option<&str>,
+	node_filter_name: Option<&str>,
+	types: &mut Vec<Type>,
+	registry: &TableFilterRegistry,
+) -> Result<FilterObjectSpec, GqlError> {
+	let nested_objects = detect_nested_objects(relation_name, fds);
+	let mut fields = vec![build_scalar_filter_field_spec(
+		"id".to_string(),
+		Kind::Record(vec![]),
+		"Filter relations by record id.".to_string(),
+		types,
+		None,
+	)?];
+
+	for fd in fds {
+		let Some(kind) = fd.field_kind.clone() else {
+			continue;
+		};
+		if fd.name.is_id() || fd.name.0.len() > 1 {
+			continue;
+		}
+
+		let sql_field_name = fd.name.to_sql();
+		if matches!(sql_field_name.as_str(), "in" | "out") {
+			continue;
+		}
+		let gql_field_name = naming::to_camel_case(&sql_field_name);
+		let description = fd
+			.comment
+			.clone()
+			.unwrap_or_else(|| format!("Filter by `{gql_field_name}` relation metadata."));
+
+		if let Some(nested) = nested_objects.get(sql_field_name.as_str()) {
+			let object = build_nested_filter_object_spec(nested, types, registry)?;
+			if nested.is_array {
+				fields.push(FilterFieldSpec {
+					gql_name: gql_field_name,
+					description,
+					kind: FilterFieldKind::List {
+						sql_name: sql_field_name,
+						list: Box::new(ListFilterSpec {
+							type_name: field_list_filter_name(field_name, &nested.gql_name),
+							description: format!(
+								"List filter for `{}` relation metadata.",
+								nested.gql_name
+							),
+							field_kind: kind,
+							item: ListItemFilterSpec::Object(Box::new(object)),
+						}),
+					},
+				});
+			} else {
+				fields.push(FilterFieldSpec {
+					gql_name: gql_field_name,
+					description,
+					kind: FilterFieldKind::Object {
+						sql_name: sql_field_name,
+						object: Box::new(object),
+					},
+				});
+			}
+			continue;
+		}
+
+		let enum_scope = Some(format!("{}_{}", relation_name, sql_field_name));
+		if let Some((item_kind, _)) = list_item_kind(&kind) {
+			fields.push(FilterFieldSpec {
+				gql_name: gql_field_name.clone(),
+				description,
+				kind: FilterFieldKind::List {
+					sql_name: sql_field_name,
+					list: Box::new(ListFilterSpec {
+						type_name: field_list_filter_name(field_name, &gql_field_name),
+						description: format!(
+							"List filter for `{gql_field_name}` relation metadata."
+						),
+						field_kind: kind,
+						item: ListItemFilterSpec::Scalar {
+							filter_name: ensure_scalar_filter_input_v2(
+								&item_kind,
+								types,
+								enum_scope.as_deref(),
+							)?,
+							kind: item_kind,
+							enum_scope,
+						},
+					}),
+				},
+			});
+		} else {
+			fields.push(build_scalar_filter_field_spec(
+				sql_field_name,
+				kind,
+				description,
+				types,
+				enum_scope,
+			)?);
+		}
+	}
+
+	if let (Some(table_name), Some(filter_type_name)) = (node_table_name, node_filter_name) {
+		fields.push(FilterFieldSpec {
+			gql_name: "node".to_string(),
+			description: "Filter by fields on the related target node.".to_string(),
+			kind: FilterFieldKind::TableObject {
+				sql_name: "out".to_string(),
+				table_name: table_name.to_string(),
+				filter_type_name: filter_type_name.to_string(),
+			},
+		});
+	}
+
+	Ok(FilterObjectSpec {
+		type_name: naming::filter_input_name(relation_name),
+		description: format!("Filter input for `{field_name}` connections."),
+		fields,
+	})
 }
 
 fn relation_node_type_name(
@@ -1904,6 +2388,7 @@ fn build_relation_type_context(
 	rel: &RelationInfo,
 	fds: Arc<[FieldDefinition]>,
 	exposed_table_names: &HashSet<String>,
+	table_filter_registry: &TableFilterRegistry,
 	types: &mut Vec<Type>,
 ) -> Result<Option<RelationTypeContext>, GqlError> {
 	let Some(node_type_name) = relation_node_type_name(rel, exposed_table_names) else {
@@ -1912,15 +2397,41 @@ fn build_relation_type_context(
 
 	let relation_name = rel.table_name.clone().into_string();
 	let field_name = naming::to_camel_case(&relation_name);
+	let node_table_name = (rel.to_tables.len() == 1).then(|| rel.to_tables[0].clone());
+	let node_filter_name = node_table_name.as_deref().map(filter_name_from_table);
+	let edge_filter_spec = build_relation_edge_filter_spec(
+		&relation_name,
+		&field_name,
+		&fds,
+		node_table_name.as_deref(),
+		node_filter_name.as_deref(),
+		types,
+		table_filter_registry,
+	)?;
+	build_filter_object_input(&edge_filter_spec, types)?;
+	let root_filter_spec = RelationListFilterSpec {
+		type_name: field_list_filter_name(
+			&naming::table_type_name(
+				&rel.from_tables.first().cloned().unwrap_or_else(|| relation_name.clone()),
+			),
+			&field_name,
+		),
+		description: format!("Relation list filter for `{field_name}`."),
+		relation_table_name: rel.table_name.clone(),
+		edge_filter: Box::new(edge_filter_spec.clone()),
+	};
+	build_relation_list_filter_input(&root_filter_spec, types)?;
 	let relation_ctx = RelationTypeContext {
 		field_name: field_name.clone(),
 		relation_table_name: rel.table_name.clone(),
 		connection_type_name: naming::connection_type_name(&relation_name),
 		edge_type_name: naming::edge_type_name(&relation_name),
 		order_name: naming::order_input_name(&relation_name),
-		filter_name: naming::filter_input_name(&relation_name),
+		filter_name: edge_filter_spec.type_name.clone(),
 		node_type_name,
 		fds: fds.clone(),
+		edge_filter_spec,
+		root_filter_spec,
 	};
 
 	let table_orderable_name = naming::order_field_enum_name(&relation_name);
@@ -1930,25 +2441,6 @@ fn build_relation_type_context(
 			"Fields that can be used to order `{}` connections.",
 			relation_ctx.edge_type_name
 		));
-
-	let mut filter = InputObject::new(&relation_ctx.filter_name)
-		.description(format!("Filter input for `{}` connections.", relation_ctx.field_name))
-		.field(
-			InputValue::new("id", TypeRef::named("IdFilterInput"))
-				.description("Filter relations by record id."),
-		)
-		.field(
-			InputValue::new("and", TypeRef::named_nn_list(&relation_ctx.filter_name))
-				.description("Combine multiple filters with a logical AND."),
-		)
-		.field(
-			InputValue::new("or", TypeRef::named_nn_list(&relation_ctx.filter_name))
-				.description("Combine multiple filters with a logical OR."),
-		)
-		.field(
-			InputValue::new("not", TypeRef::named(&relation_ctx.filter_name))
-				.description("Negate the nested filter expression."),
-		);
 
 	let order = InputObject::new(&relation_ctx.order_name)
 		.description(format!("Ordering options for `{}` connections.", relation_ctx.field_name))
@@ -1976,33 +2468,10 @@ fn build_relation_type_context(
 
 		let gql_field_name = naming::to_camel_case(&sql_field_name);
 		let order_enum_item = naming::to_screaming_snake_case(&gql_field_name);
-		let enum_scope = format!("{}_{}", relation_name, sql_field_name);
 		if list_item_kind(kind).is_none() {
 			orderable = orderable.item(
 				EnumItem::new(&order_enum_item)
 					.description(format!("Order results by `{gql_field_name}`.")),
-			);
-
-			let field_type =
-				kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?;
-			let type_filter_name =
-				naming::scalar_filter_input_name(&unwrap_type(field_type).to_string());
-			let filter_exists = types.iter().any(|ty| match ty {
-				Type::InputObject(io) => io.type_name() == type_filter_name,
-				_ => false,
-			});
-			if !filter_exists {
-				let type_filter = filter_from_type(
-					kind.clone(),
-					type_filter_name.clone(),
-					types,
-					Some(&enum_scope),
-				)?;
-				types.push(Type::InputObject(type_filter));
-			}
-			filter = filter.field(
-				InputValue::new(&gql_field_name, TypeRef::named(&type_filter_name))
-					.description(format!("Filter by `{gql_field_name}`.")),
 			);
 		}
 	}
@@ -2012,9 +2481,6 @@ fn build_relation_type_context(
 	}
 	if !has_type(types, &relation_ctx.order_name) {
 		types.push(Type::InputObject(order));
-	}
-	if !has_type(types, &relation_ctx.filter_name) {
-		types.push(Type::InputObject(filter));
 	}
 
 	make_relation_connection_types(&relation_ctx, types)?;
@@ -2032,6 +2498,7 @@ fn build_table_type(
 	fds: &[FieldDefinition],
 	relations: &[RelationInfo],
 	relation_type_contexts: &HashMap<String, RelationTypeContext>,
+	table_filter_registry: &TableFilterRegistry,
 	types: &mut Vec<Type>,
 ) -> Result<TableGraphQLTypes, GqlError> {
 	let tb_name = &tb.name;
@@ -2047,7 +2514,6 @@ fn build_table_type(
 
 	let table_orderable_name = naming::order_field_enum_name(&tb_name_str);
 	let table_order_name = naming::order_input_name(&tb_name_str);
-	let table_filter_name = filter_name_from_table(tb_name);
 	let (connection_type_name, _) =
 		make_connection_types(&tb_name_str, TypeRef::named_nn(&gql_type_name), types);
 
@@ -2065,27 +2531,16 @@ fn build_table_type(
 			InputValue::new("direction", TypeRef::named("OrderDirection"))
 				.description("The direction to sort the connection in."),
 		);
-
-	let mut filter = InputObject::new(&table_filter_name)
-		.description(format!("Filter input for `{gql_type_name}` connections."))
-		.field(
-			InputValue::new("id", TypeRef::named("IdFilterInput"))
-				.description("Filter records by record id."),
-		)
-		.field(
-			InputValue::new("and", TypeRef::named_nn_list(&table_filter_name))
-				.description("Combine multiple filters with a logical AND."),
-		)
-		.field(
-			InputValue::new("or", TypeRef::named_nn_list(&table_filter_name))
-				.description("Combine multiple filters with a logical OR."),
-		)
-		.field(
-			InputValue::new("not", TypeRef::named(&table_filter_name))
-				.description("Negate the nested filter expression."),
-		);
-
-	types.push(Type::InputObject(filter_id()));
+	let filter_spec = build_table_filter_spec(
+		&tb_name_str,
+		&gql_type_name,
+		fds,
+		relations,
+		relation_type_contexts,
+		types,
+		table_filter_registry,
+	)?;
+	build_filter_object_input(&filter_spec, types)?;
 
 	let mut ty_obj = Object::new(&gql_type_name)
 		.description(
@@ -2238,28 +2693,6 @@ fn build_table_type(
 				EnumItem::new(&order_enum_item)
 					.description(format!("Order results by `{gql_field_name}`.")),
 			);
-
-			let type_filter_name =
-				naming::scalar_filter_input_name(&unwrap_type(fd_type.clone()).to_string());
-			let filter_already_exists = types.iter().any(|t| match t {
-				Type::InputObject(io) => io.type_name() == type_filter_name,
-				_ => false,
-			});
-			if !filter_already_exists {
-				let type_filter = Type::InputObject(filter_from_type(
-					kind.clone(),
-					type_filter_name.clone(),
-					types,
-					Some(&enum_scope),
-				)?);
-				trace!("\n{type_filter:?}\n");
-				types.push(type_filter);
-			}
-
-			filter = filter.field(
-				InputValue::new(&gql_field_name, TypeRef::named(&type_filter_name))
-					.description(format!("Filter by `{gql_field_name}`.")),
-			);
 		}
 		let mut field = if let Some((item_kind, _optional)) = list_item {
 			let node_type_name = unwrap_type(kind_to_type_with_enum_prefix(
@@ -2341,7 +2774,7 @@ fn build_table_type(
 		ty_obj,
 		orderable,
 		order,
-		filter,
+		filter_spec,
 		connection_type_name,
 	})
 }
@@ -2357,7 +2790,37 @@ pub async fn process_tbs(
 	ctx: &SchemaContext<'_>,
 	relations: &[RelationInfo],
 	table_fields: &mut HashMap<String, Arc<[FieldDefinition]>>,
+	table_filter_registry_out: &mut TableFilterRegistry,
 ) -> Result<Object, GqlError> {
+	let mut table_fds_cache: HashMap<String, Arc<[FieldDefinition]>> = HashMap::new();
+	for tb in tbs.iter() {
+		if matches!(tb.table_type, TableType::Relation(_)) {
+			continue;
+		}
+		let fds = ctx.tx.all_tb_fields(ctx.ns, ctx.db, &tb.name, None).await?;
+		table_fields.insert(tb.name.clone().into_string(), fds.clone());
+		table_fds_cache.insert(tb.name.clone().into_string(), fds);
+	}
+
+	let mut table_filter_registry = TableFilterRegistry::new();
+	for tb in tbs.iter() {
+		if matches!(tb.table_type, TableType::Relation(_)) {
+			continue;
+		}
+		let tb_name_str = tb.name.clone().into_string();
+		table_filter_registry.insert(
+			tb_name_str.clone(),
+			FilterObjectSpec {
+				type_name: filter_name_from_table(&tb_name_str),
+				description: format!(
+					"Filter input for `{}` connections.",
+					naming::table_type_name(&tb_name_str)
+				),
+				fields: Vec::new(),
+			},
+		);
+	}
+
 	// Pre-fetch field definitions for relation tables so relation connections can
 	// expose edge metadata and relation-specific filter/order inputs.
 	let mut relation_table_fds: HashMap<String, Arc<[FieldDefinition]>> = HashMap::new();
@@ -2382,7 +2845,13 @@ pub async fn process_tbs(
 		let Some(fds) = relation_table_fds.get(&rel_name).cloned() else {
 			continue;
 		};
-		if let Some(context) = build_relation_type_context(rel, fds, &exposed_table_names, types)? {
+		if let Some(context) = build_relation_type_context(
+			rel,
+			fds,
+			&exposed_table_names,
+			&table_filter_registry,
+			types,
+		)? {
 			relation_type_contexts.insert(rel_name, context);
 		}
 	}
@@ -2392,23 +2861,35 @@ pub async fn process_tbs(
 			continue;
 		}
 		trace!("Adding table: {}", tb.name);
-		let fds = ctx.tx.all_tb_fields(ctx.ns, ctx.db, &tb.name, None).await?;
-		table_fields.insert(tb.name.clone().into_string(), fds.clone());
+		let fds = table_fds_cache
+			.get(tb.name.as_str())
+			.cloned()
+			.unwrap_or_else(|| Arc::<[FieldDefinition]>::from([]));
 
 		// Build and register the table's type system
-		let tt = build_table_type(tb, &fds, relations, &relation_type_contexts, types)?;
+		let tt = build_table_type(
+			tb,
+			&fds,
+			relations,
+			&relation_type_contexts,
+			&table_filter_registry,
+			types,
+		)?;
+		table_filter_registry.insert(tb.name.clone().into_string(), tt.filter_spec.clone());
 		query = query.field(make_table_list_field(
 			tb,
 			fds.clone(),
 			ctx.datastore.clone(),
 			tt.connection_type_name.clone(),
+			tt.filter_spec.clone(),
 		));
 		query = query.field(make_table_get_field(tb, ctx.datastore.clone()));
 		types.push(Type::Object(tt.ty_obj));
 		types.push(tt.order.into());
 		types.push(Type::Enum(tt.orderable));
-		types.push(Type::InputObject(tt.filter));
 	}
+
+	*table_filter_registry_out = table_filter_registry;
 
 	Ok(query)
 }
@@ -2674,6 +3155,7 @@ fn make_relation_field(relation: &RelationTypeContext) -> Field {
 			relation.relation_table_name.clone(),
 			relation.node_type_name.clone(),
 			relation.fds.clone(),
+			relation.edge_filter_spec.clone(),
 		),
 	)
 	.description(format!("Outgoing `{}` relations from this record.", relation.field_name))
@@ -2714,14 +3196,17 @@ fn make_relation_field_resolver(
 	relation_table_name: TableName,
 	node_type_name: String,
 	rel_fds: Arc<[FieldDefinition]>,
+	filter_spec: FilterObjectSpec,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
 	move |ctx: ResolverContext| {
 		let relation_table = relation_table_name.clone();
 		let relation_node_type_name = node_type_name.clone();
 		let fds = rel_fds.clone();
+		let filter_spec = filter_spec.clone();
 		FieldFuture::new(async move {
 			let ds = ctx.data::<Arc<Datastore>>()?;
 			let sess = ctx.data::<Arc<Session>>()?;
+			let table_filter_registry = ctx.data::<Arc<TableFilterRegistry>>()?;
 
 			// Extract record ID and optional version from parent.
 			// Try CachedRecord first, then VersionedRecord, then plain RecordId.
@@ -2746,7 +3231,9 @@ fn make_relation_field_resolver(
 			};
 
 			// Parse and combine user-supplied filter
-			if let Some(user_cond) = parse_filter_arg(args, &fds, relation_table.as_str())? {
+			if let Some(user_cond) =
+				parse_filter_arg(args, &filter_spec, table_filter_registry.as_ref())?
+			{
 				base_cond = Expr::Binary {
 					left: Box::new(base_cond),
 					op: BinaryOperator::And,
@@ -3195,4 +3682,1228 @@ fn binop_for_id(obj: &IndexMap<Name, GqlValue>) -> Result<Expr, GqlError> {
 	}
 
 	Ok(combined)
+}
+
+fn normalize_filter_kind(kind: &Kind) -> Kind {
+	match kind {
+		Kind::Literal(literal) => match literal {
+			KindLiteral::String(_) => kind.clone(),
+			KindLiteral::Integer(_) => Kind::Int,
+			KindLiteral::Float(_) => Kind::Float,
+			KindLiteral::Decimal(_) => Kind::Decimal,
+			KindLiteral::Duration(_) => Kind::Duration,
+			KindLiteral::Bool(_) => Kind::Bool,
+			KindLiteral::Object(_) => Kind::Object,
+			KindLiteral::Array(kinds) => {
+				let len = Some(kinds.len() as u64);
+				if let Some(first) = kinds.first()
+					&& kinds.iter().all(|kind| kind == first)
+				{
+					Kind::Array(Box::new(normalize_filter_kind(first)), len)
+				} else {
+					Kind::Array(Box::new(Kind::Any), len)
+				}
+			}
+		},
+		Kind::Either(ks) => {
+			let non_none =
+				ks.iter().filter(|k| !matches!(k, Kind::None | Kind::Null)).collect::<Vec<_>>();
+			if non_none.iter().all(|kind| matches!(kind, Kind::Literal(KindLiteral::String(_)))) {
+				return kind.clone();
+			}
+			let non_none = non_none.into_iter().map(normalize_filter_kind).collect::<Vec<_>>();
+			match non_none.as_slice() {
+				[single] => single.clone(),
+				_ => Kind::Either(non_none),
+			}
+		}
+		_ => kind.clone(),
+	}
+}
+
+fn is_ordered_filter_kind(kind: &Kind) -> bool {
+	matches!(
+		normalize_filter_kind(kind),
+		Kind::Int | Kind::Float | Kind::Number | Kind::Decimal | Kind::Datetime | Kind::Duration
+	)
+}
+
+fn is_string_filter_kind(kind: &Kind) -> bool {
+	matches!(normalize_filter_kind(kind), Kind::String)
+}
+
+fn is_geometry_filter_kind(kind: &Kind) -> bool {
+	matches!(normalize_filter_kind(kind), Kind::Geometry(_))
+}
+
+fn supports_inside_ops(kind: &Kind) -> bool {
+	matches!(
+		normalize_filter_kind(kind),
+		Kind::String
+			| Kind::Int
+			| Kind::Float
+			| Kind::Number
+			| Kind::Decimal
+			| Kind::Datetime
+			| Kind::Duration
+			| Kind::Uuid
+			| Kind::Record(_)
+	)
+}
+
+fn list_membership_supported(item: &ListItemFilterSpec) -> bool {
+	matches!(item, ListItemFilterSpec::Scalar { .. })
+}
+
+fn scalar_input_type_name(
+	kind: &Kind,
+	types: &mut Vec<Type>,
+	enum_scope: Option<&str>,
+) -> Result<String, GqlError> {
+	let effective_kind = normalize_filter_kind(kind);
+	let name = match &effective_kind {
+		Kind::Record(ts) => match ts.len() {
+			1 => return Ok(filter_name_from_table(ts[0].as_str())),
+			_ => TypeRef::ID.to_string(),
+		},
+		k => unwrap_type(kind_to_type_with_enum_prefix(k.clone(), types, true, enum_scope)?)
+			.to_string(),
+	};
+	Ok(name)
+}
+
+fn ensure_between_input(filter_name: &str, value_type_name: &str, types: &mut Vec<Type>) -> String {
+	let between_name = between_input_name(filter_name);
+	if !has_type(types, &between_name) {
+		types.push(Type::InputObject(
+			InputObject::new(&between_name)
+				.description(format!("Inclusive range bounds for `{filter_name}` filters."))
+				.field(
+					InputValue::new("gte", TypeRef::named(value_type_name))
+						.description("Match values greater than or equal to this bound."),
+				)
+				.field(
+					InputValue::new("lte", TypeRef::named(value_type_name))
+						.description("Match values less than or equal to this bound."),
+				),
+		));
+	}
+	between_name
+}
+
+fn ensure_search_filter_support(types: &mut Vec<Type>) {
+	if !has_type(types, "SearchBooleanMode") {
+		types.push(Type::Enum(
+			Enum::new("SearchBooleanMode")
+				.description("Boolean mode used by SurrealDB full-text `matches` filters.")
+				.item(EnumItem::new("AND").description("Require all search terms to match."))
+				.item(EnumItem::new("OR").description("Require any search term to match.")),
+		));
+	}
+	if !has_type(types, "SearchMatchInput") {
+		types.push(Type::InputObject(
+			InputObject::new("SearchMatchInput")
+				.description("Full-text search criteria for SurrealDB `matches` filters.")
+				.field(
+					InputValue::new("query", TypeRef::named_nn(TypeRef::STRING))
+						.description("The full-text query string."),
+				)
+				.field(
+					InputValue::new("reference", TypeRef::named(TypeRef::INT))
+						.description("Optional full-text match reference number."),
+				)
+				.field(
+					InputValue::new("mode", TypeRef::named("SearchBooleanMode"))
+						.description("Whether search terms are combined with AND or OR semantics."),
+				),
+		));
+	}
+}
+
+fn ensure_scalar_filter_input_v2(
+	kind: &Kind,
+	types: &mut Vec<Type>,
+	enum_scope: Option<&str>,
+) -> Result<String, GqlError> {
+	let filter_name =
+		naming::scalar_filter_input_name(&scalar_input_type_name(kind, types, enum_scope)?);
+	if has_type(types, &filter_name) {
+		return Ok(filter_name);
+	}
+
+	let effective_kind = normalize_filter_kind(kind);
+	let value_type_name = scalar_input_type_name(&effective_kind, types, enum_scope)?;
+	let mut filter = InputObject::new(&filter_name)
+		.description(format!("Filter operations available for `{value_type_name}` values."))
+		.field(
+			InputValue::new("eq", TypeRef::named(&value_type_name))
+				.description("Match values equal to the provided value."),
+		)
+		.field(
+			InputValue::new("exactEq", TypeRef::named(&value_type_name))
+				.description("Match values using SurrealDB exact equality semantics."),
+		)
+		.field(
+			InputValue::new("ne", TypeRef::named(&value_type_name))
+				.description("Exclude values equal to the provided value."),
+		)
+		.field(
+			InputValue::new("in", TypeRef::named_nn_list(&value_type_name))
+				.description("Match any value contained in the provided list."),
+		)
+		.field(
+			InputValue::new("notIn", TypeRef::named_nn_list(&value_type_name))
+				.description("Exclude values contained in the provided list."),
+		)
+		.field(
+			InputValue::new("isNull", TypeRef::named(TypeRef::BOOLEAN))
+				.description("Match whether the value is `null`."),
+		)
+		.field(
+			InputValue::new("isNone", TypeRef::named(TypeRef::BOOLEAN))
+				.description("Match whether the value is SurrealDB `NONE`."),
+		)
+		.field(
+			InputValue::new("exists", TypeRef::named(TypeRef::BOOLEAN))
+				.description("Match whether the field exists with a non-`NONE` value."),
+		)
+		.field(
+			InputValue::new("allEq", TypeRef::named(&value_type_name))
+				.description("Match values where all members equal the provided value."),
+		)
+		.field(
+			InputValue::new("anyEq", TypeRef::named(&value_type_name))
+				.description("Match values where any member equals the provided value."),
+		);
+
+	if is_ordered_filter_kind(&effective_kind) {
+		let between_name = ensure_between_input(&filter_name, &value_type_name, types);
+		filter = filter
+			.field(
+				InputValue::new("gt", TypeRef::named(&value_type_name))
+					.description("Match values greater than the provided value."),
+			)
+			.field(
+				InputValue::new("gte", TypeRef::named(&value_type_name))
+					.description("Match values greater than or equal to the provided value."),
+			)
+			.field(
+				InputValue::new("lt", TypeRef::named(&value_type_name))
+					.description("Match values less than the provided value."),
+			)
+			.field(
+				InputValue::new("lte", TypeRef::named(&value_type_name))
+					.description("Match values less than or equal to the provided value."),
+			)
+			.field(
+				InputValue::new("between", TypeRef::named(&between_name))
+					.description("Match values within an inclusive range."),
+			);
+	}
+
+	if is_string_filter_kind(&effective_kind) {
+		ensure_search_filter_support(types);
+		filter = filter
+			.field(
+				InputValue::new("contains", TypeRef::named(TypeRef::STRING))
+					.description("Match strings containing the provided substring."),
+			)
+			.field(
+				InputValue::new("notContains", TypeRef::named(TypeRef::STRING))
+					.description("Exclude strings containing the provided substring."),
+			)
+			.field(
+				InputValue::new("startsWith", TypeRef::named(TypeRef::STRING))
+					.description("Match strings starting with the provided prefix."),
+			)
+			.field(
+				InputValue::new("endsWith", TypeRef::named(TypeRef::STRING))
+					.description("Match strings ending with the provided suffix."),
+			)
+			.field(
+				InputValue::new("like", TypeRef::named(TypeRef::STRING))
+					.description("Match strings using SQL-like `%` and `_` wildcards."),
+			)
+			.field(
+				InputValue::new("notLike", TypeRef::named(TypeRef::STRING))
+					.description("Exclude strings matching the provided wildcard pattern."),
+			)
+			.field(
+				InputValue::new("allLike", TypeRef::named(TypeRef::STRING))
+					.description("Match values where every member matches the wildcard pattern."),
+			)
+			.field(
+				InputValue::new("anyLike", TypeRef::named(TypeRef::STRING))
+					.description("Match values where any member matches the wildcard pattern."),
+			)
+			.field(
+				InputValue::new("regex", TypeRef::named(TypeRef::STRING))
+					.description("Match strings against a regular expression."),
+			)
+			.field(
+				InputValue::new("matches", TypeRef::named("SearchMatchInput"))
+					.description("Match strings using SurrealDB full-text search."),
+			);
+	}
+
+	if is_geometry_filter_kind(&effective_kind) {
+		filter = filter
+			.field(
+				InputValue::new("contains", TypeRef::named(&value_type_name))
+					.description("Match geometries that contain the provided geometry."),
+			)
+			.field(
+				InputValue::new("inside", TypeRef::named(&value_type_name))
+					.description("Match geometries inside the provided geometry."),
+			)
+			.field(
+				InputValue::new("outside", TypeRef::named(&value_type_name))
+					.description("Match geometries outside the provided geometry."),
+			)
+			.field(
+				InputValue::new("intersects", TypeRef::named(&value_type_name))
+					.description("Match geometries that intersect the provided geometry."),
+			);
+	} else if supports_inside_ops(&effective_kind) {
+		filter = filter
+			.field(
+				InputValue::new("inside", TypeRef::named_nn_list(&value_type_name))
+					.description("Match values inside the provided collection."),
+			)
+			.field(
+				InputValue::new("notInside", TypeRef::named_nn_list(&value_type_name))
+					.description("Exclude values inside the provided collection."),
+			)
+			.field(
+				InputValue::new("allInside", TypeRef::named_nn_list(&value_type_name)).description(
+					"Match values where all members are inside the provided collection.",
+				),
+			)
+			.field(
+				InputValue::new("anyInside", TypeRef::named_nn_list(&value_type_name)).description(
+					"Match values where any member is inside the provided collection.",
+				),
+			)
+			.field(
+				InputValue::new("noneInside", TypeRef::named_nn_list(&value_type_name))
+					.description(
+						"Match values where no members are inside the provided collection.",
+					),
+			);
+	}
+
+	types.push(Type::InputObject(filter));
+	Ok(filter_name)
+}
+
+fn build_filter_object_input(
+	spec: &FilterObjectSpec,
+	types: &mut Vec<Type>,
+) -> Result<(), GqlError> {
+	if has_type(types, &spec.type_name) {
+		return Ok(());
+	}
+
+	let mut input = InputObject::new(&spec.type_name)
+		.description(spec.description.clone())
+		.field(
+			InputValue::new("and", TypeRef::named_nn_list(&spec.type_name))
+				.description("Combine multiple filters with a logical AND."),
+		)
+		.field(
+			InputValue::new("or", TypeRef::named_nn_list(&spec.type_name))
+				.description("Combine multiple filters with a logical OR."),
+		)
+		.field(
+			InputValue::new("not", TypeRef::named(&spec.type_name))
+				.description("Negate the nested filter expression."),
+		);
+
+	for field in &spec.fields {
+		let type_name = match &field.kind {
+			FilterFieldKind::Scalar(spec) => {
+				ensure_scalar_filter_input_v2(&spec.kind, types, spec.enum_scope.as_deref())?
+			}
+			FilterFieldKind::Object {
+				object,
+				..
+			} => {
+				build_filter_object_input(object, types)?;
+				object.type_name.clone()
+			}
+			FilterFieldKind::TableObject {
+				filter_type_name,
+				..
+			} => filter_type_name.clone(),
+			FilterFieldKind::List {
+				list,
+				..
+			} => {
+				build_list_filter_input(list, types)?;
+				list.type_name.clone()
+			}
+			FilterFieldKind::Relation(relation) => {
+				build_relation_list_filter_input(relation, types)?;
+				relation.type_name.clone()
+			}
+		};
+
+		input = input.field(
+			InputValue::new(&field.gql_name, TypeRef::named(&type_name))
+				.description(field.description.clone()),
+		);
+	}
+
+	types.push(Type::InputObject(input));
+	Ok(())
+}
+
+fn build_list_filter_input(list: &ListFilterSpec, types: &mut Vec<Type>) -> Result<(), GqlError> {
+	if has_type(types, &list.type_name) {
+		return Ok(());
+	}
+
+	let item_type_name = match &list.item {
+		ListItemFilterSpec::Scalar {
+			kind,
+			enum_scope,
+			..
+		} => ensure_scalar_filter_input_v2(kind, types, enum_scope.as_deref())?,
+		ListItemFilterSpec::Object(object) => {
+			build_filter_object_input(object, types)?;
+			object.type_name.clone()
+		}
+		ListItemFilterSpec::TableObject {
+			filter_type_name,
+			..
+		} => filter_type_name.clone(),
+	};
+
+	let mut input = InputObject::new(&list.type_name)
+		.description(list.description.clone())
+		.field(
+			InputValue::new("some", TypeRef::named(&item_type_name))
+				.description("Match when at least one list item satisfies the nested filter."),
+		)
+		.field(
+			InputValue::new("every", TypeRef::named(&item_type_name))
+				.description("Match when every list item satisfies the nested filter."),
+		)
+		.field(
+			InputValue::new("none", TypeRef::named(&item_type_name))
+				.description("Match when no list items satisfy the nested filter."),
+		);
+
+	if list_membership_supported(&list.item)
+		&& let ListItemFilterSpec::Scalar {
+			kind,
+			enum_scope,
+			..
+		} = &list.item
+	{
+		let value_type_name = scalar_input_type_name(kind, types, enum_scope.as_deref())?;
+		input = input
+			.field(
+				InputValue::new("contains", TypeRef::named(&value_type_name))
+					.description("Match lists containing the provided value."),
+			)
+			.field(
+				InputValue::new("containsNot", TypeRef::named(&value_type_name))
+					.description("Match lists that do not contain the provided value."),
+			)
+			.field(
+				InputValue::new("containsAll", TypeRef::named_nn_list(&value_type_name))
+					.description("Match lists containing all provided values."),
+			)
+			.field(
+				InputValue::new("containsAny", TypeRef::named_nn_list(&value_type_name))
+					.description("Match lists containing any provided values."),
+			)
+			.field(
+				InputValue::new("containsNone", TypeRef::named_nn_list(&value_type_name))
+					.description("Match lists containing none of the provided values."),
+			);
+	}
+
+	types.push(Type::InputObject(input));
+	Ok(())
+}
+
+fn build_relation_list_filter_input(
+	relation: &RelationListFilterSpec,
+	types: &mut Vec<Type>,
+) -> Result<(), GqlError> {
+	if has_type(types, &relation.type_name) {
+		return Ok(());
+	}
+	build_filter_object_input(&relation.edge_filter, types)?;
+	types.push(Type::InputObject(
+		InputObject::new(&relation.type_name)
+			.description(relation.description.clone())
+			.field(
+				InputValue::new("some", TypeRef::named(&relation.edge_filter.type_name))
+					.description(
+						"Match when at least one relation edge satisfies the nested filter.",
+					),
+			)
+			.field(
+				InputValue::new("every", TypeRef::named(&relation.edge_filter.type_name))
+					.description("Match when every relation edge satisfies the nested filter."),
+			)
+			.field(
+				InputValue::new("none", TypeRef::named(&relation.edge_filter.type_name))
+					.description("Match when no relation edges satisfy the nested filter."),
+			),
+	));
+	Ok(())
+}
+
+fn append_field(prefix: Option<&Idiom>, sql_name: &str) -> Idiom {
+	let mut idiom = prefix.cloned().unwrap_or_else(|| Idiom::field(sql_name.to_string()));
+	if prefix.is_some() {
+		idiom = idiom.push(Part::Field(sql_name.to_string()));
+	}
+	idiom
+}
+
+fn combine_with_and(mut exprs: Vec<Expr>) -> Result<Expr, GqlError> {
+	let mut iter = exprs.drain(..);
+	let mut combined =
+		iter.next().ok_or_else(|| resolver_error("Filter must contain at least one expression"))?;
+	for next in iter {
+		combined = Expr::Binary {
+			left: Box::new(combined),
+			op: BinaryOperator::And,
+			right: Box::new(next),
+		};
+	}
+	Ok(combined)
+}
+
+fn combine_with_or(mut exprs: Vec<Expr>) -> Result<Expr, GqlError> {
+	let mut iter = exprs.drain(..);
+	let mut combined =
+		iter.next().ok_or_else(|| resolver_error("Filter must contain at least one expression"))?;
+	for next in iter {
+		combined = Expr::Binary {
+			left: Box::new(combined),
+			op: BinaryOperator::Or,
+			right: Box::new(next),
+		};
+	}
+	Ok(combined)
+}
+
+fn cond_from_filter_spec(
+	filter: &IndexMap<Name, GqlValue>,
+	spec: &FilterObjectSpec,
+	registry: &TableFilterRegistry,
+) -> Result<Cond, GqlError> {
+	Ok(Cond(expr_from_filter_spec(filter, spec, registry, None)?))
+}
+
+fn expr_from_filter_spec(
+	filter: &IndexMap<Name, GqlValue>,
+	spec: &FilterObjectSpec,
+	registry: &TableFilterRegistry,
+	prefix: Option<&Idiom>,
+) -> Result<Expr, GqlError> {
+	if filter.is_empty() {
+		return Err(resolver_error("Filter must have at least one item"));
+	}
+
+	let mut exprs = Vec::with_capacity(filter.len());
+	for (key, value) in filter {
+		match key.as_str() {
+			"and" => exprs.push(aggregate_v2(value, spec, registry, prefix, true)?),
+			"or" => exprs.push(aggregate_v2(value, spec, registry, prefix, false)?),
+			"not" => {
+				let obj = value
+					.as_object()
+					.ok_or_else(|| resolver_error("Value of `not` must be an object"))?;
+				exprs.push(Expr::Prefix {
+					op: expr::PrefixOperator::Not,
+					expr: Box::new(expr_from_filter_spec(obj, spec, registry, prefix)?),
+				});
+			}
+			field_name => {
+				let field =
+					spec.fields
+						.iter()
+						.find(|candidate| candidate.gql_name == field_name)
+						.ok_or_else(|| resolver_error(format!("Field `{field_name}` not found")))?;
+				exprs.push(expr_from_filter_field(field, value, registry, prefix)?);
+			}
+		}
+	}
+
+	combine_with_and(exprs)
+}
+
+fn aggregate_v2(
+	value: &GqlValue,
+	spec: &FilterObjectSpec,
+	registry: &TableFilterRegistry,
+	prefix: Option<&Idiom>,
+	is_and: bool,
+) -> Result<Expr, GqlError> {
+	let list = value.as_list().ok_or_else(|| {
+		resolver_error(if is_and {
+			"Value of `and` must be a list"
+		} else {
+			"Value of `or` must be a list"
+		})
+	})?;
+	let mut exprs = Vec::with_capacity(list.len());
+	for item in list {
+		let obj = item
+			.as_object()
+			.ok_or_else(|| resolver_error("Logical filter lists must contain objects"))?;
+		exprs.push(expr_from_filter_spec(obj, spec, registry, prefix)?);
+	}
+	if is_and {
+		combine_with_and(exprs)
+	} else {
+		combine_with_or(exprs)
+	}
+}
+
+fn expr_from_filter_field(
+	field: &FilterFieldSpec,
+	value: &GqlValue,
+	registry: &TableFilterRegistry,
+	prefix: Option<&Idiom>,
+) -> Result<Expr, GqlError> {
+	match &field.kind {
+		FilterFieldKind::Scalar(spec) => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("Field filter should be an object"))?;
+			let lhs = Expr::Idiom(append_field(prefix, &spec.sql_name));
+			expr_from_scalar_filter(obj, lhs, &spec.kind, spec.enum_scope.as_deref())
+		}
+		FilterFieldKind::Object {
+			sql_name,
+			object,
+		} => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("Nested object filter should be an object"))?;
+			let next_prefix = append_field(prefix, sql_name);
+			expr_from_filter_spec(obj, object, registry, Some(&next_prefix))
+		}
+		FilterFieldKind::TableObject {
+			sql_name,
+			table_name,
+			..
+		} => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("Record-link filter should be an object"))?;
+			let next_prefix = append_field(prefix, sql_name);
+			let target = registry.get(table_name).ok_or_else(|| {
+				resolver_error(format!(
+					"No filter metadata registered for linked table `{table_name}`"
+				))
+			})?;
+			expr_from_filter_spec(obj, target, registry, Some(&next_prefix))
+		}
+		FilterFieldKind::List {
+			sql_name,
+			list,
+		} => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("List filter should be an object"))?;
+			let lhs = append_field(prefix, sql_name);
+			expr_from_list_filter(obj, list, registry, &lhs)
+		}
+		FilterFieldKind::Relation(relation) => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("Relation filter should be an object"))?;
+			expr_from_relation_list_filter(obj, relation, registry)
+		}
+	}
+}
+
+fn expr_from_scalar_filter(
+	filter: &IndexMap<Name, GqlValue>,
+	lhs: Expr,
+	kind: &Kind,
+	enum_scope: Option<&str>,
+) -> Result<Expr, GqlError> {
+	if filter.is_empty() {
+		return Err(resolver_error("Field filter must have at least one operator"));
+	}
+	let field_kind = normalize_filter_kind(kind);
+	let mut exprs = Vec::with_capacity(filter.len());
+
+	for (op, value) in filter {
+		let expr = match op.as_str() {
+			"eq" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::Equal,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"exactEq" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::ExactEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"ne" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::NotEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"in" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::Inside,
+				value,
+				Kind::Array(Box::new(field_kind.clone()), None),
+				enum_scope,
+			)?,
+			"notIn" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::NotInside,
+				value,
+				Kind::Array(Box::new(field_kind.clone()), None),
+				enum_scope,
+			)?,
+			"isNull" => make_boolean_match(lhs.clone(), value, Literal::Null)?,
+			"isNone" => make_boolean_match(lhs.clone(), value, Literal::None)?,
+			"exists" => make_exists_expr(lhs.clone(), value)?,
+			"gt" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::MoreThan,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"gte" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::MoreThanEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"lt" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::LessThan,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"lte" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::LessThanEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"between" => make_between_expr(lhs.clone(), value, field_kind.clone(), enum_scope)?,
+			"allEq" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::AllEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"anyEq" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::AnyEqual,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"contains" => make_contains_expr(lhs.clone(), value, &field_kind, enum_scope, false)?,
+			"notContains" => make_contains_expr(lhs.clone(), value, &field_kind, enum_scope, true)?,
+			"startsWith" => make_string_function_expr("string::starts_with", lhs.clone(), value)?,
+			"endsWith" => make_string_function_expr("string::ends_with", lhs.clone(), value)?,
+			"like" => make_like_expr(lhs.clone(), value, false, false)?,
+			"notLike" => make_like_expr(lhs.clone(), value, true, false)?,
+			"allLike" => make_like_expr(lhs.clone(), value, false, true)?,
+			"anyLike" => make_like_expr(lhs.clone(), value, false, true)?,
+			"regex" => make_string_function_expr("string::matches", lhs.clone(), value)?,
+			"matches" => make_search_match_expr(lhs.clone(), value)?,
+			"inside" => make_inside_expr(
+				lhs.clone(),
+				BinaryOperator::Inside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"notInside" => make_inside_expr(
+				lhs.clone(),
+				BinaryOperator::NotInside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"allInside" => make_inside_expr(
+				lhs.clone(),
+				BinaryOperator::AllInside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"anyInside" => make_inside_expr(
+				lhs.clone(),
+				BinaryOperator::AnyInside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"noneInside" => make_inside_expr(
+				lhs.clone(),
+				BinaryOperator::NoneInside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"outside" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::Outside,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			"intersects" => make_binary_expr(
+				lhs.clone(),
+				BinaryOperator::Intersects,
+				value,
+				field_kind.clone(),
+				enum_scope,
+			)?,
+			other => return Err(resolver_error(format!("Unsupported filter operator: {other}"))),
+		};
+		exprs.push(expr);
+	}
+
+	combine_with_and(exprs)
+}
+
+fn make_binary_expr(
+	lhs: Expr,
+	op: BinaryOperator,
+	value: &GqlValue,
+	kind: Kind,
+	enum_scope: Option<&str>,
+) -> Result<Expr, GqlError> {
+	let rhs = gql_to_sql_kind_with_scope(value, kind, enum_scope)?;
+	Ok(Expr::Binary {
+		left: Box::new(lhs),
+		op,
+		right: Box::new(rhs.into_literal()),
+	})
+}
+
+fn make_boolean_match(lhs: Expr, value: &GqlValue, literal: Literal) -> Result<Expr, GqlError> {
+	let flag = match value {
+		GqlValue::Boolean(flag) => *flag,
+		_ => return Err(resolver_error("Boolean filter operators require a boolean value")),
+	};
+	let eq = Expr::Binary {
+		left: Box::new(lhs),
+		op: BinaryOperator::Equal,
+		right: Box::new(Expr::Literal(literal)),
+	};
+	if flag {
+		Ok(eq)
+	} else {
+		Ok(Expr::Prefix {
+			op: expr::PrefixOperator::Not,
+			expr: Box::new(eq),
+		})
+	}
+}
+
+fn make_exists_expr(lhs: Expr, value: &GqlValue) -> Result<Expr, GqlError> {
+	let flag = match value {
+		GqlValue::Boolean(flag) => *flag,
+		_ => return Err(resolver_error("`exists` requires a boolean value")),
+	};
+	let expr = Expr::Binary {
+		left: Box::new(lhs),
+		op: BinaryOperator::NotEqual,
+		right: Box::new(Expr::Literal(Literal::None)),
+	};
+	if flag {
+		Ok(expr)
+	} else {
+		Ok(Expr::Prefix {
+			op: expr::PrefixOperator::Not,
+			expr: Box::new(expr),
+		})
+	}
+}
+
+fn make_between_expr(
+	lhs: Expr,
+	value: &GqlValue,
+	kind: Kind,
+	enum_scope: Option<&str>,
+) -> Result<Expr, GqlError> {
+	let obj = value.as_object().ok_or_else(|| resolver_error("`between` must be an object"))?;
+	let mut exprs = Vec::new();
+	if let Some(gte) = obj.get("gte") {
+		exprs.push(make_binary_expr(
+			lhs.clone(),
+			BinaryOperator::MoreThanEqual,
+			gte,
+			kind.clone(),
+			enum_scope,
+		)?);
+	}
+	if let Some(lte) = obj.get("lte") {
+		exprs.push(make_binary_expr(lhs, BinaryOperator::LessThanEqual, lte, kind, enum_scope)?);
+	}
+	if exprs.is_empty() {
+		return Err(resolver_error("`between` must include at least one bound"));
+	}
+	combine_with_and(exprs)
+}
+
+fn make_string_function_expr(fn_name: &str, lhs: Expr, value: &GqlValue) -> Result<Expr, GqlError> {
+	let rhs = gql_to_sql_kind(value, Kind::String)?;
+	Ok(Expr::FunctionCall(Box::new(FunctionCall {
+		receiver: Function::Normal(fn_name.to_string()),
+		arguments: vec![lhs, rhs.into_literal()],
+	})))
+}
+
+fn escape_like_pattern(pattern: &str) -> String {
+	let mut out = String::from("^");
+	for ch in pattern.chars() {
+		match ch {
+			'%' => out.push_str(".*"),
+			'_' => out.push('.'),
+			'.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+				out.push('\\');
+				out.push(ch);
+			}
+			other => out.push(other),
+		}
+	}
+	out.push('$');
+	out
+}
+
+fn make_like_expr(
+	lhs: Expr,
+	value: &GqlValue,
+	negate: bool,
+	use_collection_op: bool,
+) -> Result<Expr, GqlError> {
+	let pattern = value
+		.as_string()
+		.ok_or_else(|| resolver_error("LIKE operators require a string pattern"))?;
+	let regex = GqlValue::String(escape_like_pattern(&pattern));
+	let expr = if use_collection_op {
+		make_string_function_expr("string::matches", lhs, &regex)?
+	} else {
+		make_string_function_expr("string::matches", lhs, &regex)?
+	};
+	if negate {
+		Ok(Expr::Prefix {
+			op: expr::PrefixOperator::Not,
+			expr: Box::new(expr),
+		})
+	} else {
+		Ok(expr)
+	}
+}
+
+fn make_search_match_expr(lhs: Expr, value: &GqlValue) -> Result<Expr, GqlError> {
+	let obj = value.as_object().ok_or_else(|| resolver_error("`matches` must be an object"))?;
+	let query = obj
+		.get("query")
+		.and_then(GqlValueUtils::as_string)
+		.ok_or_else(|| resolver_error("`matches.query` is required"))?;
+	let rf = obj
+		.get("reference")
+		.and_then(GqlValue::as_i64)
+		.map(|v| u8::try_from(v).map_err(|_| resolver_error("`matches.reference` must fit in u8")))
+		.transpose()?;
+	let operator = match obj
+		.get("mode")
+		.and_then(|value| match value {
+			GqlValue::Enum(name) => Some(name.as_str()),
+			_ => None,
+		})
+		.unwrap_or("AND")
+	{
+		"AND" => BooleanOperator::And,
+		"OR" => BooleanOperator::Or,
+		other => return Err(resolver_error(format!("Unknown search boolean mode `{other}`"))),
+	};
+	Ok(Expr::Binary {
+		left: Box::new(lhs),
+		op: BinaryOperator::Matches(expr::operator::MatchesOperator {
+			rf,
+			operator,
+		}),
+		right: Box::new(Expr::Literal(Literal::String(query))),
+	})
+}
+
+fn make_contains_expr(
+	lhs: Expr,
+	value: &GqlValue,
+	kind: &Kind,
+	enum_scope: Option<&str>,
+	negate: bool,
+) -> Result<Expr, GqlError> {
+	if is_string_filter_kind(kind) {
+		let expr = make_string_function_expr("string::contains", lhs, value)?;
+		if negate {
+			return Ok(Expr::Prefix {
+				op: expr::PrefixOperator::Not,
+				expr: Box::new(expr),
+			});
+		}
+		return Ok(expr);
+	}
+
+	make_binary_expr(
+		lhs,
+		if negate {
+			BinaryOperator::NotContain
+		} else {
+			BinaryOperator::Contain
+		},
+		value,
+		kind.clone(),
+		enum_scope,
+	)
+}
+
+fn make_inside_expr(
+	lhs: Expr,
+	op: BinaryOperator,
+	value: &GqlValue,
+	kind: Kind,
+	enum_scope: Option<&str>,
+) -> Result<Expr, GqlError> {
+	make_binary_expr(lhs, op, value, Kind::Array(Box::new(kind), None), enum_scope)
+}
+
+fn expr_from_list_item_filter(
+	value: &GqlValue,
+	item: &ListItemFilterSpec,
+	registry: &TableFilterRegistry,
+) -> Result<Expr, GqlError> {
+	match item {
+		ListItemFilterSpec::Scalar {
+			kind,
+			enum_scope,
+			..
+		} => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("List item filter must be an object"))?;
+			expr_from_scalar_filter(
+				obj,
+				Expr::Param(Param::new("this".to_string())),
+				kind,
+				enum_scope.as_deref(),
+			)
+		}
+		ListItemFilterSpec::Object(object) => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("List item filter must be an object"))?;
+			expr_from_filter_spec(obj, object, registry, None)
+		}
+		ListItemFilterSpec::TableObject {
+			table_name,
+			..
+		} => {
+			let obj = value
+				.as_object()
+				.ok_or_else(|| resolver_error("List item filter must be an object"))?;
+			let spec = registry.get(table_name).ok_or_else(|| {
+				resolver_error(format!(
+					"No filter metadata registered for linked table `{table_name}`"
+				))
+			})?;
+			expr_from_filter_spec(obj, spec, registry, None)
+		}
+	}
+}
+
+fn where_filtered_idiom(base: &Idiom, predicate: Expr) -> Expr {
+	let mut idiom = base.clone();
+	idiom = idiom.push(Part::Where(predicate));
+	Expr::Idiom(idiom)
+}
+
+fn array_len_expr(expr: Expr) -> Expr {
+	Expr::FunctionCall(Box::new(FunctionCall {
+		receiver: Function::Normal("array::len".to_string()),
+		arguments: vec![expr],
+	}))
+}
+
+fn expr_from_list_filter(
+	filter: &IndexMap<Name, GqlValue>,
+	list: &ListFilterSpec,
+	registry: &TableFilterRegistry,
+	field_idiom: &Idiom,
+) -> Result<Expr, GqlError> {
+	if filter.is_empty() {
+		return Err(resolver_error("List filter must have at least one operator"));
+	}
+	let mut exprs = Vec::new();
+	for (op, value) in filter {
+		let expr = match op.as_str() {
+			"some" => {
+				let predicate = expr_from_list_item_filter(value, &list.item, registry)?;
+				Expr::Binary {
+					left: Box::new(array_len_expr(where_filtered_idiom(field_idiom, predicate))),
+					op: BinaryOperator::MoreThan,
+					right: Box::new(Expr::Literal(Literal::Integer(0))),
+				}
+			}
+			"none" => {
+				let predicate = expr_from_list_item_filter(value, &list.item, registry)?;
+				Expr::Binary {
+					left: Box::new(array_len_expr(where_filtered_idiom(field_idiom, predicate))),
+					op: BinaryOperator::Equal,
+					right: Box::new(Expr::Literal(Literal::Integer(0))),
+				}
+			}
+			"every" => {
+				let predicate = expr_from_list_item_filter(value, &list.item, registry)?;
+				let inverted = Expr::Prefix {
+					op: expr::PrefixOperator::Not,
+					expr: Box::new(predicate),
+				};
+				Expr::Binary {
+					left: Box::new(array_len_expr(where_filtered_idiom(field_idiom, inverted))),
+					op: BinaryOperator::Equal,
+					right: Box::new(Expr::Literal(Literal::Integer(0))),
+				}
+			}
+			"contains" | "containsNot" | "containsAll" | "containsAny" | "containsNone" => {
+				let ListItemFilterSpec::Scalar {
+					kind,
+					enum_scope,
+					..
+				} = &list.item
+				else {
+					return Err(resolver_error(format!(
+						"Operator `{op}` is only supported for scalar list filters"
+					)));
+				};
+				let rhs_kind = if matches!(op.as_str(), "contains" | "containsNot") {
+					kind.clone()
+				} else {
+					Kind::Array(Box::new(kind.clone()), None)
+				};
+				let rhs = gql_to_sql_kind_with_scope(value, rhs_kind, enum_scope.as_deref())?;
+				let op = match op.as_str() {
+					"contains" => BinaryOperator::Contain,
+					"containsNot" => BinaryOperator::NotContain,
+					"containsAll" => BinaryOperator::ContainAll,
+					"containsAny" => BinaryOperator::ContainAny,
+					"containsNone" => BinaryOperator::ContainNone,
+					_ => unreachable!(),
+				};
+				Expr::Binary {
+					left: Box::new(Expr::Idiom(field_idiom.clone())),
+					op,
+					right: Box::new(rhs.into_literal()),
+				}
+			}
+			other => {
+				return Err(resolver_error(format!("Unsupported list filter operator: {other}")));
+			}
+		};
+		exprs.push(expr);
+	}
+	combine_with_and(exprs)
+}
+
+fn relation_lookup_expr(relation_table_name: &TableName, predicate: Expr) -> Expr {
+	Expr::Idiom(Idiom(vec![Part::Lookup(expr::Lookup {
+		kind: LookupKind::Graph(Dir::Out),
+		expr: None,
+		only: false,
+		what: vec![LookupSubject::Table {
+			table: relation_table_name.clone(),
+			referencing_field: None,
+		}],
+		cond: Some(Cond(predicate)),
+		split: None,
+		group: None,
+		order: None,
+		limit: None,
+		start: None,
+		alias: None,
+	})]))
+}
+
+fn expr_from_relation_list_filter(
+	filter: &IndexMap<Name, GqlValue>,
+	relation: &RelationListFilterSpec,
+	registry: &TableFilterRegistry,
+) -> Result<Expr, GqlError> {
+	if filter.is_empty() {
+		return Err(resolver_error("Relation filter must have at least one operator"));
+	}
+	let mut exprs = Vec::new();
+	for (op, value) in filter {
+		let predicate = {
+			let obj = value.as_object().ok_or_else(|| {
+				resolver_error("Relation list operators require an object filter")
+			})?;
+			expr_from_filter_spec(obj, &relation.edge_filter, registry, None)?
+		};
+		let expr = match op.as_str() {
+			"some" => Expr::Binary {
+				left: Box::new(array_len_expr(relation_lookup_expr(
+					&relation.relation_table_name,
+					predicate,
+				))),
+				op: BinaryOperator::MoreThan,
+				right: Box::new(Expr::Literal(Literal::Integer(0))),
+			},
+			"none" => Expr::Binary {
+				left: Box::new(array_len_expr(relation_lookup_expr(
+					&relation.relation_table_name,
+					predicate,
+				))),
+				op: BinaryOperator::Equal,
+				right: Box::new(Expr::Literal(Literal::Integer(0))),
+			},
+			"every" => {
+				let inverted = Expr::Prefix {
+					op: expr::PrefixOperator::Not,
+					expr: Box::new(predicate),
+				};
+				Expr::Binary {
+					left: Box::new(array_len_expr(relation_lookup_expr(
+						&relation.relation_table_name,
+						inverted,
+					))),
+					op: BinaryOperator::Equal,
+					right: Box::new(Expr::Literal(Literal::Integer(0))),
+				}
+			}
+			other => {
+				return Err(resolver_error(format!(
+					"Unsupported relation list filter operator: {other}"
+				)));
+			}
+		};
+		exprs.push(expr);
+	}
+	combine_with_and(exprs)
 }
