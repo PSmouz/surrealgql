@@ -112,6 +112,46 @@ pub(crate) fn table_type_name(table_name: &str) -> String {
 	to_pascal_case(table_name)
 }
 
+pub(crate) fn relation_root_base_name(table_name: &str) -> String {
+	format!("{table_name}_relation")
+}
+
+pub(crate) fn relation_type_name(table_name: &str) -> String {
+	table_type_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_connection_type_name(table_name: &str) -> String {
+	connection_type_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_edge_type_name(table_name: &str) -> String {
+	edge_type_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_order_input_name(table_name: &str) -> String {
+	order_input_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_order_field_enum_name(table_name: &str) -> String {
+	order_field_enum_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_filter_input_name(table_name: &str) -> String {
+	filter_input_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_singular_query_name(table_name: &str) -> String {
+	singular_query_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_plural_query_name(table_name: &str) -> String {
+	plural_query_name(&relation_root_base_name(table_name))
+}
+
+pub(crate) fn relation_payload_entity_field_name(table_name: &str) -> String {
+	to_camel_case(&relation_root_base_name(table_name))
+}
+
 pub(crate) fn nested_type_name(path: &[&str]) -> String {
 	path.iter().map(|part| to_pascal_case(part)).collect()
 }
@@ -197,6 +237,14 @@ mod tests {
 	#[test]
 	fn builds_graphql_type_names() {
 		assert_eq!(table_type_name("person"), "Person");
+		assert_eq!(relation_type_name("likes"), "LikesRelation");
+		assert_eq!(relation_connection_type_name("likes"), "LikesRelationConnection");
+		assert_eq!(relation_edge_type_name("likes"), "LikesRelationEdge");
+		assert_eq!(relation_order_input_name("likes"), "LikesRelationOrder");
+		assert_eq!(relation_order_field_enum_name("likes"), "LikesRelationOrderField");
+		assert_eq!(relation_filter_input_name("likes"), "LikesRelationFilterInput");
+		assert_eq!(relation_singular_query_name("likes"), "likesRelation");
+		assert_eq!(relation_plural_query_name("likes"), "likesRelations");
 		assert_eq!(connection_type_name("likes"), "LikesConnection");
 		assert_eq!(edge_type_name("likes"), "LikesEdge");
 		assert_eq!(field_connection_type_name("Person", "likes"), "PersonLikesConnection");
@@ -214,5 +262,6 @@ mod tests {
 		assert_eq!(mutation_input_name("relate", "likes"), "RelateLikesInput");
 		assert_eq!(mutation_payload_name("delete", "person"), "DeletePersonPayload");
 		assert_eq!(payload_entity_field_name("person_profile"), "personProfile");
+		assert_eq!(relation_payload_entity_field_name("likes"), "likesRelation");
 	}
 }

@@ -1720,15 +1720,16 @@ fn make_table_list_field(
 	tb: &TableDefinition,
 	fds: Arc<[FieldDefinition]>,
 	kvs: Arc<Datastore>,
-	connection_type_name: String,
+	root_names: RootTypeNames,
 	filter_spec: FilterObjectSpec,
 ) -> Field {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.clone().into_string();
-	let table_order_name = naming::order_input_name(&tb_name_str);
-	let table_filter_name = filter_name_from_table(&tb_name);
-	let node_type_name = naming::table_type_name(&tb_name_str);
-	let query_field_name = naming::plural_query_name(&tb_name_str);
+	let table_order_name = root_names.order_name.clone();
+	let table_filter_name = root_names.filter_name.clone();
+	let node_type_name = root_names.type_name.clone();
+	let query_field_name = root_names.plural_field_name.clone();
+	let connection_type_name = root_names.connection_type_name.clone();
+	let entity_description_name = root_names.entity_description_name.clone();
 
 	Field::new(&query_field_name, TypeRef::named_nn(&connection_type_name), move |ctx| {
 		let tb_name = tb_name.clone();
@@ -1768,7 +1769,7 @@ fn make_table_list_field(
 	.description(if let Some(c) = &tb.comment {
 		c.clone()
 	} else {
-		format!("Query a paginated list of `{}` records.", naming::table_type_name(&tb_name_str))
+		format!("Query a paginated list of `{entity_description_name}` records.")
 	})
 	.argument(
 		InputValue::new("first", TypeRef::named(TypeRef::INT))
@@ -1804,11 +1805,15 @@ fn make_table_list_field(
 ///
 /// Returns the record as a [`CachedRecord`] for efficient field resolution,
 /// or `null` if the record does not exist.
-fn make_table_get_field(tb: &TableDefinition, kvs: Arc<Datastore>) -> Field {
+fn make_table_get_field(
+	tb: &TableDefinition,
+	kvs: Arc<Datastore>,
+	root_names: RootTypeNames,
+) -> Field {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.clone().into_string();
-	let gql_field_name = naming::singular_query_name(&tb_name_str);
-	let gql_type_name = naming::table_type_name(&tb_name_str);
+	let gql_field_name = root_names.singular_field_name.clone();
+	let gql_type_name = root_names.type_name.clone();
+	let entity_description_name = root_names.entity_description_name.clone();
 
 	Field::new(&gql_field_name, TypeRef::named(&gql_type_name), move |ctx| {
 		let tb_name = tb_name.clone();
@@ -1851,7 +1856,7 @@ fn make_table_get_field(tb: &TableDefinition, kvs: Arc<Datastore>) -> Field {
 	.description(if let Some(c) = &tb.comment {
 		c.clone()
 	} else {
-		format!("Fetch a single `{}` record by record id.", naming::table_type_name(&tb_name_str))
+		format!("Fetch a single `{entity_description_name}` record by record id.")
 	})
 	.argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)))
 	.argument(InputValue::new("version", TypeRef::named("Datetime")))
@@ -1878,6 +1883,19 @@ struct TableGraphQLTypes {
 }
 
 #[derive(Clone)]
+struct RootTypeNames {
+	base_name: String,
+	singular_field_name: String,
+	plural_field_name: String,
+	type_name: String,
+	connection_type_name: String,
+	order_name: String,
+	orderable_name: String,
+	filter_name: String,
+	entity_description_name: String,
+}
+
+#[derive(Clone)]
 struct RelationTypeContext {
 	field_name: String,
 	relation_table_name: TableName,
@@ -1889,6 +1907,34 @@ struct RelationTypeContext {
 	fds: Arc<[FieldDefinition]>,
 	edge_filter_spec: FilterObjectSpec,
 	root_filter_spec: RelationListFilterSpec,
+}
+
+fn root_type_names_for_table(table_name: &str) -> RootTypeNames {
+	RootTypeNames {
+		base_name: table_name.to_string(),
+		singular_field_name: naming::singular_query_name(table_name),
+		plural_field_name: naming::plural_query_name(table_name),
+		type_name: naming::table_type_name(table_name),
+		connection_type_name: naming::connection_type_name(table_name),
+		order_name: naming::order_input_name(table_name),
+		orderable_name: naming::order_field_enum_name(table_name),
+		filter_name: naming::filter_input_name(table_name),
+		entity_description_name: naming::table_type_name(table_name),
+	}
+}
+
+fn root_type_names_for_relation(table_name: &str) -> RootTypeNames {
+	RootTypeNames {
+		base_name: naming::relation_root_base_name(table_name),
+		singular_field_name: naming::relation_singular_query_name(table_name),
+		plural_field_name: naming::relation_plural_query_name(table_name),
+		type_name: naming::relation_type_name(table_name),
+		connection_type_name: naming::relation_connection_type_name(table_name),
+		order_name: naming::relation_order_input_name(table_name),
+		orderable_name: naming::relation_order_field_enum_name(table_name),
+		filter_name: naming::relation_filter_input_name(table_name),
+		entity_description_name: naming::relation_type_name(table_name),
+	}
 }
 
 #[derive(Clone)]
@@ -2109,6 +2155,7 @@ fn build_nested_filter_object_spec(
 }
 
 fn build_table_filter_spec(
+	root_names: &RootTypeNames,
 	tb_name_str: &str,
 	gql_type_name: &str,
 	fds: &[FieldDefinition],
@@ -2238,7 +2285,7 @@ fn build_table_filter_spec(
 	}
 
 	Ok(FilterObjectSpec {
-		type_name: filter_name_from_table(tb_name_str),
+		type_name: root_names.filter_name.clone(),
 		description: format!("Filter input for `{gql_type_name}` connections."),
 		fields,
 	})
@@ -2500,6 +2547,8 @@ fn build_table_type(
 	relation_type_contexts: &HashMap<String, RelationTypeContext>,
 	table_filter_registry: &TableFilterRegistry,
 	types: &mut Vec<Type>,
+	root_names: &RootTypeNames,
+	include_relation_fields: bool,
 ) -> Result<TableGraphQLTypes, GqlError> {
 	let tb_name = &tb.name;
 	let tb_name_str = tb_name.clone().into_string();
@@ -2508,14 +2557,19 @@ fn build_table_type(
 			"Table `{tb_name_str}` cannot be exposed via GraphQL because it is not valid snake_case"
 		)));
 	}
-	let gql_type_name = naming::table_type_name(&tb_name_str);
+	let gql_type_name = root_names.type_name.clone();
 
 	// --- Create initial types ---
 
-	let table_orderable_name = naming::order_field_enum_name(&tb_name_str);
-	let table_order_name = naming::order_input_name(&tb_name_str);
-	let (connection_type_name, _) =
-		make_connection_types(&tb_name_str, TypeRef::named_nn(&gql_type_name), types);
+	let table_orderable_name = root_names.orderable_name.clone();
+	let table_order_name = root_names.order_name.clone();
+	let (connection_type_name, _) = make_named_connection_types(
+		&root_names.entity_description_name,
+		root_names.connection_type_name.clone(),
+		naming::edge_type_name(&root_names.base_name),
+		TypeRef::named_nn(&gql_type_name),
+		types,
+	);
 
 	let mut orderable = Enum::new(&table_orderable_name)
 		.item(EnumItem::new("ID").description("Order results by record id."))
@@ -2532,6 +2586,7 @@ fn build_table_type(
 				.description("The direction to sort the connection in."),
 		);
 	let filter_spec = build_table_filter_spec(
+		root_names,
 		&tb_name_str,
 		&gql_type_name,
 		fds,
@@ -2543,11 +2598,9 @@ fn build_table_type(
 	build_filter_object_input(&filter_spec, types)?;
 
 	let mut ty_obj = Object::new(&gql_type_name)
-		.description(
-			tb.comment
-				.clone()
-				.unwrap_or_else(|| format!("GraphQL object type for records in `{tb_name_str}`.")),
-		)
+		.description(tb.comment.clone().unwrap_or_else(|| {
+			format!("GraphQL object type for records in `{}`.", root_names.entity_description_name)
+		}))
 		.field(
 			Field::new(
 				"id",
@@ -2748,24 +2801,26 @@ fn build_table_type(
 
 	// --- Add relation fields ---
 
-	for rel in relations.iter() {
-		let rel_table_str = rel.table_name.clone().into_string();
-		let Some(rel_ctx) = relation_type_contexts.get(&rel_table_str) else {
-			continue;
-		};
+	if include_relation_fields {
+		for rel in relations.iter() {
+			let rel_table_str = rel.table_name.clone().into_string();
+			let Some(rel_ctx) = relation_type_contexts.get(&rel_table_str) else {
+				continue;
+			};
 
-		// Outgoing: this table is in the FROM list
-		if rel.from_tables.contains(&tb_name_str) {
-			let field_name = rel_ctx.field_name.clone();
-			if !existing_field_names.contains(&field_name) {
-				existing_field_names.insert(field_name.clone());
-				ty_obj = ty_obj.field(make_relation_field(rel_ctx));
-			} else {
-				trace!(
-					"Skipping outgoing relation field '{}' on table '{}': \
-					 conflicts with existing field",
-					field_name, tb_name_str
-				);
+			// Outgoing: this table is in the FROM list
+			if rel.from_tables.contains(&tb_name_str) {
+				let field_name = rel_ctx.field_name.clone();
+				if !existing_field_names.contains(&field_name) {
+					existing_field_names.insert(field_name.clone());
+					ty_obj = ty_obj.field(make_relation_field(rel_ctx));
+				} else {
+					trace!(
+						"Skipping outgoing relation field '{}' on table '{}': \
+						 conflicts with existing field",
+						field_name, tb_name_str
+					);
+				}
 			}
 		}
 	}
@@ -2794,9 +2849,6 @@ pub async fn process_tbs(
 ) -> Result<Object, GqlError> {
 	let mut table_fds_cache: HashMap<String, Arc<[FieldDefinition]>> = HashMap::new();
 	for tb in tbs.iter() {
-		if matches!(tb.table_type, TableType::Relation(_)) {
-			continue;
-		}
 		let fds = ctx.tx.all_tb_fields(ctx.ns, ctx.db, &tb.name, None).await?;
 		table_fields.insert(tb.name.clone().into_string(), fds.clone());
 		table_fds_cache.insert(tb.name.clone().into_string(), fds);
@@ -2804,45 +2856,32 @@ pub async fn process_tbs(
 
 	let mut table_filter_registry = TableFilterRegistry::new();
 	for tb in tbs.iter() {
-		if matches!(tb.table_type, TableType::Relation(_)) {
-			continue;
-		}
 		let tb_name_str = tb.name.clone().into_string();
+		let root_names = match &tb.table_type {
+			TableType::Relation(_) => root_type_names_for_relation(&tb_name_str),
+			_ => root_type_names_for_table(&tb_name_str),
+		};
 		table_filter_registry.insert(
 			tb_name_str.clone(),
 			FilterObjectSpec {
-				type_name: filter_name_from_table(&tb_name_str),
-				description: format!(
-					"Filter input for `{}` connections.",
-					naming::table_type_name(&tb_name_str)
-				),
+				type_name: root_names.filter_name.clone(),
+				description: format!("Filter input for `{}` connections.", root_names.type_name),
 				fields: Vec::new(),
 			},
 		);
 	}
 
-	// Pre-fetch field definitions for relation tables so relation connections can
-	// expose edge metadata and relation-specific filter/order inputs.
-	let mut relation_table_fds: HashMap<String, Arc<[FieldDefinition]>> = HashMap::new();
-	for rel in relations.iter() {
-		let rel_name = rel.table_name.clone().into_string();
-		if let std::collections::hash_map::Entry::Vacant(e) = relation_table_fds.entry(rel_name) {
-			let fds = ctx.tx.all_tb_fields(ctx.ns, ctx.db, &rel.table_name, None).await?;
-			e.insert(fds);
-		}
-	}
-
 	// Set of exposed table names for checking that relation targets are visible
 	let exposed_table_names: HashSet<String> = tbs
 		.iter()
-		.filter(|tb| !matches!(tb.table_type, TableType::Relation(_)))
+		.filter(|tb| !matches!(&tb.table_type, TableType::Relation(_)))
 		.map(|t| t.name.clone().into_string())
 		.collect();
 
 	let mut relation_type_contexts = HashMap::new();
 	for rel in relations.iter() {
 		let rel_name = rel.table_name.clone().into_string();
-		let Some(fds) = relation_table_fds.get(&rel_name).cloned() else {
+		let Some(fds) = table_fds_cache.get(&rel_name).cloned() else {
 			continue;
 		};
 		if let Some(context) = build_relation_type_context(
@@ -2857,14 +2896,17 @@ pub async fn process_tbs(
 	}
 
 	for tb in tbs.iter() {
-		if matches!(tb.table_type, TableType::Relation(_)) {
-			continue;
-		}
 		trace!("Adding table: {}", tb.name);
 		let fds = table_fds_cache
 			.get(tb.name.as_str())
 			.cloned()
 			.unwrap_or_else(|| Arc::<[FieldDefinition]>::from([]));
+		let tb_name_str = tb.name.clone().into_string();
+		let root_names = match &tb.table_type {
+			TableType::Relation(_) => root_type_names_for_relation(&tb_name_str),
+			_ => root_type_names_for_table(&tb_name_str),
+		};
+		let include_relation_fields = !matches!(&tb.table_type, TableType::Relation(_));
 
 		// Build and register the table's type system
 		let tt = build_table_type(
@@ -2874,16 +2916,18 @@ pub async fn process_tbs(
 			&relation_type_contexts,
 			&table_filter_registry,
 			types,
+			&root_names,
+			include_relation_fields,
 		)?;
 		table_filter_registry.insert(tb.name.clone().into_string(), tt.filter_spec.clone());
 		query = query.field(make_table_list_field(
 			tb,
 			fds.clone(),
 			ctx.datastore.clone(),
-			tt.connection_type_name.clone(),
+			root_names.clone(),
 			tt.filter_spec.clone(),
 		));
-		query = query.field(make_table_get_field(tb, ctx.datastore.clone()));
+		query = query.field(make_table_get_field(tb, ctx.datastore.clone(), root_names));
 		types.push(Type::Object(tt.ty_obj));
 		types.push(tt.order.into());
 		types.push(Type::Enum(tt.orderable));

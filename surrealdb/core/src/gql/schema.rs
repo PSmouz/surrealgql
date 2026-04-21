@@ -190,7 +190,7 @@ pub async fn generate_schema(
 			// Generate mutations for all tables
 			mutation_obj = Some(process_mutations(tbs.clone(), &mut types, &schema_ctx).await?);
 			subscription_obj =
-				process_subscriptions(&tbs[..], &table_fields, &table_filter_registry);
+				process_subscriptions(&tbs[..], &table_fields, &table_filter_registry, &mut types);
 		}
 		_ => {}
 	}

@@ -1117,7 +1117,7 @@ mod graphql_integration {
 			);
 		}
 
-		// Test 9: Relation tables are not exposed as standalone GraphQL query/object types
+		// Test 9: Relation tables are exposed as standalone GraphQL relation query/object types
 		{
 			let res = client
 				.post(gql_url)
@@ -1128,7 +1128,16 @@ mod graphql_integration {
 								fields { name }
 							}
 						}
-						relationType: __type(name: "Likes") {
+						relationType: __type(name: "LikesRelation") {
+							name
+						}
+						relationFilterType: __type(name: "LikesRelationFilterInput") {
+							name
+						}
+						relationOrderType: __type(name: "LikesRelationOrder") {
+							name
+						}
+						relationOrderFieldType: __type(name: "LikesRelationOrderField") {
 							name
 						}
 					}"#})
@@ -1142,14 +1151,59 @@ mod graphql_integration {
 			let field_names: Vec<&str> =
 				fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
 			assert!(
-				!field_names.contains(&"like"),
-				"unexpected singular relation root field: {field_names:?}"
+				field_names.contains(&"likesRelation"),
+				"missing singular relation root field: {field_names:?}"
 			);
 			assert!(
-				!field_names.contains(&"likes"),
-				"unexpected plural relation root field: {field_names:?}"
+				field_names.contains(&"likesRelations"),
+				"missing plural relation root field: {field_names:?}"
 			);
-			assert!(body["data"]["relationType"].is_null());
+			assert_eq!(body["data"]["relationType"]["name"], "LikesRelation");
+			assert_eq!(body["data"]["relationFilterType"]["name"], "LikesRelationFilterInput");
+			assert_eq!(body["data"]["relationOrderType"]["name"], "LikesRelationOrder");
+			assert_eq!(body["data"]["relationOrderFieldType"]["name"], "LikesRelationOrderField");
+		}
+
+		// Test 10: Relation root queries expose relation records with the Relation suffix naming
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"{
+						likesRelations(orderBy: { field: RATING, direction: DESC }) {
+							nodes {
+								id
+								rating
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let relation_id =
+				body["data"]["likesRelations"]["nodes"][0]["id"].as_str().unwrap().to_string();
+			assert_eq!(body["data"]["likesRelations"]["nodes"][0]["rating"], 5);
+
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": format!(r#"{{
+						likesRelation(id: "{relation_id}") {{
+							id
+							rating
+						}}
+					}}"#)})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			assert_eq!(body["data"]["likesRelation"]["id"], relation_id);
+			assert_eq!(body["data"]["likesRelation"]["rating"], 5);
 		}
 
 		Ok(())
@@ -6639,7 +6693,7 @@ mod graphql_integration {
 				"id": "sub-1",
 				"type": "subscribe",
 				"payload": {
-					"query": "subscription { foo { id val } }"
+					"query": "subscription { fooCreated { id foo { id val } } }"
 				}
 			})
 			.to_string()
@@ -6666,7 +6720,9 @@ mod graphql_integration {
 				let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
 					continue;
 				};
-				if value["type"] == "next" && value["payload"]["data"]["foo"]["id"] == "foo:3" {
+				if value["type"] == "next"
+					&& value["payload"]["data"]["fooCreated"]["id"] == "foo:3"
+				{
 					return Some(value);
 				}
 			}
@@ -6675,7 +6731,7 @@ mod graphql_integration {
 		.await?
 		.ok_or_else(|| std::io::Error::other("subscription stream ended before event"))?;
 
-		assert_eq!(received["payload"]["data"]["foo"]["val"], 99);
+		assert_eq!(received["payload"]["data"]["fooCreated"]["foo"]["val"], 99);
 		Ok(())
 	}
 
@@ -6730,7 +6786,7 @@ mod graphql_integration {
 				"id": "sub-filter",
 				"type": "subscribe",
 				"payload": {
-					"query": "subscription { foo(filterBy: { val: { eq: 99 } }, fetch: [\"val\"]) { id val } }"
+					"query": "subscription { fooCreated(filterBy: { val: { eq: 99 } }) { id foo { id val } } }"
 				}
 			})
 			.to_string()
@@ -6743,7 +6799,7 @@ mod graphql_integration {
 				"id": "sub-id",
 				"type": "subscribe",
 				"payload": {
-					"query": "subscription { foo(id: \"foo:target\") { val } }"
+					"query": "subscription { fooCreated(id: \"foo:target\") { id foo { val } } }"
 				}
 			})
 			.to_string()
@@ -6787,12 +6843,15 @@ mod graphql_integration {
 				}
 				match value["id"].as_str() {
 					Some("sub-filter") => {
-						assert_eq!(value["payload"]["data"]["foo"]["id"], "foo:filter_match");
-						assert_eq!(value["payload"]["data"]["foo"]["val"], 99);
+						assert_eq!(
+							value["payload"]["data"]["fooCreated"]["id"],
+							"foo:filter_match"
+						);
+						assert_eq!(value["payload"]["data"]["fooCreated"]["foo"]["val"], 99);
 						got_filter = true;
 					}
 					Some("sub-id") => {
-						assert_eq!(value["payload"]["data"]["foo"]["val"], 42);
+						assert_eq!(value["payload"]["data"]["fooCreated"]["foo"]["val"], 42);
 						got_id = true;
 					}
 					_ => {}
@@ -6860,11 +6919,10 @@ mod graphql_integration {
 				"id": "sub-vars",
 				"type": "subscribe",
 				"payload": {
-					"query": "subscription($id: ID, $filterBy: FooFilterInput, $fetch: [String!]) { foo(id: $id, filterBy: $filterBy, fetch: $fetch) { val } }",
+					"query": "subscription($id: ID, $filterBy: FooFilterInput) { fooCreated(id: $id, filterBy: $filterBy) { id foo { val } } }",
 					"variables": {
 						"id": "foo:target",
-						"filterBy": { "val": { "eq": 42 } },
-						"fetch": ["val"]
+						"filterBy": { "val": { "eq": 42 } }
 					}
 				}
 			})
@@ -6910,7 +6968,180 @@ mod graphql_integration {
 		.await?
 		.ok_or_else(|| std::io::Error::other("subscription stream ended before event"))?;
 
-		assert_eq!(received["payload"]["data"]["foo"]["val"], 42);
+		assert_eq!(received["payload"]["data"]["fooCreated"]["foo"]["val"], 42);
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn subscriptions_introspection_and_relation_events()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server) = common::start_server_without_auth().await.unwrap();
+		let gql_url = &format!("http://{addr}/graphql");
+		let gql_ws_url = &format!("ws://{addr}/graphql");
+		let sql_url = &format!("http://{addr}/sql");
+
+		let mut headers = reqwest::header::HeaderMap::new();
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		headers.insert("surreal-ns", ns.parse()?);
+		headers.insert("surreal-db", db.parse()?);
+		headers.insert(header::ACCEPT, "application/json".parse()?);
+		let client = Client::builder()
+			.connect_timeout(Duration::from_secs(10))
+			.default_headers(headers)
+			.build()?;
+
+		{
+			let res = client
+				.post(sql_url)
+				.body(
+					r#"
+					DEFINE CONFIG GRAPHQL AUTO;
+					DEFINE TABLE person SCHEMAFUL;
+					DEFINE FIELD name ON person TYPE string;
+					DEFINE TABLE post SCHEMAFUL;
+					DEFINE FIELD title ON post TYPE string;
+					DEFINE TABLE likes TYPE RELATION FROM person TO post SCHEMAFUL;
+					DEFINE FIELD rating ON likes TYPE int;
+					CREATE person:alice SET name = 'Alice';
+					CREATE post:one SET title = 'First';
+				"#,
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+		}
+
+		{
+			let res = client
+				.post(gql_url)
+				.body(
+					json!({"query": r#"{
+						__schema {
+							subscriptionType {
+								fields {
+									name
+									args { name }
+								}
+							}
+						}
+						createdPayload: __type(name: "PersonCreatedPayload") {
+							fields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+						deletedPayload: __type(name: "PersonDeletedPayload") {
+							fields {
+								name
+								type { kind name ofType { kind name } }
+							}
+						}
+					}"#})
+					.to_string(),
+				)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+			let body = res.json::<serde_json::Value>().await?;
+			let fields = body["data"]["__schema"]["subscriptionType"]["fields"].as_array().unwrap();
+			let field_names: Vec<&str> =
+				fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
+			assert!(field_names.contains(&"personCreated"));
+			assert!(field_names.contains(&"personUpdated"));
+			assert!(field_names.contains(&"personDeleted"));
+			assert!(field_names.contains(&"likesRelated"));
+			assert!(field_names.contains(&"likesUpdated"));
+			assert!(field_names.contains(&"likesDeleted"));
+			assert!(!field_names.contains(&"personUpserted"));
+			assert!(!field_names.contains(&"likesUpserted"));
+
+			let likes_related_args =
+				fields.iter().find(|field| field["name"] == "likesRelated").unwrap()["args"]
+					.as_array()
+					.unwrap()
+					.iter()
+					.map(|arg| arg["name"].as_str().unwrap())
+					.collect::<Vec<_>>();
+			assert_eq!(likes_related_args, vec!["id", "filterBy"]);
+
+			let created_fields = body["data"]["createdPayload"]["fields"].as_array().unwrap();
+			let created_names: Vec<&str> =
+				created_fields.iter().map(|field| field["name"].as_str().unwrap()).collect();
+			assert_eq!(created_names, vec!["id", "person"]);
+			let person_field =
+				created_fields.iter().find(|field| field["name"] == "person").unwrap();
+			assert_eq!(person_field["type"]["kind"], "NON_NULL");
+			assert_eq!(person_field["type"]["ofType"]["name"], "Person");
+
+			let deleted_fields = body["data"]["deletedPayload"]["fields"].as_array().unwrap();
+			let deleted_person_field =
+				deleted_fields.iter().find(|field| field["name"] == "person").unwrap();
+			assert_eq!(deleted_person_field["type"]["kind"], "OBJECT");
+			assert_eq!(deleted_person_field["type"]["name"], "Person");
+		}
+
+		let mut req = gql_ws_url.into_client_request()?;
+		req.headers_mut().insert("surreal-ns", ns.parse()?);
+		req.headers_mut().insert("surreal-db", db.parse()?);
+		req.headers_mut().insert("Sec-WebSocket-Protocol", "graphql-transport-ws".parse()?);
+		let (mut ws, _) = connect_async(req).await?;
+
+		ws.send(Message::Text(json!({"type":"connection_init"}).to_string().into())).await?;
+		let Some(Ok(Message::Text(ack_msg))) = ws.next().await else {
+			return Err(std::io::Error::other("expected websocket connection ack").into());
+		};
+		let ack_json: serde_json::Value = serde_json::from_str(&ack_msg)?;
+		assert_eq!(ack_json["type"], "connection_ack");
+
+		ws.send(Message::Text(
+			json!({
+				"id": "rel-sub",
+				"type": "subscribe",
+				"payload": {
+					"query": "subscription($filterBy: LikesRelationFilterInput) { likesRelated(filterBy: $filterBy) { id likesRelation { id rating } } }",
+					"variables": {
+						"filterBy": { "rating": { "eq": 5 } }
+					}
+				}
+			})
+			.to_string()
+			.into(),
+		))
+		.await?;
+
+		tokio::time::sleep(Duration::from_secs(1)).await;
+
+		{
+			let res = client
+				.post(sql_url)
+				.body(r#"RELATE person:alice->likes->post:one SET rating = 5;"#)
+				.send()
+				.await?;
+			assert_eq!(res.status(), 200);
+		}
+
+		let received = tokio::time::timeout(Duration::from_secs(10), async {
+			while let Some(frame) = ws.next().await {
+				let Ok(frame) = frame else {
+					continue;
+				};
+				let Message::Text(text) = frame else {
+					continue;
+				};
+				let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+					continue;
+				};
+				if value["type"] == "next" && value["id"] == "rel-sub" {
+					return Some(value);
+				}
+			}
+			None
+		})
+		.await?
+		.ok_or_else(|| std::io::Error::other("subscription stream ended before relation event"))?;
+
+		assert_eq!(received["payload"]["data"]["likesRelated"]["likesRelation"]["rating"], 5);
 		Ok(())
 	}
 }

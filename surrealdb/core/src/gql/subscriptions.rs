@@ -3,7 +3,8 @@ use std::sync::{Arc, RwLock};
 
 use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::{
-	FieldValue, InputValue, Subscription, SubscriptionField, SubscriptionFieldFuture, TypeRef,
+	Field, FieldFuture, FieldValue, InputValue, Object, Subscription, SubscriptionField,
+	SubscriptionFieldFuture, Type, TypeRef,
 };
 use async_graphql::{Name, Value as GqlValue};
 use async_stream::try_stream;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 
 use super::error::{GqlError, resolver_error};
 use super::naming;
+use super::schema::{record_id_to_raw, semantic_non_null_directive};
 use super::tables::{CachedRecord, TableFilterRegistry, filter_name_from_table, parse_filter_arg};
 use super::utils::{GqlValueUtils, execute_plan};
 use crate::catalog::{FieldDefinition, TableDefinition, TableType};
@@ -21,7 +23,7 @@ use crate::expr::field::Selector;
 use crate::expr::plan::TopLevelExpr;
 use crate::expr::statements::{KillStatement, LiveFields, LiveStatement};
 use crate::expr::{
-	BinaryOperator, Cond, Expr, Fetch, Fetchs, Field, Fields, Idiom, Literal, LogicalPlan, Part,
+	BinaryOperator, Cond, Expr, Field as QueryField, Fields, Idiom, Literal, LogicalPlan, Part,
 };
 use crate::kvs::Datastore;
 use crate::val::{RecordId, TableName, Value};
@@ -90,6 +92,7 @@ pub(crate) fn process_subscriptions(
 	tbs: &[TableDefinition],
 	table_fields: &HashMap<String, Arc<[FieldDefinition]>>,
 	table_filter_registry: &TableFilterRegistry,
+	types: &mut Vec<Type>,
 ) -> Option<Subscription> {
 	if tbs.is_empty() {
 		return None;
@@ -97,44 +100,220 @@ pub(crate) fn process_subscriptions(
 
 	let mut subscription = Subscription::new("Subscription");
 	for tb in tbs {
-		if matches!(tb.table_type, TableType::Relation(_)) {
-			continue;
-		}
 		let fds = table_fields
 			.get(tb.name.as_str())
 			.cloned()
 			.unwrap_or_else(|| Arc::<[FieldDefinition]>::from([]));
-		let filter_spec = table_filter_registry.get(tb.name.as_str()).cloned().unwrap_or(
-			super::tables::FilterObjectSpec {
-				type_name: filter_name_from_table(&tb.name),
-				description: format!(
-					"Filter input for `{}` connections.",
-					naming::table_type_name(tb.name.as_str())
-				),
-				fields: Vec::new(),
-			},
-		);
-		subscription = subscription.field(make_table_subscription_field(tb, fds, filter_spec));
+		let entity = subscription_entity_context(tb);
+		let filter_spec =
+			table_filter_registry.get(tb.name.as_str()).cloned().unwrap_or_else(|| {
+				super::tables::FilterObjectSpec {
+					type_name: entity.filter_type_name.clone(),
+					description: format!(
+						"Filter input for `{}` connections.",
+						entity.entity_type_name
+					),
+					fields: Vec::new(),
+				}
+			});
+		for event in subscription_events(tb) {
+			let payload_type_name = register_subscription_payload_type(&entity, *event, types);
+			subscription = subscription.field(make_table_subscription_field(
+				tb,
+				fds.clone(),
+				filter_spec.clone(),
+				entity.clone(),
+				*event,
+				payload_type_name,
+			));
+		}
 	}
 
 	Some(subscription)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionEventKind {
+	Created,
+	Updated,
+	Deleted,
+	Related,
+}
+
+impl SubscriptionEventKind {
+	fn field_suffix(self) -> &'static str {
+		match self {
+			Self::Created => "Created",
+			Self::Updated => "Updated",
+			Self::Deleted => "Deleted",
+			Self::Related => "Related",
+		}
+	}
+
+	fn payload_suffix(self) -> &'static str {
+		self.field_suffix()
+	}
+
+	fn action_description(self) -> &'static str {
+		match self {
+			Self::Created => "created",
+			Self::Updated => "updated",
+			Self::Deleted => "deleted",
+			Self::Related => "related",
+		}
+	}
+
+	fn from_notification_action(action: PublicAction, is_relation: bool) -> Option<Self> {
+		match action {
+			PublicAction::Create => Some(if is_relation {
+				Self::Related
+			} else {
+				Self::Created
+			}),
+			PublicAction::Update => Some(Self::Updated),
+			PublicAction::Delete => Some(Self::Deleted),
+			PublicAction::Killed => None,
+		}
+	}
+
+	fn entity_is_nullable(self) -> bool {
+		matches!(self, Self::Deleted)
+	}
+}
+
+#[derive(Clone)]
+struct SubscriptionEntityContext {
+	field_name: String,
+	entity_field_name: String,
+	entity_type_name: String,
+	filter_type_name: String,
+	payload_type_prefix: String,
+	description_name: String,
+	is_relation: bool,
+}
+
+#[derive(Clone)]
+struct SubscriptionPayloadValue {
+	id: String,
+	entity: Option<CachedRecord>,
+}
+
+fn subscription_events(tb: &TableDefinition) -> &'static [SubscriptionEventKind] {
+	if matches!(&tb.table_type, TableType::Relation(_)) {
+		&[
+			SubscriptionEventKind::Related,
+			SubscriptionEventKind::Updated,
+			SubscriptionEventKind::Deleted,
+		]
+	} else {
+		&[
+			SubscriptionEventKind::Created,
+			SubscriptionEventKind::Updated,
+			SubscriptionEventKind::Deleted,
+		]
+	}
+}
+
+fn subscription_entity_context(tb: &TableDefinition) -> SubscriptionEntityContext {
+	let tb_name = tb.name.as_str();
+	match &tb.table_type {
+		TableType::Relation(_) => SubscriptionEntityContext {
+			field_name: naming::to_camel_case(tb_name),
+			entity_field_name: naming::relation_payload_entity_field_name(tb_name),
+			entity_type_name: naming::relation_type_name(tb_name),
+			filter_type_name: naming::relation_filter_input_name(tb_name),
+			payload_type_prefix: naming::to_pascal_case(tb_name),
+			description_name: naming::relation_type_name(tb_name),
+			is_relation: true,
+		},
+		_ => SubscriptionEntityContext {
+			field_name: naming::singular_query_name(tb_name),
+			entity_field_name: naming::payload_entity_field_name(tb_name),
+			entity_type_name: naming::table_type_name(tb_name),
+			filter_type_name: filter_name_from_table(&tb.name),
+			payload_type_prefix: naming::table_type_name(tb_name),
+			description_name: naming::table_type_name(tb_name),
+			is_relation: false,
+		},
+	}
+}
+
+fn register_subscription_payload_type(
+	entity: &SubscriptionEntityContext,
+	event: SubscriptionEventKind,
+	types: &mut Vec<Type>,
+) -> String {
+	let payload_type_name =
+		format!("{}{}Payload", entity.payload_type_prefix, event.payload_suffix());
+	if types
+		.iter()
+		.any(|ty| matches!(ty, Type::Object(obj) if obj.type_name() == payload_type_name))
+	{
+		return payload_type_name;
+	}
+
+	let entity_field_name = entity.entity_field_name.clone();
+	let entity_type_name = entity.entity_type_name.clone();
+	let mut entity_field = Field::new(
+		&entity_field_name,
+		if event.entity_is_nullable() {
+			TypeRef::named(&entity_type_name)
+		} else {
+			TypeRef::named_nn(&entity_type_name)
+		},
+		move |ctx| {
+			FieldFuture::new(async move {
+				let payload = ctx.parent_value.try_downcast_ref::<SubscriptionPayloadValue>()?;
+				Ok(payload.entity.as_ref().map(|entity| FieldValue::owned_any(entity.clone())))
+			})
+		},
+	)
+	.description(format!("The {} entity snapshot for this event.", entity.description_name));
+	if !event.entity_is_nullable() {
+		entity_field = entity_field.directive(semantic_non_null_directive());
+	}
+
+	let payload = Object::new(&payload_type_name)
+		.description(format!(
+			"Payload emitted when a `{}` record is {}.",
+			entity.description_name,
+			event.action_description()
+		))
+		.field(
+			Field::new("id", TypeRef::named_nn(TypeRef::ID), |ctx| {
+				FieldFuture::new(async move {
+					let payload =
+						ctx.parent_value.try_downcast_ref::<SubscriptionPayloadValue>()?;
+					Ok(Some(FieldValue::value(payload.id.clone())))
+				})
+			})
+			.description("The record id for this event.")
+			.directive(semantic_non_null_directive()),
+		)
+		.field(entity_field);
+	types.push(Type::Object(payload));
+	payload_type_name
 }
 
 fn make_table_subscription_field(
 	tb: &TableDefinition,
 	fds: Arc<[FieldDefinition]>,
 	filter_spec: super::tables::FilterObjectSpec,
+	entity: SubscriptionEntityContext,
+	event: SubscriptionEventKind,
+	payload_type_name: String,
 ) -> SubscriptionField {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.clone().into_string();
-	let gql_type_name = naming::table_type_name(&tb_name_str);
-	let table_filter_name = filter_name_from_table(&tb_name);
+	let field_name = format!("{}{}", entity.field_name, event.field_suffix());
+	let table_filter_name = entity.filter_type_name.clone();
+	let description_name = entity.description_name.clone();
 	let selectable_fields = selectable_top_level_fields(&fds);
 
-	SubscriptionField::new(tb_name_str.clone(), TypeRef::named(&gql_type_name), move |ctx| {
+	SubscriptionField::new(&field_name, TypeRef::named_nn(&payload_type_name), move |ctx| {
 		let tb_name = tb_name.clone();
 		let selectable_fields = selectable_fields.clone();
 		let filter_spec = filter_spec.clone();
+		let entity = entity.clone();
 		SubscriptionFieldFuture::new(async move {
 			let ds = ctx.data::<Arc<Datastore>>()?;
 			let sess = ctx.data::<Arc<Session>>()?;
@@ -146,7 +325,7 @@ fn make_table_subscription_field(
 			let args = ctx.args.as_index_map();
 
 			let live_sess = sess.as_ref().clone().with_rt(true);
-			let fields = projected_live_fields(&ctx, &selectable_fields);
+			let fields = projected_live_fields(&ctx, &selectable_fields, &entity.entity_field_name);
 			let table_filter_registry = ctx.data::<Arc<TableFilterRegistry>>()?;
 			let cond = parse_subscription_cond(
 				args,
@@ -154,9 +333,7 @@ fn make_table_subscription_field(
 				&tb_name,
 				table_filter_registry.as_ref(),
 			)?;
-			let fetch = parse_fetch_arg(args)?;
-			let live_id =
-				start_table_live_query(ds, &live_sess, &tb_name, fields, cond, fetch).await?;
+			let live_id = start_table_live_query(ds, &live_sess, &tb_name, fields, cond).await?;
 			let mut receiver = router.subscribe(live_id);
 			let cleanup = LiveQueryCleanup::new(ds.clone(), live_sess, live_id, router.clone());
 
@@ -166,20 +343,28 @@ fn make_table_subscription_field(
 					let Some(notification) = receiver.recv().await else {
 						break;
 					};
-					if matches!(notification.action, PublicAction::Killed) {
-						break;
-					}
-					if let Some(value) = notification_to_field_value(notification) {
+					let Some(notification_event) = SubscriptionEventKind::from_notification_action(
+						notification.action,
+						entity.is_relation,
+					) else {
+						continue;
+					};
+					if notification_event == event
+						&& let Some(value) = notification_to_field_value(notification, notification_event)
+					{
 						yield value;
 					}
 				}
 			})
 		})
 	})
-	.description(format!("LIVE query notifications for `{}`", tb.name))
+	.description(format!(
+		"LIVE query notifications for {} `{}` records.",
+		event.action_description(),
+		description_name
+	))
 	.argument(InputValue::new("id", TypeRef::named(TypeRef::ID)))
 	.argument(InputValue::new("filterBy", TypeRef::named(&table_filter_name)))
-	.argument(InputValue::new("fetch", TypeRef::named_nn_list(TypeRef::STRING)))
 }
 
 fn selectable_top_level_fields(fds: &[FieldDefinition]) -> HashSet<String> {
@@ -199,26 +384,33 @@ fn selectable_top_level_fields(fds: &[FieldDefinition]) -> HashSet<String> {
 fn projected_live_fields(
 	ctx: &async_graphql::dynamic::ResolverContext<'_>,
 	selectable_fields: &HashSet<String>,
+	entity_field_name: &str,
 ) -> LiveFields {
-	let mut selected = Vec::new();
+	let mut selected = vec!["id".to_string()];
 	for field in ctx.field().selection_set() {
 		let name = field.name();
 		if name.starts_with("__") {
 			continue;
 		}
-		if selectable_fields.contains(name) {
-			selected.push(name.to_string());
+		if name != entity_field_name {
+			continue;
 		}
-	}
-	if !selected.iter().any(|x| x == "id") {
-		selected.push("id".to_string());
+		for entity_field in field.selection_set() {
+			let entity_field_name = entity_field.name();
+			if entity_field_name.starts_with("__") {
+				continue;
+			}
+			if selectable_fields.contains(entity_field_name) {
+				selected.push(entity_field_name.to_string());
+			}
+		}
 	}
 	selected.sort_unstable();
 	selected.dedup();
 	let projected = selected
 		.into_iter()
 		.map(|name| {
-			Field::Single(Selector {
+			QueryField::Single(Selector {
 				expr: Expr::Idiom(Idiom::field(name)),
 				alias: None,
 			})
@@ -280,69 +472,43 @@ fn combine_cond(left: Option<Cond>, right: Option<Cond>) -> Option<Cond> {
 	}
 }
 
-fn parse_fetch_arg(
-	args: &IndexMap<Name, GqlValue>,
-) -> Result<Option<Fetchs>, async_graphql::Error> {
-	let Some(fetch_value) = args.get("fetch") else {
-		return Ok(None);
-	};
-	if matches!(fetch_value, GqlValue::Null) {
-		return Ok(None);
-	}
-
-	let values: Vec<String> = match fetch_value {
-		GqlValue::List(items) => {
-			let mut out = Vec::with_capacity(items.len());
-			for item in items {
-				let Some(path) = item.as_string() else {
-					return Err(async_graphql::Error::new("fetch must be a list of strings"));
-				};
-				out.push(path);
-			}
-			out
-		}
-		_ => {
-			return Err(async_graphql::Error::new("fetch must be a list of strings"));
-		}
-	};
-
-	if values.is_empty() {
-		return Ok(None);
-	}
-
-	let mut fetches = Vec::with_capacity(values.len());
-	for path in values {
-		let idiom = crate::syn::idiom(&path)
-			.map_err(|_| async_graphql::Error::new(format!("Invalid fetch path: {path}")))?;
-		fetches.push(Fetch(Expr::Idiom(idiom.into())));
-	}
-
-	Ok(Some(Fetchs::new(fetches)))
-}
-
-fn notification_to_field_value(notification: PublicNotification) -> Option<FieldValue<'static>> {
+fn notification_to_field_value(
+	notification: PublicNotification,
+	event: SubscriptionEventKind,
+) -> Option<FieldValue<'static>> {
 	let record: Value = notification.record.into();
 	let result: Value = notification.result.into();
-
-	let Value::Object(obj) = result else {
-		return None;
+	let rid = match &result {
+		Value::Object(obj) => extract_record_id(obj, &record)?,
+		_ => extract_record_id_from_value(&record)?,
+	};
+	let entity = match result {
+		Value::Object(obj) => Some(CachedRecord {
+			rid: rid.clone(),
+			version: None,
+			data: obj,
+		}),
+		_ if event.entity_is_nullable() => None,
+		_ => return None,
 	};
 
-	let rid = extract_record_id(&obj, &record)?;
-	Some(FieldValue::owned_any(CachedRecord {
-		rid,
-		version: None,
-		data: obj,
+	Some(FieldValue::owned_any(SubscriptionPayloadValue {
+		id: record_id_to_raw(&rid),
+		entity,
 	}))
 }
 
 fn extract_record_id(obj: &crate::val::Object, fallback: &Value) -> Option<RecordId> {
 	match obj.get("id") {
-		Some(Value::RecordId(rid)) => Some(rid.clone()),
-		_ => match fallback {
-			Value::RecordId(rid) => Some(rid.clone()),
-			_ => None,
-		},
+		Some(Value::RecordId(rid)) => Some(rid.clone().into()),
+		_ => extract_record_id_from_value(fallback),
+	}
+}
+
+fn extract_record_id_from_value(value: &Value) -> Option<RecordId> {
+	match value {
+		Value::RecordId(rid) => Some(rid.clone()),
+		_ => None,
 	}
 }
 
@@ -352,7 +518,6 @@ async fn start_table_live_query(
 	table: &TableName,
 	fields: LiveFields,
 	cond: Option<Cond>,
-	fetch: Option<Fetchs>,
 ) -> Result<Uuid, async_graphql::Error> {
 	let stmt = LiveStatement {
 		id: Uuid::new_v4(),
@@ -360,7 +525,7 @@ async fn start_table_live_query(
 		fields,
 		what: Expr::Table(table.clone()),
 		cond,
-		fetch,
+		fetch: None,
 	};
 	let plan = LogicalPlan {
 		expressions: vec![TopLevelExpr::Live(Box::new(stmt))],
