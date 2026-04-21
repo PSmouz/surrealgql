@@ -114,6 +114,54 @@
       left: 8px !important;
       transform: translateY(-50%) !important;
     }
+
+    .surreal-settings-field {
+      margin-top: var(--px-10);
+    }
+
+    .surreal-settings-input {
+      width: min(100%, 320px);
+      box-sizing: border-box;
+      margin-top: var(--px-10);
+      padding: var(--px-10) var(--px-12);
+      border-radius: var(--border-radius-8);
+      border: 1px solid hsla(var(--color-neutral), 0.18);
+      background: hsla(var(--color-neutral), var(--alpha-background-light));
+      color: hsl(var(--color-neutral));
+      font: inherit;
+      transition: border-color 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
+    }
+
+    .surreal-settings-input::placeholder {
+      color: hsla(var(--color-neutral), var(--alpha-secondary));
+    }
+
+    .surreal-settings-input:hover {
+      border-color: hsla(var(--color-primary), 0.35);
+      background: hsla(var(--color-neutral), var(--alpha-background-medium));
+    }
+
+    .surreal-settings-input:focus {
+      outline: none;
+      border-color: hsl(var(--color-primary));
+      box-shadow: 0 0 0 3px hsla(var(--color-primary), 0.16);
+      background: hsl(var(--color-base));
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .surreal-settings-input {
+        border-color: hsla(var(--color-neutral), 0.24);
+        background: hsla(var(--color-neutral), 0.08);
+      }
+
+      .surreal-settings-input:hover {
+        background: hsla(var(--color-neutral), 0.12);
+      }
+
+      .surreal-settings-input:focus {
+        background: hsla(var(--color-base), 0.92);
+      }
+    }
   </style>
   <link href="https://esm.sh/graphiql/dist/style.css" rel="stylesheet"/>
   <link href="https://esm.sh/@graphiql/plugin-explorer/dist/style.css"
@@ -141,7 +189,7 @@
     import {GraphiQL, HISTORY_PLUGIN} from 'graphiql';
     import {createGraphiQLFetcher} from '@graphiql/toolkit';
     import {explorerPlugin} from '@graphiql/plugin-explorer';
-    import {Dialog, UnStyledButton} from '@graphiql/react';
+    import {Dialog, Tooltip, UnStyledButton} from '@graphiql/react';
     import 'graphiql/setup-workers/esm.sh';
 
     const SurrealDBIcon = () => React.createElement('svg',
@@ -186,8 +234,10 @@
               React.createElement(
                   "input",
                   {
+                    className: 'surreal-settings-input',
                     value: headers['surreal-ns'],
                     onChange: (e) => changeFn('surreal-ns', e.target.value),
+                    placeholder: 'Namespace name',
                   }
               )
           ),
@@ -217,8 +267,10 @@
               React.createElement(
                   "input",
                   {
+                    className: 'surreal-settings-input',
                     value: headers['surreal-db'],
                     onChange: (e) => changeFn('surreal-db', e.target.value),
+                    placeholder: 'Database name',
                   }
               )
           ),
@@ -248,9 +300,10 @@
               React.createElement(
                   "input",
                   {
+                    className: 'surreal-settings-input',
                     value: headers['auth'],
                     onChange: (e) => changeFn('auth', e.target.value),
-                    placeholder: 'Basic base64(username:password) or Bearer token',
+                    placeholder: 'username:password or Bearer token',
                   }
               )
           )
@@ -267,7 +320,7 @@
 
     function App() {
       const [showSurreal, setShowSurreal] = React.useState(false);
-      const [headers, setHeaders] = React.useState({
+      const [headers, setHeaders] = React.useState(window.__SURREAL_INITIAL_HEADERS__ || {
         'surreal-ns': '',
         'surreal-db': '',
         'auth': '',
@@ -298,58 +351,70 @@
 
       const plugins = [HISTORY_PLUGIN, explorerPlugin()];
 
-      return React.createElement(React.Fragment, null,
-          React.createElement(
-              GraphiQL,
-              {
-                fetcher,
-                plugins,
-                defaultEditorToolsVisibility: true,
-              },
-          ),
-          React.createElement(
-              UnStyledButton,
-              {
-                label: "SurrealDB Settings",
-                type: 'button',
-                className: 'surreal-button surreal-button-position',
-                onClick: handleShowDialog,
-              },
-              React.createElement(SurrealDBIcon, null),
-          ),
-          React.createElement(
-              Dialog,
-              {
-                open: showSurreal,
-                onOpenChange: handleOpenSurrealDialog,
-              },
+      return React.createElement(
+          Tooltip.Provider,
+          null,
+          React.createElement(React.Fragment, null,
               React.createElement(
-                  'div',
+                  GraphiQL,
                   {
-                    className: "graphiql-dialog-header"
+                    fetcher,
+                    plugins,
+                    defaultEditorToolsVisibility: true,
+                  },
+              ),
+              React.createElement(
+                  Tooltip,
+                  {
+                    label: 'SurrealDB Settings',
+                    side: 'right',
+                    align: 'center',
+                  },
+                  React.createElement(
+                      UnStyledButton,
+                      {
+                        'aria-label': 'SurrealDB Settings',
+                        type: 'button',
+                        className: 'surreal-button surreal-button-position',
+                        onClick: handleShowDialog,
+                      },
+                      React.createElement(SurrealDBIcon, null),
+                  ),
+              ),
+              React.createElement(
+                  Dialog,
+                  {
+                    open: showSurreal,
+                    onOpenChange: handleOpenSurrealDialog,
                   },
                   React.createElement(
                       'div',
-                      null,
+                      {
+                        className: "graphiql-dialog-header"
+                      },
                       React.createElement(
-                          Dialog.Title,
-                          {
-                            className: 'graphiql-dialog-title'
-                          },
-                          'SurrealDB Connection Settings'
-                      ),
-                      React.createElement(
-                          Dialog.Description,
+                          'div',
                           null,
-                          'Configure your SurrealDB connection settings here.'
+                          React.createElement(
+                              Dialog.Title,
+                              {
+                                className: 'graphiql-dialog-title'
+                              },
+                              'SurrealDB Connection Settings'
+                          ),
+                          React.createElement(
+                              Dialog.Description,
+                              null,
+                              'Configure your SurrealDB connection settings here.'
+                          ),
                       ),
+                      React.createElement(Dialog.Close, null)
                   ),
-                  React.createElement(Dialog.Close, null)
-              ),
-              React.createElement(Settings, {
-                changeFn: handleHeaderChange,
-                headers
-              })
+                  React.createElement(Settings, {
+                    changeFn: handleHeaderChange,
+                    headers
+                  })
+              )
           )
       );
     }
@@ -359,6 +424,9 @@
   </script>
 </head>
 <body>
+<script>
+  window.__SURREAL_INITIAL_HEADERS__ = "__SURREAL_INITIAL_HEADERS__";
+</script>
 <div id="graphiql">
   <div class="loading">Loading...</div>
 </div>
