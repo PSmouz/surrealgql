@@ -68,6 +68,7 @@ keyword! {
 	Computed => "COMPUTED",
 	Count => "COUNT",
 	Create => "CREATE",
+	Cursor => "CURSOR",
 	Database => "DATABASE",
 	Default => "DEFAULT",
 	Define => "DEFINE",

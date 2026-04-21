@@ -63,12 +63,9 @@
 
 <br>
 
-<h2><img height="20" src="./img/whatissurreal.svg">&nbsp;&nbsp;What is SurrealDB?</h2>
+<h2><img height="20" src="./img/whatissurreal.svg">&nbsp;&nbsp;What is SurrealGQL?</h2>
 
-SurrealDB is a multi-model database built in Rust designed to unify multiple data models into a single engine. SurrealDB combines document, graph, relational, time-series, geospatial and key-value data types with powerful search and retrieval functionalities (full-text, vector, hybrid) and real-time and event-driven capabilities, enabling developers to build powerful applications faster and more efficiently. SurrealDB can also be used as a backend-as-a-service given its support for end user authentication. Given that it’s a single Rust binary, SurrealDB can run embedded (in‐app), in the browser (via WebAssembly), in the edge, self-hosted as single backend node, or in a distributed cluster in the cloud.
-
-SurrealDB is used for data-intensive systems such as applications requiring multiple data types, data layer for AI agents, knowledge graphs, real-time apps (e.g. recommendation engines, fraud detection systems) and embedded/edge systems. With SurrealDB, you can simplify your database and API infrastructure, reduce development time, and build secure, performant apps quickly and cost-effectively.
-
+SurrealGQL is a fork focusing on a powerful GraphQL API including features like Connections. SurrealDB is an end-to-end cloud-native database designed for modern applications, including web, mobile, serverless, Jamstack, backend, and traditional applications. With SurrealDB, you can simplify your database and API infrastructure, reduce development time, and build secure, performant apps quickly and cost-effectively.
 **Key features of SurrealDB include:**
 
 - **Reduces development time**: SurrealDB simplifies your database and API stack by removing the need for most server-side components, allowing you to build secure, performant apps faster and cheaper.
