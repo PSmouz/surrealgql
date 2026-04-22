@@ -561,5 +561,5 @@ To build the release Docker image, run the following command from the root of
 the repository:
 
 ```bash
-docker build -f docker/Dockerfile --target prod -t psmouz/surrealgql:3.10.0 .
+docker build -f docker/Dockerfile --target prod --build-arg SURREALDB_BINARY=surreal -t psmouz/surrealgql:3.10.0 target/release
 ```
