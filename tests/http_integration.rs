@@ -3226,6 +3226,22 @@ mod http_integration {
 	}
 
 	#[test(tokio::test)]
+	async fn bucket_list_is_denied_for_record_users_in_streaming_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) = start_bucket_permission_test_server(None).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body = record_sql(&client, &addr, &token, r#"file::list("list_full");"#).await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"record users must not list bucket contents even when bucket permissions are FULL",
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
 	async fn bucket_list_is_denied_for_record_users_in_compute_only_planner()
 	-> Result<(), Box<dyn std::error::Error>> {
 		let (addr, _server, client) =
