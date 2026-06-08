@@ -9,11 +9,13 @@ use anyhow::{Result, bail, ensure};
 
 use crate::buc::BucketOperation;
 use crate::buc::store::{ListOptions, ObjectKey, ObjectStore};
+use crate::catalog::BucketDefinition;
 use crate::catalog::providers::BucketProvider;
-use crate::catalog::{BucketDefinition, Permission};
 use crate::dbs::capabilities::ExperimentalTarget;
 use crate::err::Error;
+use crate::exec::ExecutionContext;
 use crate::exec::function::FunctionRegistry;
+use crate::exec::permission::{PhysicalPermission, convert_permission_to_physical_runtime};
 use crate::exec::physical_expr::EvalContext;
 use crate::fnc::args::FromArgs;
 use crate::val::{Bytes, File, Object, Value};
@@ -36,6 +38,7 @@ struct StreamingBucketOps<'a> {
 	bucket: Arc<BucketDefinition>,
 	store: Arc<dyn ObjectStore>,
 	frozen_ctx: &'a crate::ctx::FrozenContext,
+	exec_ctx: &'a ExecutionContext,
 	opt: &'a crate::dbs::Options,
 }
 
@@ -70,6 +73,7 @@ impl<'a> StreamingBucketOps<'a> {
 			bucket,
 			store,
 			frozen_ctx,
+			exec_ctx: ctx.exec_ctx,
 			opt,
 		})
 	}
@@ -81,11 +85,12 @@ impl<'a> StreamingBucketOps<'a> {
 	}
 
 	/// Check permissions for an operation.
-	///
-	/// For Permission::Specific, we currently don't support the full expression
-	/// evaluation in the streaming executor (requires Stk). In that case, we
-	/// fall back to checking based on role only.
-	fn check_permission(&self, op: BucketOperation) -> Result<()> {
+	async fn check_permission(
+		&self,
+		op: BucketOperation,
+		key: Option<&ObjectKey>,
+		target: Option<&ObjectKey>,
+	) -> Result<()> {
 		// Check if we should check permissions (uses Options::check_perms like fnc::file)
 		if self.frozen_ctx.check_perms(self.opt, op.into())? {
 			// Guest and Record users are not allowed to list files in buckets
@@ -97,22 +102,58 @@ impl<'a> StreamingBucketOps<'a> {
 				}
 			);
 
-			match &self.bucket.permissions {
-				Permission::None => {
+			match convert_permission_to_physical_runtime(
+				&self.bucket.permissions,
+				self.exec_ctx.ctx(),
+			)
+			.await?
+			{
+				PhysicalPermission::Deny => {
 					bail!(Error::BucketPermissions {
 						name: self.bucket.name.to_string(),
 						op,
 					})
 				}
-				Permission::Full => (),
-				Permission::Specific(_) => {
-					// For specific permissions, we would need to evaluate the expression
-					// using the legacy compute path. For now, we allow if auth is sufficient.
-					// This is a simplification - the full BucketController would evaluate
-					// the expression with $action, $file, $target variables.
-					//
-					// In practice, most buckets use Permission::Full or Permission::None,
-					// so this simplification should work for the common cases.
+				PhysicalPermission::Allow => (),
+				PhysicalPermission::Conditional(expr) => {
+					let mut exec_ctx =
+						self.exec_ctx.with_param("action", Value::from(op.to_string()));
+					if let Some(key) = key {
+						exec_ctx = exec_ctx.with_param(
+							"file",
+							Value::File(File {
+								bucket: self.bucket.name.to_string(),
+								key: key.to_string(),
+							}),
+						);
+					}
+					if let Some(target) = target {
+						exec_ctx = exec_ctx.with_param(
+							"target",
+							Value::File(File {
+								bucket: self.bucket.name.to_string(),
+								key: target.to_string(),
+							}),
+						);
+					}
+
+					// SECURITY: the bucket predicate runs with the caller's auth and only
+					// disables nested permission checks to avoid recursive permission
+					// evaluation, matching the bounded legacy `new_with_perms(false)` path.
+					let exec_ctx = exec_ctx.with_skip_fetch_perms(true);
+					let eval_ctx = EvalContext::from_exec_ctx(&exec_ctx);
+					let res = expr
+						.evaluate(eval_ctx)
+						.await
+						.map_err(|e| Error::Internal(e.to_string()))?;
+
+					ensure!(
+						res.is_truthy(),
+						Error::BucketPermissions {
+							name: self.bucket.name.to_string(),
+							op,
+						}
+					);
 				}
 			}
 		}
@@ -124,7 +165,7 @@ impl<'a> StreamingBucketOps<'a> {
 	async fn put(&self, key: &ObjectKey, value: Value) -> Result<()> {
 		let payload = accept_payload(value)?;
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Put)?;
+		self.check_permission(BucketOperation::Put, Some(key), None).await?;
 
 		self.store
 			.put(key, payload)
@@ -138,7 +179,7 @@ impl<'a> StreamingBucketOps<'a> {
 	async fn put_if_not_exists(&self, key: &ObjectKey, value: Value) -> Result<()> {
 		let payload = accept_payload(value)?;
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Put)?;
+		self.check_permission(BucketOperation::Put, Some(key), None).await?;
 
 		self.store
 			.put_if_not_exists(key, payload)
@@ -150,7 +191,7 @@ impl<'a> StreamingBucketOps<'a> {
 
 	/// Get a file from the bucket.
 	async fn get(&self, key: &ObjectKey) -> Result<Option<Bytes>> {
-		self.check_permission(BucketOperation::Get)?;
+		self.check_permission(BucketOperation::Get, Some(key), None).await?;
 
 		let bytes = match self
 			.store
@@ -167,7 +208,7 @@ impl<'a> StreamingBucketOps<'a> {
 
 	/// Get file metadata from the bucket.
 	async fn head(&self, key: &ObjectKey) -> Result<Option<Value>> {
-		self.check_permission(BucketOperation::Head)?;
+		self.check_permission(BucketOperation::Head, Some(key), None).await?;
 
 		let meta = self
 			.store
@@ -181,7 +222,7 @@ impl<'a> StreamingBucketOps<'a> {
 	/// Delete a file from the bucket.
 	async fn delete(&self, key: &ObjectKey) -> Result<()> {
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Delete)?;
+		self.check_permission(BucketOperation::Delete, Some(key), None).await?;
 
 		self.store
 			.delete(key)
@@ -194,7 +235,7 @@ impl<'a> StreamingBucketOps<'a> {
 	/// Copy a file within the bucket.
 	async fn copy(&self, src: &ObjectKey, dst: ObjectKey) -> Result<()> {
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Copy)?;
+		self.check_permission(BucketOperation::Copy, Some(src), Some(&dst)).await?;
 
 		self.store
 			.copy(src, &dst)
@@ -207,7 +248,7 @@ impl<'a> StreamingBucketOps<'a> {
 	/// Copy a file if destination doesn't exist.
 	async fn copy_if_not_exists(&self, src: &ObjectKey, dst: ObjectKey) -> Result<()> {
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Copy)?;
+		self.check_permission(BucketOperation::Copy, Some(src), Some(&dst)).await?;
 
 		self.store
 			.copy_if_not_exists(src, &dst)
@@ -220,7 +261,7 @@ impl<'a> StreamingBucketOps<'a> {
 	/// Rename a file within the bucket.
 	async fn rename(&self, src: &ObjectKey, dst: ObjectKey) -> Result<()> {
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Rename)?;
+		self.check_permission(BucketOperation::Rename, Some(src), Some(&dst)).await?;
 
 		self.store
 			.rename(src, &dst)
@@ -233,7 +274,7 @@ impl<'a> StreamingBucketOps<'a> {
 	/// Rename a file if destination doesn't exist.
 	async fn rename_if_not_exists(&self, src: &ObjectKey, dst: ObjectKey) -> Result<()> {
 		self.require_writeable()?;
-		self.check_permission(BucketOperation::Rename)?;
+		self.check_permission(BucketOperation::Rename, Some(src), Some(&dst)).await?;
 
 		self.store
 			.rename_if_not_exists(src, &dst)
@@ -245,7 +286,7 @@ impl<'a> StreamingBucketOps<'a> {
 
 	/// Check if a file exists.
 	async fn exists(&self, key: &ObjectKey) -> Result<bool> {
-		self.check_permission(BucketOperation::Exists)?;
+		self.check_permission(BucketOperation::Exists, Some(key), None).await?;
 
 		self.store
 			.exists(key)
@@ -256,7 +297,7 @@ impl<'a> StreamingBucketOps<'a> {
 
 	/// List files in the bucket.
 	async fn list(&self, opts: &ListOptions) -> Result<Vec<Value>> {
-		self.check_permission(BucketOperation::List)?;
+		self.check_permission(BucketOperation::List, None, None).await?;
 
 		let items = self
 			.store
