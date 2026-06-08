@@ -9,14 +9,14 @@ use anyhow::{Result, bail, ensure};
 
 use crate::buc::BucketOperation;
 use crate::buc::store::{ListOptions, ObjectKey, ObjectStore};
-use crate::catalog::BucketDefinition;
 use crate::catalog::providers::BucketProvider;
+use crate::catalog::{BucketDefinition, Permission};
 use crate::dbs::capabilities::ExperimentalTarget;
 use crate::err::Error;
 use crate::exec::ExecutionContext;
 use crate::exec::function::FunctionRegistry;
-use crate::exec::permission::{PhysicalPermission, convert_permission_to_physical_runtime};
 use crate::exec::physical_expr::EvalContext;
+use crate::exec::planner::Planner;
 use crate::fnc::args::FromArgs;
 use crate::val::{Bytes, File, Object, Value};
 use crate::{define_async_function, define_pure_function, register_functions};
@@ -102,20 +102,16 @@ impl<'a> StreamingBucketOps<'a> {
 				}
 			);
 
-			match convert_permission_to_physical_runtime(
-				&self.bucket.permissions,
-				self.exec_ctx.ctx(),
-			)
-			.await?
-			{
-				PhysicalPermission::Deny => {
+			match &self.bucket.permissions {
+				Permission::None => {
 					bail!(Error::BucketPermissions {
 						name: self.bucket.name.to_string(),
 						op,
 					})
 				}
-				PhysicalPermission::Allow => (),
-				PhysicalPermission::Conditional(expr) => {
+				Permission::Full => (),
+				Permission::Specific(e) => {
+					let expr = Planner::new(self.exec_ctx.ctx()).physical_expr(e.clone()).await?;
 					let mut exec_ctx =
 						self.exec_ctx.with_param("action", Value::from(op.to_string()));
 					if let Some(key) = key {
