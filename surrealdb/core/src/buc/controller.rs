@@ -244,7 +244,7 @@ impl<'a> BucketController<'a> {
 	/// The listing can be filtered by prefix and paginated using start key and limit.
 	/// Note: Guest and Record users are not allowed to list files in buckets.
 	pub(crate) async fn list(&mut self, opts: &ListOptions) -> Result<Vec<ObjectMeta>> {
-		self.check_permission(BucketOperation::Exists, None, None).await?;
+		self.check_permission(BucketOperation::List, None, None).await?;
 		self.store
 			.list(opts)
 			.await
