@@ -2737,6 +2737,511 @@ mod http_integration {
 		}
 	}
 
+	async fn start_bucket_permission_test_server(
+		planner_strategy: Option<&str>,
+	) -> Result<(String, common::Child, Client), Box<dyn std::error::Error>> {
+		const NS: &str = "bucket_permission_ns";
+		const DB: &str = "bucket_permission_db";
+
+		let mut args = "--allow-experimental files".to_string();
+		if let Some(planner_strategy) = planner_strategy {
+			args.push_str(&format!(" --planner-strategy {planner_strategy}"));
+		}
+		let (addr, server) = common::start_server(StartServerArguments {
+			args,
+			..Default::default()
+		})
+		.await?;
+
+		let mut headers = reqwest::header::HeaderMap::new();
+		headers.insert("surreal-ns", NS.parse()?);
+		headers.insert("surreal-db", DB.parse()?);
+		headers.insert(header::ACCEPT, "application/json".parse()?);
+		let client = reqwest::Client::builder()
+			.connect_timeout(Duration::from_millis(10))
+			.default_headers(headers)
+			.build()?;
+
+		Ok((addr, server, client))
+	}
+
+	async fn root_sql(
+		client: &Client,
+		addr: &str,
+		query: &str,
+	) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+		let res = client
+			.post(format!("http://{addr}/sql"))
+			.basic_auth(USER, Some(PASS))
+			.body(query.to_string())
+			.send()
+			.await?;
+		assert!(res.status().is_success(), "root SQL HTTP request failed: {}", res.status());
+		Ok(res.json().await?)
+	}
+
+	async fn record_sql(
+		client: &Client,
+		addr: &str,
+		token: &str,
+		query: &str,
+	) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+		let res = client
+			.post(format!("http://{addr}/sql"))
+			.header(header::AUTHORIZATION, format!("Bearer {token}"))
+			.body(query.to_string())
+			.send()
+			.await?;
+		assert!(res.status().is_success(), "record SQL HTTP request failed: {}", res.status());
+		Ok(res.json().await?)
+	}
+
+	async fn signin_bucket_record_user(
+		client: &Client,
+		addr: &str,
+	) -> Result<String, Box<dyn std::error::Error>> {
+		let res = client
+			.post(format!("http://{addr}/rpc"))
+			.header(header::CONTENT_TYPE, "application/json")
+			.body(
+				json!({
+					"id": "bucket-permission-signin",
+					"method": "signin",
+					"params": [{
+						"ns": "bucket_permission_ns",
+						"db": "bucket_permission_db",
+						"ac": "user",
+						"email": "bob@example.com",
+						"password": "pw"
+					}]
+				})
+				.to_string(),
+			)
+			.send()
+			.await?;
+		assert!(res.status().is_success(), "signin RPC HTTP request failed: {}", res.status());
+		let body: serde_json::Value = res.json().await?;
+		assert!(body.get("error").is_none(), "record signin must succeed: {body}");
+		let token = body
+			.get("result")
+			.and_then(|v| v.get("access").or(Some(v)))
+			.and_then(|v| v.as_str())
+			.unwrap_or_else(|| panic!("signin must return a token: {body}"));
+		Ok(token.to_owned())
+	}
+
+	async fn setup_bucket_permission_fixture(
+		client: &Client,
+		addr: &str,
+	) -> Result<String, Box<dyn std::error::Error>> {
+		let body = root_sql(
+			client,
+			addr,
+			r#"
+					DEFINE ACCESS user ON DATABASE TYPE RECORD
+						SIGNIN (
+							SELECT * FROM user
+							WHERE email = string::lowercase($email)
+								AND crypto::argon2::compare(password_hash, $password)
+						)
+						WITH JWT ALGORITHM HS512 KEY "test-key"
+						DURATION FOR TOKEN 1h, FOR SESSION 12h;
+					DEFINE TABLE user PERMISSIONS FOR select WHERE id = $auth.id;
+					CREATE user:bob SET
+						email = "bob@example.com",
+						password_hash = crypto::argon2::generate("pw"),
+						enabled = true;
+				"#,
+		)
+		.await?;
+		assert_all_sql_ok(&body, "record access setup");
+
+		let body = root_sql(
+			client,
+			addr,
+			r#"
+					DEFINE BUCKET deny_where BACKEND "memory" PERMISSIONS WHERE false;
+					f"deny_where:/secret.txt".put("DENY-ME");
+
+					DEFINE BUCKET file_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "get" AND $file = f"file_gate:/allowed.txt";
+					f"file_gate:/allowed.txt".put("ALLOWED");
+					f"file_gate:/denied.txt".put("DENIED");
+
+					DEFINE BUCKET head_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "head" AND $file = f"head_gate:/allowed.txt";
+					f"head_gate:/allowed.txt".put("HEAD");
+					f"head_gate:/denied.txt".put("HEAD-DENIED");
+
+					DEFINE BUCKET exists_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "exists" AND $file = f"exists_gate:/allowed.txt";
+					f"exists_gate:/allowed.txt".put("EXISTS");
+					f"exists_gate:/denied.txt".put("EXISTS-DENIED");
+
+					DEFINE BUCKET write_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "put" AND $file = f"write_gate:/allowed.txt";
+
+					DEFINE BUCKET delete_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "delete" AND $file = f"delete_gate:/allowed.txt";
+					f"delete_gate:/allowed.txt".put("DELETE");
+					f"delete_gate:/denied.txt".put("DELETE-DENIED");
+
+					DEFINE BUCKET target_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "copy"
+							AND $file = f"target_gate:/source.txt"
+							AND $target = f"target_gate:/allowed-copy.txt";
+					f"target_gate:/source.txt".put("SOURCE");
+
+					DEFINE BUCKET rename_gate BACKEND "memory"
+						PERMISSIONS WHERE $action = "rename"
+							AND $file = f"rename_gate:/source.txt"
+							AND $target = f"rename_gate:/allowed-rename.txt";
+					f"rename_gate:/source.txt".put("RENAME");
+					f"rename_gate:/denied-source.txt".put("RENAME-DENIED");
+
+					DEFINE BUCKET list_full BACKEND "memory" PERMISSIONS FULL;
+					f"list_full:/visible.txt".put("VISIBLE");
+				"#,
+		)
+		.await?;
+		assert_all_sql_ok(&body, "bucket permission fixture setup");
+
+		signin_bucket_record_user(client, addr).await
+	}
+
+	fn assert_all_sql_ok(body: &serde_json::Value, context: &str) {
+		let results =
+			body.as_array().unwrap_or_else(|| panic!("{context}: body must be an array: {body}"));
+		for result in results {
+			assert_eq!(
+				result.get("status").and_then(|v| v.as_str()),
+				Some("OK"),
+				"{context}: {body}"
+			);
+		}
+	}
+
+	fn assert_single_sql_ok<'a>(
+		body: &'a serde_json::Value,
+		context: &str,
+	) -> &'a serde_json::Value {
+		let results =
+			body.as_array().unwrap_or_else(|| panic!("{context}: body must be an array: {body}"));
+		assert_eq!(results.len(), 1, "{context}: expected one SQL result: {body}");
+		let result = &results[0];
+		assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("OK"), "{context}: {body}");
+		result.get("result").unwrap_or_else(|| panic!("{context}: result missing: {body}"))
+	}
+
+	fn assert_single_sql_err_contains(body: &serde_json::Value, needle: &str, context: &str) {
+		let results =
+			body.as_array().unwrap_or_else(|| panic!("{context}: body must be an array: {body}"));
+		assert_eq!(results.len(), 1, "{context}: expected one SQL result: {body}");
+		let result = &results[0];
+		assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("ERR"), "{context}: {body}");
+		let message = result.get("result").map(ToString::to_string).unwrap_or_default();
+		assert!(
+			message.contains(needle),
+			"{context}: expected error to contain {needle:?}, got: {body}"
+		);
+	}
+
+	#[test(tokio::test)]
+	async fn bucket_where_permissions_deny_record_users_in_streaming_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) = start_bucket_permission_test_server(None).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN <string>f"deny_where:/secret.txt".get();"#).await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "root users bypass bucket permissions"),
+			"DENY-ME",
+			"root/system users must retain the documented fine-grained permission bypass"
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"RETURN <string>f"deny_where:/secret.txt".get();"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"record user must not read a bucket denied by PERMISSIONS WHERE false",
+		);
+
+		let body =
+			record_sql(&client, &addr, &token, r#"f"deny_where:/secret.txt".put("OVERWRITE");"#)
+				.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"record user must not write a bucket denied by PERMISSIONS WHERE false",
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn bucket_action_and_file_variables_gate_reads_in_streaming_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) = start_bucket_permission_test_server(None).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"RETURN <string>f"file_gate:/allowed.txt".get();"#,
+		)
+		.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "$action and $file allow matching reads"),
+			"ALLOWED"
+		);
+
+		let body =
+			record_sql(&client, &addr, &token, r#"RETURN <string>f"file_gate:/denied.txt".get();"#)
+				.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"$file must deny non-matching file pointers",
+		);
+
+		let body =
+			record_sql(&client, &addr, &token, r#"RETURN file::head(f"head_gate:/allowed.txt");"#)
+				.await?;
+		assert_single_sql_ok(&body, "$action and $file allow matching metadata reads");
+
+		let body =
+			record_sql(&client, &addr, &token, r#"RETURN file::head(f"head_gate:/denied.txt");"#)
+				.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"head must deny non-matching file pointers",
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"RETURN file::exists(f"exists_gate:/allowed.txt");"#,
+		)
+		.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "$action and $file allow matching existence checks"),
+			true
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"RETURN file::exists(f"exists_gate:/denied.txt");"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"exists must deny non-matching file pointers",
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn bucket_action_and_file_variables_gate_writes_in_streaming_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) = start_bucket_permission_test_server(None).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::put(f"write_gate:/allowed.txt", "WRITE-ALLOWED");"#,
+		)
+		.await?;
+		assert_single_sql_ok(&body, "$action and $file allow matching writes");
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN <string>f"write_gate:/allowed.txt".get();"#).await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "allowed record write persists expected bytes"),
+			"WRITE-ALLOWED"
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::put(f"write_gate:/denied.txt", "WRITE-DENIED");"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"put must deny non-matching file pointers",
+		);
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN file::exists(f"write_gate:/denied.txt");"#).await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "denied record write must not create the target file"),
+			false
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::put_if_not_exists(f"write_gate:/allowed-if-missing.txt", "WRITE-IF-MISSING");"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"put_if_not_exists must bind the same put action and file pointer",
+		);
+
+		let body =
+			record_sql(&client, &addr, &token, r#"file::delete(f"delete_gate:/allowed.txt");"#)
+				.await?;
+		assert_single_sql_ok(&body, "$action and $file allow matching deletes");
+
+		let body = root_sql(&client, &addr, r#"RETURN file::exists(f"delete_gate:/allowed.txt");"#)
+			.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "allowed record delete removes the target file"),
+			false
+		);
+
+		let body =
+			record_sql(&client, &addr, &token, r#"file::delete(f"delete_gate:/denied.txt");"#)
+				.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"delete must deny non-matching file pointers",
+		);
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN file::exists(f"delete_gate:/denied.txt");"#).await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "denied record delete must leave the source file intact"),
+			true
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn bucket_target_variable_gates_copy_and_rename_in_streaming_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) = start_bucket_permission_test_server(None).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::copy(f"target_gate:/source.txt", "allowed-copy.txt");"#,
+		)
+		.await?;
+		assert_single_sql_ok(&body, "$target allows matching copy target");
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN <string>f"target_gate:/allowed-copy.txt".get();"#)
+				.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "allowed copy persists the expected bytes"),
+			"SOURCE"
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::copy(f"target_gate:/source.txt", "denied-copy.txt");"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"$target must deny non-matching copy targets",
+		);
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN file::exists(f"target_gate:/denied-copy.txt");"#)
+				.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "denied copy must not create the target file"),
+			false
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::rename(f"rename_gate:/source.txt", "allowed-rename.txt");"#,
+		)
+		.await?;
+		assert_single_sql_ok(&body, "$target allows matching rename target");
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN <string>f"rename_gate:/allowed-rename.txt".get();"#)
+				.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "allowed rename moves the expected bytes"),
+			"RENAME"
+		);
+
+		let body = record_sql(
+			&client,
+			&addr,
+			&token,
+			r#"file::rename(f"rename_gate:/denied-source.txt", "denied-rename.txt");"#,
+		)
+		.await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"$target must deny non-matching rename targets",
+		);
+
+		let body =
+			root_sql(&client, &addr, r#"RETURN file::exists(f"rename_gate:/denied-rename.txt");"#)
+				.await?;
+		assert_eq!(
+			assert_single_sql_ok(&body, "denied rename must not create the target file"),
+			false
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn bucket_list_is_denied_for_record_users_in_compute_only_planner()
+	-> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server, client) =
+			start_bucket_permission_test_server(Some("compute-only")).await?;
+		let token = setup_bucket_permission_fixture(&client, &addr).await?;
+
+		let body = record_sql(&client, &addr, &token, r#"file::list("list_full");"#).await?;
+		assert_single_sql_err_contains(
+			&body,
+			"permission",
+			"record users must not list bucket contents even when bucket permissions are FULL",
+		);
+
+		Ok(())
+	}
+
 	#[test(tokio::test)]
 	async fn arbitrary_query_capabilities() {
 		// Allow system
