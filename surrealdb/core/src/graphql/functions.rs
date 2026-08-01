@@ -18,7 +18,7 @@ use super::utils::execute_plan;
 use crate::catalog::FunctionDefinition;
 use crate::dbs::Session;
 use crate::expr::{Expr, FunctionCall, Kind, LogicalPlan, TopLevelExpr};
-use crate::graphql::schema::kind_to_type_with_enum_prefix;
+use crate::graphql::schema::{TableTypeNames, kind_to_type_with_enum_prefix};
 use crate::kvs::Datastore;
 use crate::val::Value;
 
@@ -35,6 +35,7 @@ pub async fn process_fns(
 	mut query: Object,
 	types: &mut Vec<Type>,
 	datastore: &Arc<Datastore>,
+	table_types: &TableTypeNames,
 ) -> Result<Object, GraphqlError> {
 	for fnd in fns.iter() {
 		let Some(kind) = &fnd.returns else {
@@ -66,6 +67,7 @@ pub async fn process_fns(
 				types,
 				false,
 				Some(&format!("fn_{}_return", fnd.name)),
+				table_types,
 			)?,
 			move |ctx| {
 				let kvs1 = Arc::clone(&kvs1);
@@ -145,6 +147,7 @@ pub async fn process_fns(
 				types,
 				true,
 				Some(&format!("fn_{}_{}", fnd.name, arg_name)),
+				table_types,
 			)?;
 			field = field.argument(InputValue::new(arg_name, arg_ty))
 		}

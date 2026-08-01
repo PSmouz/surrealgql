@@ -127,6 +127,21 @@ pub(crate) fn field_graphql_name(fd: &FieldDefinition) -> String {
 	field_base_name(fd)
 }
 
+/// Field name exposed on a generated *nested* Object type for a sub-field
+/// declared as `parent.child` (or `parent.*.child`).
+///
+/// Such a field is addressed by the last segment of its idiom rather than by
+/// the whole idiom, so it cannot go through [`field_base_name`], whose fallback
+/// flattens the full path (`price.in_euro` → `price_in_euro`). An explicit
+/// `GRAPHQL_ALIAS` still wins, exactly as it does for a top-level field
+/// (#7453); `lookup_name` is the raw segment used otherwise.
+pub(crate) fn nested_field_graphql_name(fd: &FieldDefinition, lookup_name: &str) -> String {
+	match fd.graphql_alias.as_deref() {
+		Some(alias) if is_valid_graphql_identifier(alias) => alias.to_owned(),
+		_ => lookup_name.to_owned(),
+	}
+}
+
 /// Plural query field name — the table list query (e.g. `stores`).
 ///
 /// When `GRAPHQL <alias>` is set on the table the alias is treated as the

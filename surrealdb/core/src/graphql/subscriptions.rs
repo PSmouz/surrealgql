@@ -110,12 +110,15 @@ fn make_table_subscription_field(
 	fds: Arc<[FieldDefinition]>,
 ) -> SubscriptionField {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.as_str().to_string();
-	let table_filter_name = filter_name_from_table(&tb_name);
+	// The subscription field and its payload type follow the table's GraphQL
+	// name, so a `GRAPHQL_ALIAS` reaches them too (#7453).
+	let gql_name: Arc<str> = Arc::from(super::naming::table_base_name(tb));
+	let table_filter_name = filter_name_from_table(&gql_name);
 	let selectable_fields = selectable_top_level_fields(&fds);
 
-	SubscriptionField::new(tb_name_str.clone(), TypeRef::named(&tb_name_str), move |ctx| {
+	SubscriptionField::new(gql_name.to_string(), TypeRef::named(gql_name.as_ref()), move |ctx| {
 		let tb_name = tb_name.clone();
+		let gql_name = Arc::clone(&gql_name);
 		let fds = Arc::clone(&fds);
 		let selectable_fields = selectable_fields.clone();
 		SubscriptionFieldFuture::new(async move {
@@ -130,7 +133,7 @@ fn make_table_subscription_field(
 
 			let live_sess = sess.as_ref().clone().with_rt(true);
 			let fields = projected_live_fields(&ctx, &selectable_fields);
-			let cond = parse_subscription_cond(args, &fds, &tb_name)?;
+			let cond = parse_subscription_cond(args, &fds, &tb_name, &gql_name)?;
 			let fetch = parse_fetch_arg(args)?;
 			let live_id =
 				start_table_live_query(ds, &live_sess, &tb_name, fields, cond, fetch).await?;
@@ -210,9 +213,12 @@ fn parse_subscription_cond(
 	args: &IndexMap<Name, GraphqlValue>,
 	fds: &[FieldDefinition],
 	tb_name: &TableName,
+	gql_name: &str,
 ) -> Result<Option<Cond>, async_graphql::Error> {
 	let id_cond = parse_id_cond(args, tb_name)?;
-	let where_cond = parse_filter_arg(args, fds, tb_name.as_str(), &[])
+	// The `where` argument is typed by `_filter_<gql_name>`, so its enum scope
+	// has to be the table's GraphQL name rather than the SurrealQL one (#7453).
+	let where_cond = parse_filter_arg(args, fds, gql_name, &[])
 		.map_err(|e| async_graphql::Error::new(e.to_string()))?;
 	Ok(combine_cond(id_cond, where_cond))
 }

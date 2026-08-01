@@ -84,8 +84,8 @@ use crate::expr::{
 };
 use crate::graphql::error::internal_error;
 use crate::graphql::schema::{
-	filter_type_name, geometry_graphql_type_name, kind_to_type, kind_to_type_with_enum_prefix,
-	unwrap_type,
+	TableTypeNames, filter_type_name, geometry_graphql_type_name, kind_to_type,
+	kind_to_type_with_enum_prefix, unwrap_type,
 };
 use crate::graphql::utils::{GraphqlValueUtils, execute_plan};
 use crate::kvs::Datastore;
@@ -453,8 +453,13 @@ async fn execute_select(
 
 /// Information about a sub-field of a nested object type.
 struct NestedSubField {
-	/// The GraphQL field name (e.g., "createdAt").
+	/// The GraphQL field name — the `GRAPHQL_ALIAS` when one is set, otherwise
+	/// the same as [`lookup_name`](Self::lookup_name).
 	name: String,
+	/// The key this sub-field is stored under inside the parent `SurObject`,
+	/// i.e. the last segment of the SurrealQL idiom (e.g. `in_euro`). Differs
+	/// from [`name`](Self::name) whenever the field is aliased.
+	lookup_name: String,
 	/// The field's SurrealDB kind, if defined.
 	kind: Option<Kind>,
 	/// Optional comment from the field definition.
@@ -526,7 +531,8 @@ fn detect_nested_objects(
 		parent_has_wildcard.entry(parent_name.clone()).or_insert(has_wildcard);
 
 		children_by_parent.entry(parent_name.clone()).or_default().push(NestedSubField {
-			name: child_name,
+			name: super::naming::nested_field_graphql_name(fd, &child_name),
+			lookup_name: child_name,
 			kind: fd.field_kind.clone(),
 			comment: fd.comment.clone(),
 		});
@@ -609,10 +615,14 @@ fn detect_nested_objects(
 			None => continue,
 		};
 
+		// Literal-object shapes are declared inline on the parent field's type,
+		// so there is no per-sub-field `DEFINE FIELD` to carry a
+		// `GRAPHQL_ALIAS`; the GraphQL name is always the raw key.
 		let sub_fields: Vec<NestedSubField> = literal_map
 			.iter()
 			.map(|(k, v)| NestedSubField {
 				name: k.as_str().to_owned(),
+				lookup_name: k.as_str().to_owned(),
 				kind: Some(v.clone()),
 				comment: None,
 			})
@@ -677,6 +687,7 @@ fn make_nested_object_type(
 	type_name: &str,
 	sub_fields: &[NestedSubField],
 	types: &mut Vec<Type>,
+	table_types: &TableTypeNames,
 ) -> Result<Object, GraphqlError> {
 	let mut obj = Object::new(type_name);
 
@@ -685,8 +696,16 @@ fn make_nested_object_type(
 			continue;
 		};
 		let enum_scope = format!("{type_name}_{}", sf.name);
-		let fd_type = kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?;
-		let resolver = make_sub_field_resolver(sf.name.clone(), sf.kind.clone(), Some(enum_scope));
+		let fd_type = kind_to_type_with_enum_prefix(
+			kind.clone(),
+			types,
+			false,
+			Some(&enum_scope),
+			table_types,
+		)?;
+		// The resolver keys off the storage name, which an alias does not change.
+		let resolver =
+			make_sub_field_resolver(sf.lookup_name.clone(), sf.kind.clone(), Some(enum_scope));
 		let mut field = Field::new(&sf.name, fd_type, resolver);
 		if let Some(ref comment) = sf.comment {
 			field = field.description(comment.clone());
@@ -724,7 +743,7 @@ fn make_sub_field_resolver(
 						});
 						let field_val = match field_kind {
 							Some(Kind::Record(ref ts)) if ts.is_empty() || ts.len() > 1 => {
-								field_val.with_type(rid.table.clone())
+								field_val.with_type(graphql_type_of(&ctx, &rid.table))
 							}
 							_ => field_val,
 						};
@@ -836,6 +855,18 @@ pub(crate) fn filter_name_from_table(tb_name: impl Display) -> String {
 	format!("_filter_{tb_name}")
 }
 
+/// Resolve a record's table to the GraphQL Object type generated for it.
+///
+/// Used by resolvers that tag a value with its concrete type for interface or
+/// union resolution: they only have the record ID to hand, and the type name
+/// follows the table's `GRAPHQL_ALIAS` when it sets one (#7453). Falls back to
+/// the raw table name if the map is missing, which is what the type name was
+/// before aliases reached it.
+fn graphql_type_of(ctx: &ResolverContext<'_>, table: &TableName) -> String {
+	ctx.data::<Arc<TableTypeNames>>()
+		.map_or_else(|_| table.as_str().to_owned(), |m| m.get(table.as_str()).to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Result conversion helpers
 // ---------------------------------------------------------------------------
@@ -895,16 +926,19 @@ fn make_table_list_field(
 	kvs: Arc<Datastore>,
 ) -> Field {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.as_str().to_string();
-	let table_order_name = format!("_order_{tb_name}");
-	let table_filter_name = filter_name_from_table(&tb_name);
+	// GraphQL-facing base name for every type and scope generated from this
+	// table (#7453). Distinct from `tb_name`, which stays the SurrealQL table
+	// the query actually runs against.
+	let gql_name: Arc<str> = Arc::from(super::naming::table_base_name(tb));
+	let table_order_name = format!("_order_{gql_name}");
+	let table_filter_name = filter_name_from_table(&gql_name);
 	// Apply the naming convention (#4552) plus any explicit
-	// `GRAPHQL <ident>` alias (#4537). The underlying Object type stays as
-	// the source table name so cross-table `record<T>` references remain valid.
+	// `GRAPHQL <ident>` alias (#4537).
 	let field_name = super::naming::list_field_name(tb);
 
-	Field::new(field_name, TypeRef::named_nn_list_nn(&tb_name_str), move |ctx| {
+	Field::new(field_name, TypeRef::named_nn_list_nn(gql_name.as_ref()), move |ctx| {
 		let tb_name = tb_name.clone();
+		let gql_name = Arc::clone(&gql_name);
 		let fds = Arc::clone(&fds);
 		let rel_filters = Arc::clone(&rel_filters);
 		let kvs = Arc::clone(&kvs);
@@ -917,8 +951,7 @@ fn make_table_list_field(
 			let limit = parse_limit_arg(args);
 			let version = parse_version_arg(args)?;
 			let order = parse_order_arg(args, &fds)?;
-			let tb_name_str_ref = tb_name.as_str();
-			let cond = parse_filter_arg(args, &fds, tb_name_str_ref, &rel_filters)?;
+			let cond = parse_filter_arg(args, &fds, &gql_name, &rel_filters)?;
 
 			trace!("parsed order: {order:?}");
 			trace!("parsed filter: {cond:?}");
@@ -959,10 +992,10 @@ fn make_table_list_field(
 /// or `null` if the record does not exist.
 fn make_table_get_field(tb: &TableDefinition, kvs: Arc<Datastore>) -> Field {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.as_str().to_string();
+	let gql_name = super::naming::table_base_name(tb).to_owned();
 
 	let field_name = super::naming::get_field_name(tb);
-	Field::new(field_name, TypeRef::named(&tb_name_str), move |ctx| {
+	Field::new(field_name, TypeRef::named(gql_name), move |ctx| {
 		let tb_name = tb_name.clone();
 		let kvs = Arc::clone(&kvs);
 		FieldFuture::new(async move {
@@ -1056,14 +1089,14 @@ fn make_generic_get_field(kvs: Arc<Datastore>) -> Field {
 						Some(Value::RecordId(rid)) => rid.clone(),
 						_ => return Ok(None),
 					};
-					let table_name = rid.table.clone();
+					let type_name = graphql_type_of(&ctx, &rid.table);
 					Ok(Some(
 						FieldValue::owned_any(CachedRecord {
 							rid,
 							version,
 							data: obj,
 						})
-						.with_type(table_name),
+						.with_type(type_name),
 					))
 				}
 				_ => Ok(None),
@@ -1110,15 +1143,21 @@ fn build_table_type(
 	exposed_table_names: &HashSet<TableName>,
 	relation_table_fds: &HashMap<TableName, Arc<[FieldDefinition]>>,
 	types: &mut Vec<Type>,
+	table_types: &TableTypeNames,
 ) -> Result<TableGraphQLTypes, GraphqlError> {
 	let tb_name = &tb.name;
 	let tb_name_str = tb_name.as_str().to_string();
+	// Base name for every GraphQL type and enum scope generated below — the
+	// `GRAPHQL_ALIAS` when the table sets one, else the table name (#7453).
+	// `tb_name` / `tb_name_str` stay the raw SurrealQL name and are only used
+	// to address the table itself.
+	let gql_name = super::naming::table_base_name(tb).to_owned();
 
 	// --- Create initial types ---
 
-	let table_orderable_name = format!("_orderable_{tb_name}");
-	let table_order_name = format!("_order_{tb_name}");
-	let table_filter_name = filter_name_from_table(tb_name);
+	let table_orderable_name = format!("_orderable_{gql_name}");
+	let table_order_name = format!("_order_{gql_name}");
+	let table_filter_name = filter_name_from_table(&gql_name);
 
 	let mut orderable = Enum::new(&table_orderable_name).item("id").description(format!(
 		"Generated from `{tb_name}` the fields which a query can be ordered by"
@@ -1139,7 +1178,7 @@ fn build_table_type(
 	// `_filter_id` is registered once globally in `register_filter_helper_types`,
 	// not per-table — it's the same shape for every table.
 
-	let mut ty_obj = Object::new(&tb_name_str)
+	let mut ty_obj = Object::new(&gql_name)
 		.field(Field::new(
 			"id",
 			TypeRef::named_nn(TypeRef::ID),
@@ -1152,7 +1191,7 @@ fn build_table_type(
 
 	// --- Process field definitions ---
 
-	let nested_objects = detect_nested_objects(&tb_name_str, fds);
+	let nested_objects = detect_nested_objects(&gql_name, fds);
 
 	for fd in fds.iter() {
 		let Some(ref kind) = fd.field_kind else {
@@ -1179,8 +1218,12 @@ fn build_table_type(
 		// alias, so two columns aliased the same way would conflict — that's
 		// caught at schema build time by async-graphql.
 		if let Some(nested) = nested_objects.get(lookup_name.as_str()) {
-			let nested_type =
-				make_nested_object_type(&nested.graphql_type_name, &nested.sub_fields, types)?;
+			let nested_type = make_nested_object_type(
+				&nested.graphql_type_name,
+				&nested.sub_fields,
+				types,
+				table_types,
+			)?;
 			types.push(Type::Object(nested_type));
 
 			let fd_type = if nested.is_array {
@@ -1212,8 +1255,14 @@ fn build_table_type(
 		}
 
 		// Handle regular fields
-		let enum_scope = format!("{}_{}", tb_name_str, fd_name);
-		let fd_type = kind_to_type_with_enum_prefix(kind.clone(), types, false, Some(&enum_scope))?;
+		let enum_scope = format!("{gql_name}_{fd_name}");
+		let fd_type = kind_to_type_with_enum_prefix(
+			kind.clone(),
+			types,
+			false,
+			Some(&enum_scope),
+			table_types,
+		)?;
 		orderable = orderable.item(fd_name.to_string());
 
 		let type_filter_name = format!("_filter_{}", filter_type_name(&fd_type));
@@ -1227,6 +1276,7 @@ fn build_table_type(
 				type_filter_name.clone(),
 				types,
 				Some(&enum_scope),
+				table_types,
 			)?);
 			trace!("\n{type_filter:?}\n");
 			types.push(type_filter);
@@ -1255,9 +1305,10 @@ fn build_table_type(
 		if !exposed_table_names.contains(&rel.table_name) {
 			continue;
 		}
-		// Only allocate the `String` form once we know we'll use
-		// it for the GraphQL field/type names below.
-		let rel_table_str = rel.table_name.as_str().to_owned();
+		// The relation table's own GraphQL name — its `GRAPHQL_ALIAS` when it
+		// sets one (#7453). Names both the traversal field added here and the
+		// Object type the field resolves to.
+		let rel_table_str = table_types.get(rel.table_name.as_str()).to_owned();
 
 		let rel_fds = relation_table_fds.get(&rel.table_name).cloned();
 
@@ -1274,7 +1325,7 @@ fn build_table_type(
 					rel_fds.clone(),
 				));
 				let rel_filter_name =
-					register_relation_filter(&tb_name_str, &field_name, "out", types);
+					register_relation_filter(&gql_name, &field_name, "out", types);
 				filter = filter
 					.field(InputValue::new(field_name.clone(), TypeRef::named(rel_filter_name)));
 				rel_filters.push(RelationFieldInfo {
@@ -1303,8 +1354,7 @@ fn build_table_type(
 					RelationDirection::Incoming,
 					rel_fds.clone(),
 				));
-				let rel_filter_name =
-					register_relation_filter(&tb_name_str, &field_name, "in", types);
+				let rel_filter_name = register_relation_filter(&gql_name, &field_name, "in", types);
 				filter = filter
 					.field(InputValue::new(field_name.clone(), TypeRef::named(rel_filter_name)));
 				rel_filters.push(RelationFieldInfo {
@@ -1368,6 +1418,7 @@ pub async fn process_tbs(
 	ctx: &SchemaContext<'_>,
 	relations: &[RelationInfo],
 	table_fields: &mut HashMap<TableName, Arc<[FieldDefinition]>>,
+	table_types: &TableTypeNames,
 ) -> Result<Object, GraphqlError> {
 	// Pre-fetch field definitions for relation tables (needed for filter support
 	// in relation field resolvers). These are captured by the resolver closures.
@@ -1432,7 +1483,9 @@ pub async fn process_tbs(
 			let list = super::naming::list_field_name(tb);
 			let get = super::naming::get_field_name(tb);
 			let conn_field = format!("{list}Connection");
-			let aggregate = format!("{}_aggregate", tb.name.as_str());
+			// Matches `make_table_aggregate_field`, which prefixes the aggregate
+			// field with the list-field name rather than the raw table name.
+			let aggregate = aggregate_field_name(&list);
 			for name in [list, get, conn_field, aggregate] {
 				if let Some(prior) = seen.get(&name) {
 					let prior_desc = if prior == BUILTIN {
@@ -1453,10 +1506,10 @@ pub async fn process_tbs(
 			// two tables both produces `FooConnection` / `FooEdge`. The
 			// table's own Object type also collides if aliased to a built-in
 			// like `PageInfo`.
-			// The table's own Object type uses the raw table name (see
-			// `Object::new(&tb_name_str)` in `build_table_type`), so the
-			// collision surface for the Object name is the raw `tb.name`.
-			let tb_ty = tb.name.as_str().to_owned();
+			// The Object type is named after the table's GraphQL name (see
+			// `Object::new(&gql_name)` in `build_table_type`), so that — not the
+			// raw `tb.name` — is the collision surface (#7453).
+			let tb_ty = super::naming::table_base_name(tb).to_owned();
 			let conn_ty = connection_type_name(tb);
 			let edge_ty = edge_type_name(tb);
 			for ty_name in [tb_ty, conn_ty, edge_ty] {
@@ -1492,6 +1545,7 @@ pub async fn process_tbs(
 			&exposed_table_names,
 			&relation_table_fds,
 			types,
+			table_types,
 		)?;
 		let rel_filters: Arc<[RelationFieldInfo]> = tt.rel_filters.into();
 		types.push(Type::Object(tt.ty_obj));
@@ -1511,7 +1565,8 @@ pub async fn process_tbs(
 		// Aggregation query field — `<table_plural>_aggregate` returns
 		// `[{Table}AggregateRow!]!` with count + per-numeric-field stats and
 		// optional groupBy.  See `register_filter_helper_types` / Stage E.
-		let (agg_obj, agg_enum) = build_aggregate_type(tb.name.as_str(), &fds, types);
+		let (agg_obj, agg_enum) =
+			build_aggregate_type(super::naming::table_base_name(tb), &fds, types, table_types);
 		types.push(Type::Object(agg_obj));
 		types.push(Type::Enum(agg_enum));
 		query = query.field(make_table_aggregate_field(
@@ -1645,7 +1700,7 @@ async fn resolve_field_value(
 					});
 					let field_val = match field_kind {
 						Some(Kind::Record(ts)) if ts.is_empty() || ts.len() > 1 => {
-							field_val.with_type(target_rid.table)
+							field_val.with_type(graphql_type_of(ctx, &target_rid.table))
 						}
 						_ => field_val,
 					};
@@ -1852,6 +1907,7 @@ fn filter_from_type(
 	filter_name: String,
 	types: &mut Vec<Type>,
 	enum_scope: Option<&str>,
+	table_types: &TableTypeNames,
 ) -> Result<InputObject, GraphqlError> {
 	// Normalise `option<record<T>>` (Kind::Either([None, Record([T])])) down to the
 	// inner record kind so filters are generated correctly with ID-based filtering.
@@ -1877,7 +1933,8 @@ fn filter_from_type(
 		Kind::Record(ts) => match ts.len() {
 			1 => (
 				TypeRef::named(filter_name_from_table(
-					ts.first().expect("ts should have exactly one element").as_str(),
+					table_types
+						.get(ts.first().expect("ts should have exactly one element").as_str()),
 				)),
 				true,
 			),
@@ -1887,9 +1944,16 @@ fn filter_from_type(
 		Kind::Array(inner, _) if matches!(**inner, Kind::Record(_)) => {
 			(TypeRef::named(TypeRef::ID), false)
 		}
-		k => {
-			(unwrap_type(kind_to_type_with_enum_prefix(k.clone(), types, true, enum_scope)?), true)
-		}
+		k => (
+			unwrap_type(kind_to_type_with_enum_prefix(
+				k.clone(),
+				types,
+				true,
+				enum_scope,
+				table_types,
+			)?),
+			true,
+		),
 	};
 
 	let mut filter = InputObject::new(filter_name);
@@ -2962,6 +3026,7 @@ fn build_aggregate_type(
 	tb_name: &str,
 	fds: &[FieldDefinition],
 	types: &mut Vec<Type>,
+	table_types: &TableTypeNames,
 ) -> (Object, Enum) {
 	let obj_name = aggregate_object_type_name(tb_name);
 	let mut obj = Object::new(&obj_name)
@@ -2989,7 +3054,7 @@ fn build_aggregate_type(
 		let kind = fd.field_kind.clone().unwrap_or(Kind::Any);
 		if is_numeric_kind(&kind) {
 			let inner = numeric_kind(&kind);
-			let ty_min_max = match kind_to_type(inner.clone(), types, false) {
+			let ty_min_max = match kind_to_type(inner.clone(), types, false, table_types) {
 				Ok(t) => unwrap_type(t),
 				Err(_) => TypeRef::named("number"),
 			};
@@ -3025,6 +3090,7 @@ fn build_aggregate_type(
 				types,
 				false,
 				Some(&format!("{tb_name}_{fname}")),
+				table_types,
 			) {
 				Ok(t) => unwrap_type(t),
 				Err(_) => TypeRef::named("any"),
@@ -3072,10 +3138,10 @@ fn make_table_aggregate_field(
 	kvs: Arc<Datastore>,
 ) -> Field {
 	let tb_name = tb.name.clone();
-	let tb_name_str = tb_name.as_str().to_string();
-	let table_filter_name = filter_name_from_table(&tb_name);
-	let aggregate_row_name = aggregate_object_type_name(&tb_name_str);
-	let groupable_enum_name = aggregate_groupable_enum_name(&tb_name_str);
+	let gql_name: Arc<str> = Arc::from(super::naming::table_base_name(tb));
+	let table_filter_name = filter_name_from_table(&gql_name);
+	let aggregate_row_name = aggregate_object_type_name(&gql_name);
+	let groupable_enum_name = aggregate_groupable_enum_name(&gql_name);
 	// The aggregate Query field uses the active list-field name as its prefix
 	// so it pluralises in Apollo mode and honours any explicit alias.
 	let field_name = aggregate_field_name(&super::naming::list_field_name(tb));
@@ -3088,6 +3154,7 @@ fn make_table_aggregate_field(
 
 	Field::new(field_name, TypeRef::named_nn_list_nn(&aggregate_row_name), move |ctx| {
 		let tb_name = tb_name.clone();
+		let gql_name = Arc::clone(&gql_name);
 		let fds = Arc::clone(&fds);
 		let rel_filters = Arc::clone(&rel_filters);
 		let kvs = Arc::clone(&kvs);
@@ -3096,8 +3163,7 @@ fn make_table_aggregate_field(
 			let sess = ctx.data::<Arc<Session>>()?;
 			let args = ctx.args.as_index_map();
 
-			let tb_name_str_ref = tb_name.as_str();
-			let cond = parse_filter_arg(args, &fds, tb_name_str_ref, &rel_filters)?;
+			let cond = parse_filter_arg(args, &fds, &gql_name, &rel_filters)?;
 
 			// Parse groupBy: list of enum tokens identifying groupable fields.
 			let mut group_keys: Vec<String> = Vec::new();
@@ -3204,7 +3270,8 @@ fn make_table_aggregate_field(
 		})
 	})
 	.description(format!(
-		"Aggregation query over `{tb_name_str}`. Returns `count` plus per-numeric-field `min/max/sum/avg`. Group rows by one or more non-numeric fields via the `groupBy` argument."
+		"Aggregation query over `{}`. Returns `count` plus per-numeric-field `min/max/sum/avg`. Group rows by one or more non-numeric fields via the `groupBy` argument.",
+		tb.name
 	))
 	.argument(InputValue::new("filter", TypeRef::named(&table_filter_name)))
 	.argument(InputValue::new("groupBy", TypeRef::named_list(&groupable_enum_name)))
@@ -3236,7 +3303,7 @@ fn build_connection_types(tb: &TableDefinition, types: &mut Vec<Type>) {
 	let tb_name_str = tb.name.as_str().to_string();
 	let connection_name = connection_type_name(tb);
 	let edge_name = edge_type_name(tb);
-	let node_type = tb_name_str.clone();
+	let node_type = super::naming::table_base_name(tb).to_owned();
 
 	// <Table>Edge { cursor: String!, node: <table>! }
 	let edge_obj = Object::new(&edge_name)
@@ -3409,12 +3476,14 @@ fn make_table_connection_field(
 ) -> Field {
 	let tb_name = tb.name.clone();
 	let tb_name_str = tb_name.as_str().to_string();
+	let gql_name: Arc<str> = Arc::from(super::naming::table_base_name(tb));
 	let connection_name = connection_type_name(tb);
-	let table_filter_name = filter_name_from_table(&tb_name);
+	let table_filter_name = filter_name_from_table(&gql_name);
 	let field_name = format!("{}Connection", super::naming::list_field_name(tb));
 
 	Field::new(field_name, TypeRef::named_nn(connection_name), move |ctx| {
 		let tb_name = tb_name.clone();
+		let gql_name = Arc::clone(&gql_name);
 		let fds = Arc::clone(&fds);
 		let rel_filters = Arc::clone(&rel_filters);
 		let kvs = Arc::clone(&kvs);
@@ -3422,7 +3491,7 @@ fn make_table_connection_field(
 			let sess = ctx.data::<Arc<Session>>()?;
 			let args = ctx.args.as_index_map();
 			let version = parse_version_arg(args)?;
-			let mut cond = parse_filter_arg(args, &fds, tb_name.as_str(), &rel_filters)?;
+			let mut cond = parse_filter_arg(args, &fds, &gql_name, &rel_filters)?;
 
 			let first = args.get("first").and_then(|v| v.as_i64());
 			let last = args.get("last").and_then(|v| v.as_i64());
