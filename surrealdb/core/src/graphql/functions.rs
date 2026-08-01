@@ -35,7 +35,7 @@ pub async fn process_fns(
 	mut query: Object,
 	types: &mut Vec<Type>,
 	datastore: &Arc<Datastore>,
-	table_types: &TableTypeNames,
+	table_types: &Arc<TableTypeNames>,
 ) -> Result<Object, GraphqlError> {
 	for fnd in fns.iter() {
 		let Some(kind) = &fnd.returns else {
@@ -51,6 +51,7 @@ pub async fn process_fns(
 		// resolvers in this crate.
 		let kvs1 = Arc::clone(datastore);
 		let fnd1 = fnd.clone();
+		let table_types1 = Arc::clone(table_types);
 		// Decided by the declared return type, which is fixed for the life of
 		// the schema — so it is resolved here rather than on every invocation.
 		let tag_record_type = returns_abstract_record(fnd.returns.as_ref());
@@ -75,6 +76,7 @@ pub async fn process_fns(
 			move |ctx| {
 				let kvs1 = Arc::clone(&kvs1);
 				let fnd1 = fnd1.clone();
+				let table_types1 = Arc::clone(&table_types1);
 				FieldFuture::new(async move {
 					let sess1 = ctx.data::<Arc<Session>>()?;
 					let graphql_args = ctx.args.as_index_map();
@@ -112,10 +114,11 @@ pub async fn process_fns(
 							let field_val = FieldValue::owned_any(rid.clone());
 							// The tag names the table's *generated Object type*,
 							// which follows its `GRAPHQL_ALIAS` rather than its
-							// SurrealQL name (#7453).
+							// SurrealQL name (#7453). The map is fixed for the life
+							// of the schema, so it is captured rather than looked
+							// up in the per-request context.
 							let field_val = if tag_record_type {
-								field_val
-									.with_type(super::tables::graphql_type_of(&ctx, &rid.table))
+								field_val.with_type(table_types1.get(rid.table.as_str()).to_owned())
 							} else {
 								field_val
 							};

@@ -81,6 +81,11 @@ pub(crate) struct SchemaContext<'a> {
 /// are not exposed through GraphQL are therefore left untouched, producing the
 /// same dangling type reference they did before (async-graphql reports those at
 /// schema-build time).
+///
+/// Built once per schema and shared by `Arc` with the resolvers that need it at
+/// runtime, rather than registered as schema data: it is derived from the same
+/// catalog snapshot the schema was built from and never varies per request, so
+/// a captured handle is both cheaper and impossible to look up wrongly.
 #[derive(Clone, Debug, Default)]
 pub struct TableTypeNames(HashMap<String, String>);
 
@@ -273,14 +278,7 @@ pub async fn generate_schema(
 		None
 	};
 
-	let mut schema = Schema::build("Query", mutation_name, subscription_name)
-		.register(query)
-		// Resolvers that tag a value with its concrete type (`FieldValue::with_type`)
-		// only have the record's raw table name to hand, so they resolve it to the
-		// generated Object type name through this. Schema-level rather than
-		// request-level data: it is derived from the same catalog snapshot the
-		// schema was built from, and is cached alongside it.
-		.data(Arc::clone(&table_types));
+	let mut schema = Schema::build("Query", mutation_name, subscription_name).register(query);
 
 	// Apply depth and complexity limits from the GraphQL config
 	if let Some(depth) = graphql_config.depth_limit {

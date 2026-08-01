@@ -687,7 +687,7 @@ fn make_nested_object_type(
 	type_name: &str,
 	sub_fields: &[NestedSubField],
 	types: &mut Vec<Type>,
-	table_types: &TableTypeNames,
+	table_types: &Arc<TableTypeNames>,
 ) -> Result<Object, GraphqlError> {
 	let mut obj = Object::new(type_name);
 
@@ -704,8 +704,12 @@ fn make_nested_object_type(
 			table_types,
 		)?;
 		// The resolver keys off the storage name, which an alias does not change.
-		let resolver =
-			make_sub_field_resolver(sf.lookup_name.clone(), sf.kind.clone(), Some(enum_scope));
+		let resolver = make_sub_field_resolver(
+			sf.lookup_name.clone(),
+			sf.kind.clone(),
+			Some(enum_scope),
+			Arc::clone(table_types),
+		);
 		let mut field = Field::new(&sf.name, fd_type, resolver);
 		if let Some(ref comment) = sf.comment {
 			field = field.description(comment.clone());
@@ -724,11 +728,13 @@ fn make_sub_field_resolver(
 	field_name: String,
 	kind: Option<Kind>,
 	enum_scope: Option<String>,
+	table_types: Arc<TableTypeNames>,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
 	move |ctx: ResolverContext| {
 		let field_name = field_name.clone();
 		let field_kind = kind.clone();
 		let enum_scope = enum_scope.clone();
+		let table_types = Arc::clone(&table_types);
 		FieldFuture::new(async move {
 			let obj = ctx.parent_value.try_downcast_ref::<SurObject>()?;
 
@@ -743,7 +749,7 @@ fn make_sub_field_resolver(
 						});
 						let field_val = match field_kind {
 							Some(Kind::Record(ref ts)) if ts.is_empty() || ts.len() > 1 => {
-								field_val.with_type(graphql_type_of(&ctx, &rid.table))
+								field_val.with_type(table_types.get(rid.table.as_str()).to_owned())
 							}
 							_ => field_val,
 						};
@@ -853,18 +859,6 @@ fn resolve_nested_object_value(
 /// Derive the GraphQL filter input type name for a table (e.g. `_filter_person`).
 pub(crate) fn filter_name_from_table(tb_name: impl Display) -> String {
 	format!("_filter_{tb_name}")
-}
-
-/// Resolve a record's table to the GraphQL Object type generated for it.
-///
-/// Used by resolvers that tag a value with its concrete type for interface or
-/// union resolution: they only have the record ID to hand, and the type name
-/// follows the table's `GRAPHQL_ALIAS` when it sets one (#7453). Falls back to
-/// the raw table name if the map is missing, which is what the type name was
-/// before aliases reached it.
-pub(super) fn graphql_type_of(ctx: &ResolverContext<'_>, table: &TableName) -> String {
-	ctx.data::<Arc<TableTypeNames>>()
-		.map_or_else(|_| table.as_str().to_owned(), |m| m.get(table.as_str()).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,9 +1051,10 @@ fn make_table_get_field(tb: &TableDefinition, kvs: Arc<Datastore>) -> Field {
 /// Unlike `_get_<table>`, this accepts a full record ID (e.g. `"person:alice"`)
 /// and returns the `record` interface type, requiring `.with_type()` to
 /// indicate the concrete table type.
-fn make_generic_get_field(kvs: Arc<Datastore>) -> Field {
+fn make_generic_get_field(kvs: Arc<Datastore>, table_types: Arc<TableTypeNames>) -> Field {
 	Field::new("_get", TypeRef::named("record"), move |ctx| {
 		let kvs = Arc::clone(&kvs);
+		let table_types = Arc::clone(&table_types);
 		FieldFuture::new(async move {
 			let sess = ctx.data::<Arc<Session>>()?;
 			let args = ctx.args.as_index_map();
@@ -1089,7 +1084,7 @@ fn make_generic_get_field(kvs: Arc<Datastore>) -> Field {
 						Some(Value::RecordId(rid)) => rid.clone(),
 						_ => return Ok(None),
 					};
-					let type_name = graphql_type_of(&ctx, &rid.table);
+					let type_name = table_types.get(rid.table.as_str()).to_owned();
 					Ok(Some(
 						FieldValue::owned_any(CachedRecord {
 							rid,
@@ -1143,7 +1138,7 @@ fn build_table_type(
 	exposed_table_names: &HashSet<TableName>,
 	relation_table_fds: &HashMap<TableName, Arc<[FieldDefinition]>>,
 	types: &mut Vec<Type>,
-	table_types: &TableTypeNames,
+	table_types: &Arc<TableTypeNames>,
 ) -> Result<TableGraphQLTypes, GraphqlError> {
 	let tb_name = &tb.name;
 	let tb_name_str = tb_name.as_str().to_string();
@@ -1182,7 +1177,12 @@ fn build_table_type(
 		.field(Field::new(
 			"id",
 			TypeRef::named_nn(TypeRef::ID),
-			make_table_field_resolver("id", Some(Kind::Record(vec![tb_name.clone()])), None),
+			make_table_field_resolver(
+				"id",
+				Some(Kind::Record(vec![tb_name.clone()])),
+				None,
+				Arc::clone(table_types),
+			),
 		))
 		.implement("record");
 
@@ -1286,7 +1286,12 @@ fn build_table_type(
 		let mut field = Field::new(
 			fd_name.as_str(),
 			fd_type,
-			make_table_field_resolver(&lookup_name, fd.field_kind.clone(), Some(enum_scope)),
+			make_table_field_resolver(
+				&lookup_name,
+				fd.field_kind.clone(),
+				Some(enum_scope),
+				Arc::clone(table_types),
+			),
 		);
 		if let Some(desc) = super::naming::description_with_deprecation(
 			fd.comment.as_deref(),
@@ -1418,7 +1423,7 @@ pub async fn process_tbs(
 	ctx: &SchemaContext<'_>,
 	relations: &[RelationInfo],
 	table_fields: &mut HashMap<TableName, Arc<[FieldDefinition]>>,
-	table_types: &TableTypeNames,
+	table_types: &Arc<TableTypeNames>,
 ) -> Result<Object, GraphqlError> {
 	// Pre-fetch field definitions for relation tables (needed for filter support
 	// in relation field resolvers). These are captured by the resolver closures.
@@ -1587,7 +1592,7 @@ pub async fn process_tbs(
 	}
 
 	// Add generic _get query field for fetching any record by full ID
-	query = query.field(make_generic_get_field(Arc::clone(ctx.datastore)));
+	query = query.field(make_generic_get_field(Arc::clone(ctx.datastore), Arc::clone(table_types)));
 
 	Ok(query)
 }
@@ -1610,12 +1615,14 @@ fn make_table_field_resolver(
 	fd_name: impl Into<String>,
 	kind: Option<Kind>,
 	enum_scope: Option<String>,
+	table_types: Arc<TableTypeNames>,
 ) -> impl for<'a> Fn(ResolverContext<'a>) -> FieldFuture<'a> + Send + Sync + 'static {
 	let fd_name = fd_name.into();
 	move |ctx: ResolverContext| {
 		let fd_name = fd_name.clone();
 		let field_kind = kind.clone();
 		let enum_scope = enum_scope.clone();
+		let table_types = Arc::clone(&table_types);
 		FieldFuture::new({
 			async move {
 				// ── Fast path: extract field from CachedRecord ──
@@ -1631,6 +1638,7 @@ fn make_table_field_resolver(
 						&fd_name,
 						&field_kind,
 						enum_scope.as_deref(),
+						&table_types,
 					)
 					.await;
 				}
@@ -1660,6 +1668,7 @@ fn make_table_field_resolver(
 					&field_kind,
 					&version,
 					enum_scope.as_deref(),
+					&table_types,
 				)
 				.await
 			}
@@ -1679,6 +1688,7 @@ async fn resolve_field_value(
 	field_kind: &Option<Kind>,
 	version: &Option<Datetime>,
 	enum_scope: Option<&str>,
+	table_types: &TableTypeNames,
 ) -> Result<Option<FieldValue<'static>>, async_graphql::Error> {
 	match val {
 		Value::RecordId(target_rid) if fd_name != "id" => {
@@ -1699,9 +1709,8 @@ async fn resolve_field_value(
 						data: obj,
 					});
 					let field_val = match field_kind {
-						Some(Kind::Record(ts)) if ts.is_empty() || ts.len() > 1 => {
-							field_val.with_type(graphql_type_of(ctx, &target_rid.table))
-						}
+						Some(Kind::Record(ts)) if ts.is_empty() || ts.len() > 1 => field_val
+							.with_type(table_types.get(target_rid.table.as_str()).to_owned()),
 						_ => field_val,
 					};
 					Ok(Some(field_val))
@@ -1741,9 +1750,11 @@ async fn resolve_field_from_cached_record(
 	fd_name: &str,
 	field_kind: &Option<Kind>,
 	enum_scope: Option<&str>,
+	table_types: &TableTypeNames,
 ) -> Result<Option<FieldValue<'static>>, async_graphql::Error> {
 	let val = cached.data.get(fd_name).cloned().unwrap_or(Value::None);
-	resolve_field_value(ctx, val, fd_name, field_kind, &cached.version, enum_scope).await
+	resolve_field_value(ctx, val, fd_name, field_kind, &cached.version, enum_scope, table_types)
+		.await
 }
 
 /// Build a GraphQL field for a relation on a table type.
