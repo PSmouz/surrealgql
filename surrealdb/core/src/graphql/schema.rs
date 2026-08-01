@@ -379,6 +379,23 @@ pub(crate) fn sql_value_to_graphql_value(v: SurValue) -> Result<GraphqlValue, Gr
 	Ok(out)
 }
 
+/// Strip an `option<…>` wrapper, which is represented as an `Either` carrying a
+/// `None` variant: `option<array<T>>` collapses to `array<T>`.
+///
+/// A union with more than one meaningful variant is returned untouched — that
+/// deliberately includes `option<'A' | 'B'>`, which must stay an `Either` so it
+/// is still recognised as a literal union.
+fn strip_optional(kind: &Kind) -> &Kind {
+	let Kind::Either(ks) = kind else {
+		return kind;
+	};
+	let mut variants = ks.iter().filter(|k| !matches!(k, Kind::None | Kind::Null));
+	match (variants.next(), variants.next()) {
+		(Some(only), None) => only,
+		_ => kind,
+	}
+}
+
 /// Convert a SurrealDB runtime value to GraphQL, using field kind metadata when available.
 ///
 /// For string-literal `Either` kinds, this emits a GraphQL enum token instead
@@ -388,18 +405,34 @@ pub(crate) fn sql_value_to_graphql_value_with_kind(
 	kind: Option<&Kind>,
 	enum_scope: Option<&str>,
 ) -> Result<GraphqlValue, GraphqlError> {
-	if let SurValue::String(s) = &v
-		&& let Some(Kind::Either(ks)) = kind
-	{
-		for k in ks {
-			if let Kind::Literal(KindLiteral::String(lit)) = k
-				&& lit.as_str() == s.as_str()
-			{
-				return Ok(GraphqlValue::Enum(Name::new(literal_enum_item_name(enum_scope, lit))));
+	// `strip_optional` is needed to avoid the `Either([None, Array(Either([…]))])` case hitting
+	// the literal-lookup arm (and consequentially falling through) due to the outer `Either`.
+	match (v, kind.map(strip_optional)) {
+		// Convert element-wise so the enum mapping survives the array layer.
+		// `kind_to_type_inner` registers one enum for the *element* kind and
+		// passes `enum_scope` through the array unchanged, so the elements are
+		// scoped identically to a bare field of that kind.
+		(SurValue::Array(items), Some(Kind::Array(inner, _))) => items
+			.into_iter()
+			.map(|item| sql_value_to_graphql_value_with_kind(item, Some(inner), enum_scope))
+			.collect::<Result<Vec<_>, GraphqlError>>()
+			.map(GraphqlValue::List),
+		(v, Some(Kind::Either(ks))) => {
+			if let SurValue::String(s) = &v {
+				for k in ks {
+					if let Kind::Literal(KindLiteral::String(lit)) = k
+						&& lit.as_str() == s.as_str()
+					{
+						return Ok(GraphqlValue::Enum(Name::new(literal_enum_item_name(
+							enum_scope, lit,
+						))));
+					}
+				}
 			}
+			sql_value_to_graphql_value(v)
 		}
+		(v, _) => sql_value_to_graphql_value(v),
 	}
-	sql_value_to_graphql_value(v)
 }
 
 /// Formats a `RecordId` as a raw string without SQL-specific escaping.
@@ -1250,7 +1283,17 @@ pub(crate) fn graphql_to_sql_kind_with_scope(
 					Err(type_error(Kind::Either(ks), val))
 				}
 				list @ GraphqlValue::List(_) => {
-					either_try_kind!(ks, list, Kind::Array);
+					// Same shape as `either_try_kind!(ks, list, Kind::Array)`,
+					// but threading `enum_scope` through — the macro cannot see
+					// it (a `macro_rules!` body resolves free identifiers at its
+					// definition site), and without it the elements of an
+					// `option<array<'A' | 'B'>>` lose their enum mapping.
+					for arr_kind in ks.iter().filter(|k| matches!(k, Kind::Array(_, _))).cloned() {
+						if let Ok(out) = graphql_to_sql_kind_with_scope(list, arr_kind, enum_scope)
+						{
+							return Ok(out);
+						}
+					}
 					Err(type_error(Kind::Either(ks), val))
 				}
 				obj @ GraphqlValue::Object(_) => {
@@ -1268,7 +1311,11 @@ pub(crate) fn graphql_to_sql_kind_with_scope(
 		Kind::Set(_k, _n) => Err(resolver_error("Sets are not yet supported")),
 		Kind::Array(ref k, n) => match val {
 			GraphqlValue::List(l) => {
-				let list_iter = l.iter().map(|v| graphql_to_sql_kind(v, *k.to_owned()));
+				// Carry `enum_scope` into the elements: the element kind is what
+				// registered the enum, so dropping the scope here leaves the
+				// reverse mapping unable to recognise its own tokens.
+				let list_iter =
+					l.iter().map(|v| graphql_to_sql_kind_with_scope(v, *k.to_owned(), enum_scope));
 				let list: Result<Vec<SurValue>, GraphqlError> = list_iter.collect();
 
 				match (list, n) {
@@ -1814,5 +1861,63 @@ mod tests {
 		.unwrap();
 
 		assert_eq!(ty.to_string(), only_registered_enum(&types));
+	}
+
+	/// `array<'ACTIVE' | 'BANNED'>`, wrapped in `option<…>` when `optional`.
+	fn status_union_array(optional: bool) -> Kind {
+		let array = Kind::Array(Box::new(status_union(false)), None);
+		if optional {
+			Kind::Either(vec![Kind::None, array])
+		} else {
+			array
+		}
+	}
+
+	#[test]
+	fn enum_values_survive_an_array_layer_in_both_directions() {
+		// `kind_to_type` registers one enum for the *element* kind and passes
+		// the scope through the array unchanged, so both converters have to do
+		// the same. They used to stop at the array: reading produced raw
+		// strings that async-graphql rejected as invalid enum items, and
+		// writing produced tokens the reverse mapping no longer recognised.
+		for optional in [false, true] {
+			let kind = status_union_array(optional);
+			let stored = SurValue::Array(SurArray(vec![SurValue::from("BANNED")]));
+
+			let out = sql_value_to_graphql_value_with_kind(
+				stored.clone(),
+				Some(&kind),
+				Some("person_status"),
+			)
+			.unwrap();
+			assert_eq!(
+				out,
+				GraphqlValue::List(vec![GraphqlValue::Enum(Name::new("PERSON_STATUS_BANNED"))]),
+				"reading array<'A' | 'B'> (optional: {optional})"
+			);
+
+			// And the token round-trips back to the stored string.
+			assert_eq!(
+				graphql_to_sql_kind_with_scope(&out, kind, Some("person_status")).unwrap(),
+				stored,
+				"writing array<'A' | 'B'> (optional: {optional})"
+			);
+		}
+	}
+
+	#[test]
+	fn scalar_literal_union_conversion_is_unchanged() {
+		// The array handling is layered on top of the scalar path, not in place
+		// of it: a bare `'A' | 'B'` must still map string to token and back.
+		let kind = status_union(false);
+
+		let out =
+			sql_value_to_graphql_value_with_kind(SurValue::from("ACTIVE"), Some(&kind), Some("s"))
+				.unwrap();
+		assert_eq!(out, GraphqlValue::Enum(Name::new("S_ACTIVE")));
+		assert_eq!(
+			graphql_to_sql_kind_with_scope(&out, kind, Some("s")).unwrap(),
+			SurValue::from("ACTIVE")
+		);
 	}
 }
