@@ -671,32 +671,41 @@ fn kind_to_type_inner(
 				let enum_ty = tmp.type_name().to_string();
 
 				types.push(Type::Enum(tmp));
-				if others.is_empty() {
-					return Ok(TypeRef::named(enum_ty));
-				}
 				Some(enum_ty)
 			} else {
 				None
 			};
 
-			let pos_names: Result<Vec<TypeRef>, GraphqlError> = others
-				.into_iter()
-				.map(|k| kind_to_type_inner(k, types, is_input, enum_scope, array_depth))
-				.collect();
-			let pos_names: Vec<String> = pos_names?.into_iter().map(|tr| tr.to_string()).collect();
-			let ty_name = pos_names.join("_or_");
+			match (enum_ty, others.is_empty()) {
+				// Every member was a string literal, so the field *is* the enum
+				// and there is nothing to union it with. Yielded here rather
+				// than returned early so that it still picks up the `optional`
+				// wrapping at the end of this function: a non-optional literal
+				// union must be emitted as `<Enum>!`, exactly like every other
+				// non-optional kind (issue #7452).
+				(Some(enum_ty), true) => TypeRef::named(enum_ty),
+				(enum_ty, _) => {
+					let pos_names: Result<Vec<TypeRef>, GraphqlError> = others
+						.into_iter()
+						.map(|k| kind_to_type_inner(k, types, is_input, enum_scope, array_depth))
+						.collect();
+					let pos_names: Vec<String> =
+						pos_names?.into_iter().map(|tr| tr.to_string()).collect();
+					let ty_name = pos_names.join("_or_");
 
-			let mut tmp_union = Union::new(ty_name.clone());
-			for n in pos_names {
-				tmp_union = tmp_union.possible_type(n);
+					let mut tmp_union = Union::new(ty_name.clone());
+					for n in pos_names {
+						tmp_union = tmp_union.possible_type(n);
+					}
+
+					if let Some(ty) = enum_ty {
+						tmp_union = tmp_union.possible_type(ty);
+					}
+
+					types.push(Type::Union(tmp_union));
+					TypeRef::named(ty_name)
+				}
 			}
-
-			if let Some(ty) = enum_ty {
-				tmp_union = tmp_union.possible_type(ty);
-			}
-
-			types.push(Type::Union(tmp_union));
-			TypeRef::named(ty_name)
 		}
 		Kind::Set(_, _) => return Err(schema_error("Kind::Set is not yet supported")),
 		Kind::Array(k, _) => {
