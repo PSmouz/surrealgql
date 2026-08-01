@@ -1749,4 +1749,70 @@ mod tests {
 		let literal = GraphqlValue::String("19.99dec".to_owned());
 		assert_eq!(graphql_to_sql_kind(&literal, Kind::Decimal).unwrap(), decimal);
 	}
+
+	/// `'ACTIVE' | 'BANNED'`, wrapped in `option<…>` when `optional`.
+	fn status_union(optional: bool) -> Kind {
+		let mut variants = Vec::new();
+		if optional {
+			variants.push(Kind::None);
+		}
+		variants.push(Kind::Literal(KindLiteral::String("ACTIVE".into())));
+		variants.push(Kind::Literal(KindLiteral::String("BANNED".into())));
+		Kind::Either(variants)
+	}
+
+	/// Name of the one enum type a `kind_to_type*` call registered, so the
+	/// assertions below tie the returned `TypeRef` to the actual registration
+	/// instead of restating the generated name.
+	fn only_registered_enum(types: &[Type]) -> String {
+		let names: Vec<&str> = types
+			.iter()
+			.filter_map(|t| match t {
+				Type::Enum(e) => Some(e.type_name()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(names.len(), 1, "expected exactly one registered enum, got {names:?}");
+		names[0].to_owned()
+	}
+
+	#[test]
+	fn literal_union_derives_non_null_like_every_other_kind() {
+		// The `NonNull` wrapper is applied in a single place, at the end of
+		// `kind_to_type_inner`. The literal-union arm used to return the enum's
+		// `TypeRef` early and skip it, so `TYPE 'A' | 'B'` came out nullable
+		// while `TYPE string` correctly came out `String!` (issue #7452).
+		let mut types = Vec::new();
+		let ty = kind_to_type_with_enum_prefix(
+			status_union(false),
+			&mut types,
+			false,
+			Some("person_status"),
+		)
+		.unwrap();
+
+		let rendered = ty.to_string();
+		let TypeRef::NonNull(inner) = ty else {
+			panic!("a non-optional literal union should be NonNull, got `{rendered}`");
+		};
+		assert_eq!(inner.to_string(), only_registered_enum(&types));
+	}
+
+	#[test]
+	fn optional_literal_union_stays_nullable() {
+		// The other half of the same contract: `optional` is derived from the
+		// kind, which keeps its `None` variant, so `option<'A' | 'B'>` must not
+		// pick up a `NonNull` wrapper. Guards against "fixing" the case above by
+		// wrapping unconditionally.
+		let mut types = Vec::new();
+		let ty = kind_to_type_with_enum_prefix(
+			status_union(true),
+			&mut types,
+			false,
+			Some("person_mood"),
+		)
+		.unwrap();
+
+		assert_eq!(ty.to_string(), only_registered_enum(&types));
+	}
 }
