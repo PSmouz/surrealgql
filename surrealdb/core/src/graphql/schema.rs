@@ -1814,4 +1814,48 @@ mod tests {
 		let literal = GraphqlValue::String("19.99dec".to_owned());
 		assert_eq!(graphql_to_sql_kind(&literal, Kind::Decimal).unwrap(), decimal);
 	}
+
+	/// A table definition carrying the given `GRAPHQL_ALIAS`.
+	fn table(name: &str, alias: Option<&str>) -> TableDefinition {
+		let mut tb = TableDefinition::new(
+			crate::catalog::NamespaceId(1),
+			crate::catalog::DatabaseId(1),
+			crate::catalog::TableId(1),
+			name.into(),
+		);
+		tb.graphql_alias = alias.map(str::to_owned);
+		tb
+	}
+
+	#[test]
+	fn table_type_names_resolves_aliases_and_falls_back_to_the_table_name() {
+		let map = TableTypeNames::new(&[table("gadget", Some("Gadget")), table("holder", None)]);
+
+		assert_eq!(map.get("gadget"), "Gadget");
+		// Un-aliased tables resolve to themselves.
+		assert_eq!(map.get("holder"), "holder");
+		// Excluded tables stay untouched.
+		assert_eq!(map.get("never_exposed"), "never_exposed");
+	}
+
+	#[test]
+	fn table_type_names_stores_nothing_without_a_meaningful_alias() {
+		// The map is empty unless an alias actually changes a name.
+		let unaliased = TableTypeNames::new(&[table("widget", None), table("holder", None)]);
+		assert!(unaliased.0.is_empty(), "un-aliased tables must not be stored: {:?}", unaliased.0);
+
+		// An alias equal to the table name changes nothing either.
+		let identity = TableTypeNames::new(&[table("widget", Some("widget"))]);
+		assert!(identity.0.is_empty(), "identity alias must not be stored: {:?}", identity.0);
+
+		// An alias outside the GraphQL Name grammar is ignored by
+		// `table_base_name`, so it must not be stored either. `DEFINE TABLE …
+		// GRAPHQL_ALIAS` rejects these, so only a catalog entry predating that
+		// validation can reach here — which no language test can produce.
+		for invalid in ["My Table", "1st", "kebab-case", ""] {
+			let map = TableTypeNames::new(&[table("widget", Some(invalid))]);
+			assert!(map.0.is_empty(), "alias {invalid:?} should have been rejected");
+			assert_eq!(map.get("widget"), "widget");
+		}
+	}
 }
