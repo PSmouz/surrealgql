@@ -862,7 +862,7 @@ pub(crate) fn filter_name_from_table(tb_name: impl Display) -> String {
 /// follows the table's `GRAPHQL_ALIAS` when it sets one (#7453). Falls back to
 /// the raw table name if the map is missing, which is what the type name was
 /// before aliases reached it.
-fn graphql_type_of(ctx: &ResolverContext<'_>, table: &TableName) -> String {
+pub(super) fn graphql_type_of(ctx: &ResolverContext<'_>, table: &TableName) -> String {
 	ctx.data::<Arc<TableTypeNames>>()
 		.map_or_else(|_| table.as_str().to_owned(), |m| m.get(table.as_str()).to_owned())
 }

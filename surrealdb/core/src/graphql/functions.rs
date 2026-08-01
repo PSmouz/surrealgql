@@ -51,6 +51,9 @@ pub async fn process_fns(
 		// resolvers in this crate.
 		let kvs1 = Arc::clone(datastore);
 		let fnd1 = fnd.clone();
+		// Decided by the declared return type, which is fixed for the life of
+		// the schema — so it is resolved here rather than on every invocation.
+		let tag_record_type = returns_abstract_record(fnd.returns.as_ref());
 
 		// Honour an explicit `GRAPHQL <ident>` alias when valid; otherwise fall
 		// back to the auto-derived `fn_<name>` form. See GitHub issue #4537.
@@ -107,13 +110,14 @@ pub async fn process_fns(
 					let graphql_res = match res {
 						Value::RecordId(rid) => {
 							let field_val = FieldValue::owned_any(rid.clone());
-							// Untyped record returns need `.with_type()` for
-							// interface resolution; typed `record<T>` do not.
-							let field_val = match &fnd1.returns {
-								Some(Kind::Record(ts)) if ts.is_empty() => {
-									field_val.with_type(rid.table)
-								}
-								_ => field_val,
+							// The tag names the table's *generated Object type*,
+							// which follows its `GRAPHQL_ALIAS` rather than its
+							// SurrealQL name (#7453).
+							let field_val = if tag_record_type {
+								field_val
+									.with_type(super::tables::graphql_type_of(&ctx, &rid.table))
+							} else {
+								field_val
 							};
 							Some(field_val)
 						}
@@ -156,4 +160,61 @@ pub async fn process_fns(
 	}
 
 	Ok(query)
+}
+
+/// `true` when a function's record-valued return lands on an *abstract* GraphQL
+/// type and therefore needs a `FieldValue::with_type()` tag to resolve.
+///
+/// [`kind_to_type`](super::schema::kind_to_type) maps a bare `record` to the
+/// `record` interface and a multi-target `record<a | b>` to a generated union;
+/// async-graphql cannot pick the concrete member of either without the tag. A
+/// single-target `record<t>` already *is* that Object type, so tagging it is
+/// unnecessary. `option<T>` is stored as `Either([None, T])` and is unwrapped
+/// here exactly as `kind_to_type` unwraps it when building the type reference.
+fn returns_abstract_record(kind: Option<&Kind>) -> bool {
+	match kind {
+		Some(Kind::Record(ts)) => ts.is_empty() || ts.len() > 1,
+		Some(Kind::Either(ks)) => {
+			let mut concrete = ks.iter().filter(|k| !matches!(k, Kind::None | Kind::Null));
+			match (concrete.next(), concrete.next()) {
+				(Some(only), None) => returns_abstract_record(Some(only)),
+				_ => false,
+			}
+		}
+		_ => false,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn record(tables: &[&str]) -> Kind {
+		Kind::Record(tables.iter().map(|t| (*t).into()).collect())
+	}
+
+	#[test]
+	fn abstract_record_returns_need_a_concrete_type_tag() {
+		// `record` is the interface, `record<a | b>` a union: neither resolves
+		// without `.with_type()`.
+		assert!(returns_abstract_record(Some(&record(&[]))));
+		assert!(returns_abstract_record(Some(&record(&["gadget", "widget"]))));
+		// `option<record>` strips to the same interface reference.
+		assert!(returns_abstract_record(Some(&Kind::Either(vec![Kind::None, record(&[])]))));
+	}
+
+	#[test]
+	fn concrete_and_non_record_returns_do_not() {
+		// A single-target record already resolves to that Object type.
+		assert!(!returns_abstract_record(Some(&record(&["gadget"]))));
+		assert!(!returns_abstract_record(Some(&Kind::Either(vec![
+			Kind::None,
+			record(&["gadget"])
+		]))));
+		assert!(!returns_abstract_record(Some(&Kind::String)));
+		assert!(!returns_abstract_record(None));
+		// A genuine multi-kind Either is its own union of those types; the
+		// record member is not what the field resolves to.
+		assert!(!returns_abstract_record(Some(&Kind::Either(vec![Kind::String, record(&[])]))));
+	}
 }
