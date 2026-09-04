@@ -19,7 +19,7 @@ use crate::expr::statements::relate::RelateThrough;
 use crate::idx::planner::iterators::{IndexItemRecord, IteratorRef, RecordIterator};
 use crate::idx::planner::{IterationStage, RecordStrategy, ScanDirection};
 use crate::key::{graph, record, r#ref};
-use crate::kvs::{KVKey, KVValue, Key, NORMAL_BATCH_SIZE, ScanLimit, Transaction, Val};
+use crate::kvs::{KVKey, KVValue, Key, NORMAL_BATCH_SIZE, Transaction, Val};
 use crate::val::{RecordId, RecordIdKey, RecordIdKeyRange, TableName, Value};
 
 impl Iterable {
@@ -326,6 +326,16 @@ impl Collectable {
 				rid: Some(v.into()),
 				ir: None,
 				val: Operable::Value(Default::default()),
+			},
+			(false, RelateThrough::RecordId(v)) if o.is_some() => Processable {
+				doc_ctx,
+				record_strategy: RecordStrategy::KeysAndValues,
+				generate: None,
+				rid: Some(v.into()),
+				ir: None,
+				// INSERT RELATION with an explicit edge id must be create-only so a
+				// duplicate returns RecordExists unless ON DUPLICATE KEY UPDATE is set.
+				val: Operable::Relate(Default::default(), f, w, o.map(|v| v.into())),
 			},
 			(false, RelateThrough::RecordId(v)) => {
 				let val = txn
@@ -769,7 +779,7 @@ pub(super) trait Collector {
 			if remaining == 0 {
 				break;
 			}
-			let batch = cursor.next_batch(ScanLimit::Count(remaining as u32)).await?;
+			let batch = cursor.next_batch(remaining as u32).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -828,7 +838,7 @@ pub(super) trait Collector {
 		// Loop until no more entries
 		let mut count = 0;
 		'outer: loop {
-			let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -879,7 +889,7 @@ pub(super) trait Collector {
 		// Loop until no more entries
 		let mut count = 0;
 		'outer: loop {
-			let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -973,7 +983,7 @@ pub(super) trait Collector {
 		// Loop until no more entries
 		let mut count = 0;
 		'outer: loop {
-			let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -1021,7 +1031,7 @@ pub(super) trait Collector {
 		// Loop until no more entries
 		let mut count = 0;
 		'outer: loop {
-			let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}
@@ -1120,7 +1130,7 @@ pub(super) trait Collector {
 			// Loop until no more entries
 			let mut count = 0;
 			loop {
-				let batch = cursor.next_batch(ScanLimit::Count(NORMAL_BATCH_SIZE)).await?;
+				let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
 				if batch.is_empty() {
 					break;
 				}

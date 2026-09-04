@@ -51,6 +51,7 @@ impl PhysicalExpr for WherePart {
 					document_root: ctx.document_root,
 					skip_fetch_perms: ctx.skip_fetch_perms,
 					computing_record: ctx.computing_record,
+					plan_depth: ctx.plan_depth,
 				}
 			} else {
 				ctx

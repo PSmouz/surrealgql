@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a label mutation (`SET a:Label`) is unsupported — a SurrealDB record belongs to exactly one table."
+
+[test.results]
+parsing-error = """
+Label mutation is not supported: a record belongs to exactly one table
+  --> [15:22]
+   |
+15 | MATCH (n:person) SET n:Archived
+   |                      ^^^^^^^^^^ SurrealDB has no multi-label model; create the record in the target table instead
+"""
+*/
+
+MATCH (n:person) SET n:Archived

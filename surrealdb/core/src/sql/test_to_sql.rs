@@ -150,7 +150,9 @@ use crate::val::{Bytes, Duration, File, Geometry, Number, Object, RecordId, Set,
 // Expression: Delete
 #[case::expr_delete(Expr::Delete(Box::new(DeleteStatement { only: false, what: vec![Expr::Table("user".into())], with: None, cond: None, output: None, timeout: Expr::Literal(Literal::None), explain: None })), "DELETE user", "DELETE user")]
 // Expression: Relate
-#[case::expr_relate(Expr::Relate(Box::new(RelateStatement { only: false, through: Expr::Table("likes".into()), from: Expr::Param(Param::new("from".to_string())), to: Expr::Param(Param::new("to".to_string())), data: None, output: None, timeout: Expr::Literal(Literal::None) })), "RELATE $from -> likes -> $to", "RELATE $from -> likes -> $to")]
+#[case::expr_relate(Expr::Relate(Box::new(RelateStatement { only: false, or_update: false, through: Expr::Table("likes".into()), from: Expr::Param(Param::new("from".to_string())), to: Expr::Param(Param::new("to".to_string())), data: None, output: None, timeout: Expr::Literal(Literal::None) })), "RELATE $from -> likes -> $to", "RELATE $from -> likes -> $to")]
+// Expression: Relate OR UPDATE
+#[case::expr_relate_or_update(Expr::Relate(Box::new(RelateStatement { only: false, or_update: true, through: Expr::Table("likes".into()), from: Expr::Param(Param::new("from".to_string())), to: Expr::Param(Param::new("to".to_string())), data: None, output: None, timeout: Expr::Literal(Literal::None) })), "RELATE OR UPDATE $from -> likes -> $to", "RELATE OR UPDATE $from -> likes -> $to")]
 // Expression: Insert
 #[case::expr_insert(Expr::Insert(Box::new(InsertStatement { into: Some(Expr::Table("user".into())), data: Data::SingleExpression(Expr::Literal(Literal::Object(vec![ObjectEntry { key: "name".into(), value: Expr::Literal(Literal::String(Strand::new_static("test"))) }]))), ignore: false, update: None, output: None, timeout: Expr::Literal(Literal::None), relation: false})), "INSERT INTO user { name: 'test' }", "INSERT INTO user {\n\tname: 'test'\n}")]
 // Expression: Define

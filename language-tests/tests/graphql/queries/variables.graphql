@@ -1,0 +1,22 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[graphql]
+variables = { personId = "bob", minViews = 10 }
+
+[test]
+reason = "GraphQL request variables are passed via the [graphql] config section"
+
+[[test.results]]
+value = "{ person: { age: 25, name: 'Bob' }, posts: [{ title: 'Hello world' }, { title: 'Intro to GraphQL' }] }"
+*/
+query FetchData($personId: String!, $minViews: Int!) {
+	person(id: $personId) {
+		name
+		age
+	}
+	posts(filter: {views: {gt: $minViews}}) {
+		title
+	}
+}

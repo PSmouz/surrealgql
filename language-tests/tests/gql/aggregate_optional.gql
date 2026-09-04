@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Aggregation folds over an OPTIONAL MATCH: count(c.id) counts only the non-null (matched) cities per person. Only person:1 knows a city (city:1), so A=1 and B=C=0 (the optional miss null-fills c, and count of the null is 0)."
+
+[[test.results]]
+value = "[{ cities: 1, name: 'A' }, { cities: 0, name: 'B' }, { cities: 0, name: 'C' }]"
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(c:city) RETURN a.name AS name, count(c.id) AS cities GROUP BY a.name ORDER BY name

@@ -442,6 +442,127 @@ impl Value {
 						Ok(res)
 					}
 				},
+				// Current value at path is a set
+				Value::Set(v) => match p {
+					Part::All => stk
+						.scope(|scope| {
+							let futs = v.iter().map(|v| {
+								scope.run(|stk| {
+									let path = if v.is_record() {
+										path
+									} else {
+										path.next()
+									};
+
+									v.get(stk, ctx, opt, doc, path)
+								})
+							});
+							try_join_all_buffered(futs, ctx.config.max_concurrent_tasks)
+						})
+						.await
+						.map(|vals| Value::Set(vals.into_iter().collect())),
+					Part::Flatten => {
+						let path = path.next();
+						stk.scope(|scope| {
+							let futs =
+								v.iter().map(|v| scope.run(|stk| v.get(stk, ctx, opt, doc, path)));
+							try_join_all_buffered(futs, ctx.config.max_concurrent_tasks)
+						})
+						.await
+						.map(|vals| Value::Set(vals.into_iter().collect()))
+					}
+					Part::First => match v.first() {
+						Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
+						None => {
+							stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await
+						}
+					},
+					Part::Last => match v.last() {
+						Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
+						None => {
+							stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await
+						}
+					},
+					Part::Where(w) => {
+						let parent_ctx = match doc {
+							Some(d) if expr_references_parent(w) => {
+								let mut child = Context::new_child(ctx);
+								child.add_value("parent", Arc::new(d.doc.as_ref().clone()));
+								Some(child.freeze())
+							}
+							_ => None,
+						};
+						let ctx = parent_ctx.as_ref().unwrap_or(ctx);
+						let mut a = Vec::new();
+						for v in v.iter() {
+							let cur = v.clone().into();
+							if stk
+								.run(|stk| w.compute(stk, ctx, opt, Some(&cur)))
+								.await
+								.catch_return()?
+								.is_truthy()
+							{
+								a.push(v.clone());
+							}
+						}
+						let v = Value::Set(a.into_iter().collect());
+						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
+					}
+					Part::Value(x) => match stk
+						.run(|stk| x.compute(stk, ctx, opt, doc))
+						.await
+						.catch_return()?
+					{
+						Value::Number(i) => match i.as_array_index().and_then(|i| v.nth(i)) {
+							Some(v) => stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await,
+							None => Ok(Value::None),
+						},
+						Value::Range(r) => {
+							let values: Vec<_> = v.iter().cloned().collect();
+							let v = r
+								.coerce_to_typed::<i64>()
+								.map_err(Error::from)
+								.map_err(anyhow::Error::new)
+								.map_err(ControlFlow::Err)?
+								.slice(values.as_slice())
+								.map(|v| Value::Set(v.iter().cloned().collect()))
+								.unwrap_or_default();
+
+							stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
+						}
+						_ => stk.run(|stk| Value::None.get(stk, ctx, opt, doc, path.next())).await,
+					},
+					Part::Method(name, args) => {
+						let a = stk
+							.scope(|scope| {
+								try_join_all(
+									args.iter()
+										.map(|v| scope.run(|stk| v.compute(stk, ctx, opt, doc))),
+								)
+							})
+							.await?;
+						let v = stk
+							.run(|stk| idiom(stk, ctx, opt, doc, v.clone().into(), name, a))
+							.await?;
+						stk.run(|stk| v.get(stk, ctx, opt, doc, path.next())).await
+					}
+					Part::Optional => {
+						stk.run(|stk| self.get(stk, ctx, opt, doc, path.next())).await
+					}
+					_ => {
+						let res = stk
+							.scope(|scope| {
+								let futs = v
+									.iter()
+									.map(|v| scope.run(|stk| v.get(stk, ctx, opt, doc, path)));
+								try_join_all_buffered(futs, ctx.config.max_concurrent_tasks)
+							})
+							.await
+							.map(|vals| Value::Set(vals.into_iter().collect()))?;
+
+						Ok(res)
+					}
+				},
 				// Current value at path is a record
 				Value::RecordId(v) => {
 					// Clone the record
@@ -799,6 +920,16 @@ mod tests {
 				key: RecordIdKey::String(Strand::new_static("jaime"))
 			})
 		);
+	}
+
+	#[tokio::test]
+	async fn get_set_last() {
+		let (ctx, opt) = mock().await;
+		let idi: Idiom = syn::idiom("tags[$]").unwrap().into();
+		let val: Value = parse_val!("{ tags: {1, 3, 5} }");
+		let mut stack = reblessive::tree::TreeStack::new();
+		let res = stack.enter(|stk| val.get(stk, &ctx, &opt, None, &idi)).finish().await.unwrap();
+		assert_eq!(res, Value::from(5));
 	}
 
 	#[tokio::test]

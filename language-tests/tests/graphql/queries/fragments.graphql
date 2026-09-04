@@ -1,0 +1,24 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Named fragments and fragment spreads are supported"
+
+[[test.results]]
+value = "{ person: { active: true, age: 30, name: 'Alice' }, persons: [{ active: true, age: 35, name: 'Carol' }] }"
+*/
+query {
+	person(id: "alice") {
+		...personFields
+	}
+	persons(filter: {age: {gt: 30}}) {
+		...personFields
+	}
+}
+
+fragment personFields on person {
+	name
+	age
+	active
+}

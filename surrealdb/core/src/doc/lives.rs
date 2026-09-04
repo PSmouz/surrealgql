@@ -12,6 +12,7 @@ use tracing::instrument;
 
 use super::IgnoreError;
 use crate::catalog::{Permission, SubscriptionDefinition, SubscriptionFields};
+use crate::cnf::LiveQueryEngine;
 use crate::ctx::{Context, FrozenContext};
 use crate::dbs::{MessageBroker, Options, RoutedNotification};
 use crate::doc::{Action, CursorDoc, Document};
@@ -29,6 +30,30 @@ impl Document {
 	/// through the live queries and processes them
 	/// all within the currently running transaction.
 	pub(super) async fn process_table_lives(
+		&mut self,
+		stk: &mut Stk,
+		ctx: &FrozenContext,
+		opt: &Options,
+		action: Action,
+	) -> Result<()> {
+		// Under the Router engine, live-query delivery is performed off the write
+		// path by the per-node router (see `crate::lq`), which tails the captured
+		// `lqe` events and replays them through `process_table_lives_inner` on the
+		// subscriber side. The inline write-path call is therefore disabled here —
+		// this is the flip that removes per-subscriber cost from the mutator's
+		// transaction. (Capture into the `lqe` keyspace still happens; see
+		// `Document::process_live_events`.)
+		if ctx.config.live_query_engine == LiveQueryEngine::Router {
+			return Ok(());
+		}
+		self.process_table_lives_inner(stk, ctx, opt, action).await
+	}
+
+	/// The live-query delivery pipeline, shared by the inline write path (via
+	/// [`Self::process_table_lives`], after its engine gate) and the off-path
+	/// router replay (via [`Document::replay_live_event`]). Loads the table's
+	/// subscriptions and computes/sends a notification per matching subscription.
+	pub(super) async fn process_table_lives_inner(
 		&mut self,
 		_stk: &mut Stk,
 		ctx: &FrozenContext,
@@ -548,8 +573,8 @@ impl Document {
 						&self.current
 					};
 
-					// Disable permissions
-					let opt = &opt.new_with_perms(false);
+					// Disable permission recursion and block side effects
+					let opt = &opt.new_for_permission_predicate();
 					// Process the PERMISSION clause
 					if !stk
 						.run(|stk| e.compute(stk, ctx, opt, Some(doc)))

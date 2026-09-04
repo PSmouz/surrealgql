@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the lowering owns the `__` prefix for its internal binding fields."
+
+[test.results]
+parsing-error = '''
+Variable names starting with `__` are reserved for internal use
+  --> [15:8]
+   |
+15 | MATCH (__n:person) RETURN __n
+   |        ^^^ rename the variable
+'''
+*/
+
+MATCH (__n:person) RETURN __n

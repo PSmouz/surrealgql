@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "NOT on a nullable boolean property keeps only rows where it is exactly false: person:3 has no active property, NOT UNKNOWN is UNKNOWN, so it is excluded."
+
+[[test.results]]
+value = "[{ name: 'B' }]"
+*/
+
+MATCH (n:person) WHERE NOT n.active RETURN n.name AS name ORDER BY name

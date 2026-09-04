@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Two comma-separated patterns with NO shared variable: the planner combines them with a cartesian-product HashJoin (Cross). The two patterns live on the disjoint person and hub components, so the result is every (person, hub) pair. 3 persons (A,B,C) x 3 hubs (D,E,F) = 9 rows. No edges are bound, so R2/DIFFERENT EDGES is inert here."
+
+[[test.results]]
+value = "[{ p: 'A', h: 'D' }, { p: 'A', h: 'E' }, { p: 'A', h: 'F' }, { p: 'B', h: 'D' }, { p: 'B', h: 'E' }, { p: 'B', h: 'F' }, { p: 'C', h: 'D' }, { p: 'C', h: 'E' }, { p: 'C', h: 'F' }]"
+*/
+
+MATCH (x:person), (y:hub)
+RETURN x.name AS p, y.name AS h ORDER BY p, h

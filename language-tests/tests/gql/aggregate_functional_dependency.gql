@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Grouping by the whole node `a` determines `a.name`, so a non-aggregate projection of `a.name` is allowed (constant within each group) — emitted as the first value per group. count(*) is the number of person->person knows edges per source."
+
+[[test.results]]
+value = "[{ c: 1, name: 'A' }, { c: 2, name: 'B' }, { c: 1, name: 'C' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS name, count(*) AS c GROUP BY a ORDER BY name

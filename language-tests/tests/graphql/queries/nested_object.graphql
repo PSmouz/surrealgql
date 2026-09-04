@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Nested object fields (multi-part SurrealQL fields) generate nested GraphQL types"
+
+[[test.results]]
+value = "{ person: { address: { city: 'London', country: 'UK' }, name: 'Alice' } }"
+*/
+query {
+	person(id: "alice") {
+		name
+		address {
+			city
+			country
+		}
+	}
+}

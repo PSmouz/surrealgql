@@ -1,4 +1,5 @@
 pub mod audit_logs;
+#[cfg(feature = "tokio-console")]
 mod console;
 mod logs;
 pub mod metrics;
@@ -179,6 +180,18 @@ impl Builder {
 		// Surface any deprecated telemetry env vars now that a subscriber is
 		// installed so the warning is actually delivered.
 		warn_removed_env_vars();
+		// Warn when Tokio Console was requested via the env var but this build
+		// was compiled without the `tokio-console` feature, so the request
+		// would otherwise be silently ignored. (When the feature IS enabled the
+		// console layer is wired up in `build` instead.)
+		#[cfg(not(feature = "tokio-console"))]
+		if *ENABLE_TOKIO_CONSOLE {
+			warn!(
+				"SURREAL_TOKIO_CONSOLE_ENABLED is set but this build was compiled \
+				 without the `tokio-console` feature; the Tokio Console subscriber \
+				 is unavailable. Rebuild with the `tokio-console` feature to use it."
+			);
+		}
 		// Everything ok
 		Ok(handles)
 	}
@@ -385,7 +398,8 @@ impl Builder {
 			guards.push(guard);
 		}
 
-		// Setup logging to console if enabled
+		// Setup tokio console debugging if enabled
+		#[cfg(feature = "tokio-console")]
 		if *ENABLE_TOKIO_CONSOLE {
 			// Create the console destination layer
 			let layer = console::new()?;

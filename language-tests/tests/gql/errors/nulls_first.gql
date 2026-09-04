@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the engine has no NULLS FIRST/LAST mapping; NONE and NULL always sort below other values."
+
+[test.results]
+parsing-error = '''
+`NULLS FIRST`/`NULLS LAST` ordering is not supported yet
+  --> [15:49]
+   |
+15 | MATCH (n:person) RETURN n.name AS name ORDER BY name NULLS FIRST
+   |                                                 ^^^^^^^^^^^^^^^^
+'''
+*/
+
+MATCH (n:person) RETURN n.name AS name ORDER BY name NULLS FIRST

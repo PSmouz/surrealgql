@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: an empty quantifier range can never match."
+
+[test.results]
+parsing-error = '''
+The quantifier maximum must not be smaller than its minimum
+  --> [15:28]
+   |
+15 | MATCH (a:person)-[:knows]->{3,1}(b:person) RETURN a
+   |                            ^^^^^
+'''
+*/
+
+MATCH (a:person)-[:knows]->{3,1}(b:person) RETURN a

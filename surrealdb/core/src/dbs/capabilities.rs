@@ -123,6 +123,7 @@ impl std::str::FromStr for FuncTarget {
 pub enum ExperimentalTarget {
 	Files,
 	Surrealism,
+	Gql,
 }
 
 impl fmt::Display for ExperimentalTarget {
@@ -130,6 +131,7 @@ impl fmt::Display for ExperimentalTarget {
 		match self {
 			Self::Files => write!(f, "files"),
 			Self::Surrealism => write!(f, "surrealism"),
+			Self::Gql => write!(f, "gql"),
 		}
 	}
 }
@@ -145,6 +147,7 @@ impl Target<str> for ExperimentalTarget {
 		match self {
 			Self::Files => elem.eq_ignore_ascii_case("files"),
 			Self::Surrealism => elem.eq_ignore_ascii_case("surrealism"),
+			Self::Gql => elem.eq_ignore_ascii_case("gql"),
 		}
 	}
 }
@@ -172,6 +175,7 @@ impl std::str::FromStr for ExperimentalTarget {
 		match s.trim().to_ascii_lowercase().as_str() {
 			"files" => Ok(ExperimentalTarget::Files),
 			"surrealism" => Ok(ExperimentalTarget::Surrealism),
+			"gql" => Ok(ExperimentalTarget::Gql),
 			_ => Err(ParseExperimentalTargetError::InvalidName),
 		}
 	}
@@ -379,6 +383,7 @@ pub enum RouteTarget {
 	GraphQL,
 	Api,
 	Mcp,
+	Gql,
 }
 
 // impl display
@@ -399,6 +404,7 @@ impl fmt::Display for RouteTarget {
 			RouteTarget::GraphQL => write!(f, "graphql"),
 			RouteTarget::Api => write!(f, "api"),
 			RouteTarget::Mcp => write!(f, "mcp"),
+			RouteTarget::Gql => write!(f, "gql"),
 		}
 	}
 }
@@ -438,6 +444,7 @@ impl std::str::FromStr for RouteTarget {
 			"graphql" => Ok(RouteTarget::GraphQL),
 			"api" => Ok(RouteTarget::Api),
 			"mcp" => Ok(RouteTarget::Mcp),
+			"gql" => Ok(RouteTarget::Gql),
 			_ => Err(ParseRouteTargetError),
 		}
 	}
@@ -523,6 +530,97 @@ impl std::str::FromStr for ArbitraryQueryTarget {
 	}
 }
 
+/// The authentication subject class permitted to invoke the `eval::*` functions
+/// (`eval::surql`, `eval::gql`).
+///
+/// This mirrors [`ArbitraryQueryTarget`] exactly — the subject is derived from
+/// the session auth level — but is a *separate, additive* gate: an `eval`
+/// invocation must satisfy both the arbitrary-query capability (because running
+/// a nested query *is* an arbitrary query) and this one. The default is
+/// [`Targets::None`] (no subject), so eval is denied out of the box and must be
+/// explicitly enabled (e.g. `--allow-eval-query system`). Because both gates
+/// must pass, eval can never grant a subject more query power than the
+/// front-door arbitrary-query capability allows.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub enum EvalQueryTarget {
+	Guest,
+	Record,
+	System,
+}
+
+impl fmt::Display for EvalQueryTarget {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Guest => write!(f, "guest"),
+			Self::Record => write!(f, "record"),
+			Self::System => write!(f, "system"),
+		}
+	}
+}
+
+impl<'a> From<&'a Level> for EvalQueryTarget {
+	fn from(level: &'a Level) -> Self {
+		match level {
+			Level::No => EvalQueryTarget::Guest,
+			Level::Root => EvalQueryTarget::System,
+			Level::Namespace(_) => EvalQueryTarget::System,
+			Level::Database(_, _) => EvalQueryTarget::System,
+			Level::Record(_, _, _) => EvalQueryTarget::Record,
+		}
+	}
+}
+
+impl<'a> From<&'a Auth> for EvalQueryTarget {
+	fn from(auth: &'a Auth) -> Self {
+		auth.level().into()
+	}
+}
+
+impl Target for EvalQueryTarget {
+	fn matches(&self, elem: &EvalQueryTarget) -> bool {
+		self == elem
+	}
+}
+
+impl Target<str> for EvalQueryTarget {
+	fn matches(&self, elem: &str) -> bool {
+		match self {
+			Self::Guest => elem.eq_ignore_ascii_case("guest"),
+			Self::Record => elem.eq_ignore_ascii_case("record"),
+			Self::System => elem.eq_ignore_ascii_case("system"),
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub enum ParseEvalQueryTargetError {
+	InvalidName,
+}
+
+impl std::error::Error for ParseEvalQueryTargetError {}
+impl fmt::Display for ParseEvalQueryTargetError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match *self {
+			ParseEvalQueryTargetError::InvalidName => {
+				write!(f, "invalid eval query target name")
+			}
+		}
+	}
+}
+
+impl std::str::FromStr for EvalQueryTarget {
+	type Err = ParseEvalQueryTargetError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s.trim().to_ascii_lowercase().as_str() {
+			"guest" => Ok(EvalQueryTarget::Guest),
+			"record" => Ok(EvalQueryTarget::Record),
+			"system" => Ok(EvalQueryTarget::System),
+			_ => Err(ParseEvalQueryTargetError::InvalidName),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Targets<T: Hash + Eq + PartialEq + Ord> {
 	None,
@@ -598,6 +696,8 @@ pub struct Capabilities {
 	deny_experimental: Targets<ExperimentalTarget>,
 	allow_arbitrary_query: Targets<ArbitraryQueryTarget>,
 	deny_arbitrary_query: Targets<ArbitraryQueryTarget>,
+	allow_eval_query: Targets<EvalQueryTarget>,
+	deny_eval_query: Targets<EvalQueryTarget>,
 	planner_strategy: NewPlannerStrategy,
 }
 
@@ -605,7 +705,7 @@ impl fmt::Display for Capabilities {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(
 			f,
-			"scripting={}, guest_access={}, live_query_notifications={}, allow_funcs={}, deny_funcs={}, allow_net={}, deny_net={}, allow_rpc={}, deny_rpc={}, allow_http={}, deny_http={}, allow_experimental={}, deny_experimental={}, allow_arbitrary_query={}, deny_arbitrary_query={}, planner_strategy={}",
+			"scripting={}, guest_access={}, live_query_notifications={}, allow_funcs={}, deny_funcs={}, allow_net={}, deny_net={}, allow_rpc={}, deny_rpc={}, allow_http={}, deny_http={}, allow_experimental={}, deny_experimental={}, allow_arbitrary_query={}, deny_arbitrary_query={}, allow_eval_query={}, deny_eval_query={}, planner_strategy={}",
 			self.scripting,
 			self.guest_access,
 			self.live_query_notifications,
@@ -621,6 +721,8 @@ impl fmt::Display for Capabilities {
 			self.deny_experimental,
 			self.allow_arbitrary_query,
 			self.deny_arbitrary_query,
+			self.allow_eval_query,
+			self.deny_eval_query,
 			self.planner_strategy,
 		)
 	}
@@ -645,6 +747,10 @@ impl Default for Capabilities {
 			deny_experimental: Targets::None,
 			allow_arbitrary_query: Targets::All,
 			deny_arbitrary_query: Targets::None,
+			// Denied out of the box (even under `Capabilities::all()` /
+			// `--allow-all`): eval must be explicitly enabled per subject class.
+			allow_eval_query: Targets::None,
+			deny_eval_query: Targets::None,
 			planner_strategy: NewPlannerStrategy::default(),
 		}
 	}
@@ -669,6 +775,10 @@ impl Capabilities {
 			deny_experimental: Targets::None,
 			allow_arbitrary_query: Targets::All,
 			deny_arbitrary_query: Targets::None,
+			// Denied out of the box (even under `Capabilities::all()` /
+			// `--allow-all`): eval must be explicitly enabled per subject class.
+			allow_eval_query: Targets::None,
+			deny_eval_query: Targets::None,
 			planner_strategy: NewPlannerStrategy::default(),
 		}
 	}
@@ -691,6 +801,8 @@ impl Capabilities {
 			deny_experimental: Targets::None,
 			allow_arbitrary_query: Targets::None,
 			deny_arbitrary_query: Targets::None,
+			allow_eval_query: Targets::None,
+			deny_eval_query: Targets::None,
 			planner_strategy: NewPlannerStrategy::default(),
 		}
 	}
@@ -759,6 +871,16 @@ impl Capabilities {
 		deny_arbitrary_query: Targets<ArbitraryQueryTarget>,
 	) -> Self {
 		self.deny_arbitrary_query = deny_arbitrary_query;
+		self
+	}
+
+	pub fn with_eval_query(mut self, allow_eval_query: Targets<EvalQueryTarget>) -> Self {
+		self.allow_eval_query = allow_eval_query;
+		self
+	}
+
+	pub fn without_eval_query(mut self, deny_eval_query: Targets<EvalQueryTarget>) -> Self {
+		self.deny_eval_query = deny_eval_query;
 		self
 	}
 
@@ -845,6 +967,14 @@ impl Capabilities {
 
 	pub fn allows_query(&self, target: &ArbitraryQueryTarget) -> bool {
 		self.allow_arbitrary_query.matches(target) && !self.deny_arbitrary_query.matches(target)
+	}
+
+	/// Whether the given subject class may invoke the `eval::*` functions.
+	///
+	/// This is an additive gate on top of [`Capabilities::allows_query`]; both
+	/// must pass for an `eval` invocation to proceed.
+	pub fn allows_eval_query(&self, target: &EvalQueryTarget) -> bool {
+		self.allow_eval_query.matches(target) && !self.deny_eval_query.matches(target)
 	}
 
 	pub fn allows_network_target(&self, target: &NetTarget) -> bool {
@@ -955,6 +1085,31 @@ mod tests {
 
 		assert!(FuncTarget::from_str("test::name").unwrap().matches("test::name"));
 		assert!(!FuncTarget::from_str("test::name").unwrap().matches("test::name2"));
+	}
+
+	#[test]
+	fn test_experimental_target() {
+		assert_eq!(ExperimentalTarget::from_str("files").unwrap(), ExperimentalTarget::Files);
+		assert_eq!(
+			ExperimentalTarget::from_str("surrealism").unwrap(),
+			ExperimentalTarget::Surrealism
+		);
+		assert_eq!(ExperimentalTarget::from_str("gql").unwrap(), ExperimentalTarget::Gql);
+		assert_eq!(ExperimentalTarget::from_str("GQL").unwrap(), ExperimentalTarget::Gql);
+		// The retired `opengql` spelling must no longer parse.
+		ExperimentalTarget::from_str("opengql").unwrap_err();
+		ExperimentalTarget::from_str("").unwrap_err();
+
+		assert_eq!(ExperimentalTarget::Gql.to_string(), "gql");
+		assert_eq!(
+			ExperimentalTarget::from_str(&ExperimentalTarget::Gql.to_string()).unwrap(),
+			ExperimentalTarget::Gql
+		);
+
+		assert!(ExperimentalTarget::Gql.matches("gql"));
+		assert!(ExperimentalTarget::Gql.matches("GQL"));
+		assert!(!ExperimentalTarget::Gql.matches("files"));
+		assert!(!ExperimentalTarget::Files.matches("gql"));
 	}
 
 	#[test]
@@ -1487,6 +1642,35 @@ mod tests {
 			assert!(caps.allows_query(&ArbitraryQueryTarget::from_str("guest").unwrap()));
 			assert!(!caps.allows_query(&ArbitraryQueryTarget::from_str("record").unwrap()));
 			assert!(!caps.allows_query(&ArbitraryQueryTarget::from_str("system").unwrap()));
+		}
+	}
+
+	#[test]
+	fn test_eval_query() {
+		// Denied out of the box for every subject — including under
+		// `Capabilities::all()` / `--allow-all`.
+		for caps in [Capabilities::default(), Capabilities::all(), Capabilities::none()] {
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::from_str("guest").unwrap()));
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::from_str("record").unwrap()));
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::from_str("system").unwrap()));
+		}
+
+		// Explicitly enabled for a single subject class.
+		{
+			let caps = Capabilities::all()
+				.with_eval_query(Targets::<EvalQueryTarget>::from(EvalQueryTarget::System));
+			assert!(caps.allows_eval_query(&EvalQueryTarget::System));
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::Record));
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::Guest));
+		}
+
+		// Deny overrides allow.
+		{
+			let caps = Capabilities::all()
+				.with_eval_query(Targets::<EvalQueryTarget>::All)
+				.without_eval_query(Targets::<EvalQueryTarget>::from(EvalQueryTarget::Record));
+			assert!(caps.allows_eval_query(&EvalQueryTarget::System));
+			assert!(!caps.allows_eval_query(&EvalQueryTarget::Record));
 		}
 	}
 }

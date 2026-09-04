@@ -22,7 +22,7 @@ mod graphql_integration {
 	use ulid::Ulid;
 
 	use super::common;
-	use crate::common::{PASS, USER};
+	use crate::common::{Format, PASS, Socket, StartServerArguments, USER};
 
 	#[test(tokio::test)]
 	async fn basic() -> Result<(), Box<dyn std::error::Error>> {
@@ -8555,6 +8555,126 @@ mod graphql_integration {
 		assert!(
 			msg.contains("PageInfo") && msg.contains("built-in"),
 			"expected built-in collision error mentioning PageInfo, got: {body}"
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn graphql_rpc_method() -> Result<(), Box<dyn std::error::Error>> {
+		// GraphQL is not an experimental capability, so a default server (with
+		// auth + a root user) is enough; the `graphql` RPC method is reachable
+		// whenever the query capability allows it.
+		let (addr, _server) = common::start_server(StartServerArguments::default()).await.unwrap();
+		// Connect over WebSocket and authenticate.
+		let mut socket = Socket::connect(&addr, Some(Format::Json), Format::Json).await?;
+		socket.send_message_signin(USER, PASS, None, None, None).await?;
+		// Select a fresh namespace and database.
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		socket.send_message_use(Some(&ns), Some(&db)).await?;
+		// Seed a table and expose it to GraphQL.
+		socket
+			.send_message_query(
+				r#"
+				DEFINE TABLE foo SCHEMAFULL;
+				DEFINE FIELD val ON foo TYPE int;
+				CREATE foo:1 SET val = 42 RETURN NONE;
+				DEFINE CONFIG GRAPHQL AUTO;
+				"#,
+			)
+			.await?;
+		// Execute a GraphQL query through the `graphql` RPC method. The result
+		// is the GraphQL response envelope (`{ data, errors }`).
+		let res = socket.send_request("graphql", json!(["query{ foos { id, val } }"])).await?;
+		assert!(res["error"].is_null(), "result: {res:?}");
+		assert_eq!(
+			res["result"]["data"]["foos"],
+			json!([{ "id": "foo:1", "val": 42 }]),
+			"result: {res:?}"
+		);
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn graphql_rpc_with_variables() -> Result<(), Box<dyn std::error::Error>> {
+		let (addr, _server) = common::start_server(StartServerArguments::default()).await.unwrap();
+		let mut socket = Socket::connect(&addr, Some(Format::Json), Format::Json).await?;
+		socket.send_message_signin(USER, PASS, None, None, None).await?;
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		socket.send_message_use(Some(&ns), Some(&db)).await?;
+		socket
+			.send_message_query(
+				r#"
+				DEFINE TABLE foo SCHEMAFULL;
+				DEFINE FIELD val ON foo TYPE int;
+				CREATE foo:1 SET val = 42 RETURN NONE;
+				CREATE foo:2 SET val = 43 RETURN NONE;
+				DEFINE CONFIG GRAPHQL AUTO;
+				"#,
+			)
+			.await?;
+		// A named operation plus GraphQL variables exercise the second and
+		// third RPC arguments (`variables`, `operation`).
+		let res = socket
+			.send_request(
+				"graphql",
+				json!([
+					"query Foos($n: Int) { foos(limit: $n) { id } }",
+					{ "n": 1 },
+					"Foos"
+				]),
+			)
+			.await?;
+		assert!(res["error"].is_null(), "result: {res:?}");
+		assert_eq!(res["result"]["data"]["foos"], json!([{ "id": "foo:1" }]), "result: {res:?}");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn graphql_rpc_denied_by_deny_rpc() -> Result<(), Box<dyn std::error::Error>> {
+		// `--deny-rpc graphql` must block the method — the per-method RPC
+		// capability is the kill-switch the security section relies on.
+		let (addr, _server) = common::start_server(StartServerArguments {
+			args: "--deny-rpc graphql".to_string(),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+		let mut socket = Socket::connect(&addr, Some(Format::Json), Format::Json).await?;
+		socket.send_message_signin(USER, PASS, None, None, None).await?;
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		socket.send_message_use(Some(&ns), Some(&db)).await?;
+		let res = socket.send_request("graphql", json!(["query{ __typename }"])).await?;
+		let err = &res["error"];
+		assert!(err.is_object(), "result: {res:?}");
+		assert_eq!(err["kind"], "NotAllowed", "error: {err}");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn graphql_rpc_not_configured() -> Result<(), Box<dyn std::error::Error>> {
+		// Without `DEFINE CONFIG GRAPHQL`, the method must surface a clean error
+		// rather than panicking or returning a malformed envelope.
+		let (addr, _server) = common::start_server(StartServerArguments::default()).await.unwrap();
+		let mut socket = Socket::connect(&addr, Some(Format::Json), Format::Json).await?;
+		socket.send_message_signin(USER, PASS, None, None, None).await?;
+		let ns = Ulid::new().to_string();
+		let db = Ulid::new().to_string();
+		socket.send_message_use(Some(&ns), Some(&db)).await?;
+		// Create the database (a table) but deliberately omit the GraphQL config.
+		socket.send_message_query("DEFINE TABLE foo SCHEMALESS;").await?;
+		let res = socket.send_request("graphql", json!(["query{ __typename }"])).await?;
+		let err = &res["error"];
+		assert!(err.is_object(), "result: {res:?}");
+		assert!(
+			err["message"].as_str().unwrap_or_default().to_lowercase().contains("configured"),
+			"error: {err}"
 		);
 
 		Ok(())

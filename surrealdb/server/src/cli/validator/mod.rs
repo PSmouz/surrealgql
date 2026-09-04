@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use surrealdb_core::dbs::capabilities::{
-	ArbitraryQueryTarget, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget, RouteTarget,
-	Targets,
+	ArbitraryQueryTarget, EvalQueryTarget, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
+	RouteTarget, Targets,
 };
 use surrealdb_core::kvs::export::{ExcludedTables, TableConfig};
 use surrealdb_types::Duration;
@@ -124,6 +124,20 @@ pub(crate) fn query_arbitrary_targets(
 
 	for target in value.split(',').filter(|s| !s.is_empty()) {
 		result.insert(ArbitraryQueryTarget::from_str(target).map_err(|e| e.to_string())?);
+	}
+
+	Ok(Targets::Some(result))
+}
+
+pub(crate) fn eval_query_targets(value: &str) -> Result<Targets<EvalQueryTarget>, String> {
+	if ["*", ""].contains(&value) {
+		return Ok(Targets::All);
+	}
+
+	let mut result = HashSet::new();
+
+	for target in value.split(',').filter(|s| !s.is_empty()) {
+		result.insert(EvalQueryTarget::from_str(target).map_err(|e| e.to_string())?);
 	}
 
 	Ok(Targets::Some(result))
@@ -295,5 +309,24 @@ mod tests {
 				.collect()
 			)
 		);
+	}
+
+	#[test]
+	fn test_eval_query_targets() {
+		assert_eq!(eval_query_targets("*").unwrap(), Targets::<EvalQueryTarget>::All);
+		assert_eq!(eval_query_targets("").unwrap(), Targets::<EvalQueryTarget>::All);
+		assert_eq!(
+			eval_query_targets("system").unwrap(),
+			Targets::<EvalQueryTarget>::Some(vec![EvalQueryTarget::System].into_iter().collect())
+		);
+		assert_eq!(
+			eval_query_targets("guest,record,system").unwrap(),
+			Targets::<EvalQueryTarget>::Some(
+				vec![EvalQueryTarget::Guest, EvalQueryTarget::Record, EvalQueryTarget::System]
+					.into_iter()
+					.collect()
+			)
+		);
+		assert!(eval_query_targets("nonsense").is_err());
 	}
 }

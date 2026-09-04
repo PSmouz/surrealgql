@@ -1,0 +1,17 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "The __typename meta field resolves on the root and on object types"
+
+[[test.results]]
+value = "{ __typename: 'Query', person: { __typename: 'person', name: 'Alice' } }"
+*/
+query {
+	__typename
+	person(id: "alice") {
+		__typename
+		name
+	}
+}

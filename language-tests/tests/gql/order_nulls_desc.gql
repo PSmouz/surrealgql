@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "DESC ordering with a missing key: the NONE row comes last."
+
+[[test.results]]
+value = "[{ age: 30, name: 'A' }, { age: 20, name: 'B' }, { age: NONE, name: 'C' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name, n.age AS age ORDER BY age DESC

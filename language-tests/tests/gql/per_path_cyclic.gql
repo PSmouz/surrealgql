@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6 one-row-per-path with edge-uniqueness, made explicit by returning the edge group. On the directed triangle 4->5->6->4 (D/E/F), `{1,3}` from each source produces exactly one path to each of the three hubs: depth 1 (single-edge group) to the next hub, depth 2 (two-edge group) to the one after, and depth 3 (the full three-edge loop) back to the source itself. The group value is the canonical witness that this is per-path, not distinct-reachable: D->D carries the complete loop [l45,l56,l64], while D->E carries just [l45]. Hand-derived: 3 sources x 3 depths = 9 rows; the fourth hop is impossible because every edge is already used (R2 within-path uniqueness)."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'D', bn: 'E', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'D', bn: 'F', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'E', bn: 'D', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'E', bn: 'E', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'E', bn: 'F', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'F', bn: 'D', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'F', bn: 'E', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'F', bn: 'F', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }]"
+*/
+
+MATCH (a:hub)-[g:link]->{1,3}(b:hub) RETURN a.name AS an, b.name AS bn, g AS grp ORDER BY an, bn

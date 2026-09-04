@@ -55,7 +55,7 @@ impl RemoveFieldStatement {
 		// Get the field name
 		let name = name.to_raw_string();
 		// Get the definition
-		let _fd = match txn.get_tb_field(ns, db, &table_name, &name, None).await? {
+		let fd = match txn.get_tb_field(ns, db, &table_name, &name, None).await? {
 			Some(x) => x,
 			None => {
 				if self.if_exists {
@@ -71,6 +71,29 @@ impl RemoveFieldStatement {
 		// Delete the definition
 		let key = crate::key::table::fd::new(ns, db, &table_name, &name);
 		txn.del(&key).await?;
+		// If the removed field declared a REFERENCE, purge the reference keys it
+		// wrote. Those keys live under the referenced (target) record's range,
+		// keyed by the referencing (table, field) rather than under the removed
+		// field, so deleting the field definition above does not remove them.
+		// Passing `new = None` cleans every table the field could target.
+		//
+		// Unlike ALTER FIELD and DEFINE FIELD ... OVERWRITE, this is NOT gated
+		// on `opt.import`: a removed field must never leave reference keys
+		// behind, and there is no verbatim-restore case to preserve here (a
+		// removed field has no keys to re-establish). The import guard on
+		// ALTER/DEFINE exists to avoid purging keys an in-progress import is
+		// restoring for a field that still exists; a consistent import that
+		// removes a field carries no keys for it, so purging unconditionally is
+		// at worst a no-op and never deletes live data.
+		crate::expr::statements::define::purge_dropped_reference_keys(
+			&txn,
+			ns,
+			db,
+			&table_name,
+			&fd,
+			None,
+		)
+		.await?;
 		// Refresh the table cache for fields
 		let Some(tb) = txn.get_tb(ns, db, &table_name, None).await? else {
 			return Err(Error::TbNotFound {

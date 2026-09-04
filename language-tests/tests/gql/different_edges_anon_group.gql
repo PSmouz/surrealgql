@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "R2 (DIFFERENT EDGES) across an ANONYMOUS quantified edge group and a second named edge sharing the same edge table, within one MATCH statement. The anonymous `{1,1}` group has a hidden `__e<n>` binding; the planner must still bind that group on the row so DistinctEdges can read its edge ids and drop a row where the same edge record fills both the group position and `k2`. Pins the regression for the anonymous-group R2 skip (V2_DESIGN R2 / §5 DistinctEdges): without the group binding, the diagonal rows {b:'A',c:'A',e2:knows:k21} and {b:'C',c:'C',e2:knows:k23} (same edge reused) would leak. From B (person:2) the two distinct outgoing person-knows edges are B->A (k21) and B->C (k23), so only the two off-diagonal rows survive."
+
+[[test.results]]
+value = "[{ b: 'A', c: 'C', e2: knows:k23 }, { b: 'C', c: 'A', e2: knows:k21 }]"
+*/
+
+MATCH (a:person)-[:knows]->{1,1}(b:person), (a)-[k2:knows]->(c:person)
+WHERE a.name = 'B'
+RETURN b.name AS b, c.name AS c, k2.id AS e2 ORDER BY b, c

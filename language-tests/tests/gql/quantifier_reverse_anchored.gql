@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Unprefixed (plain, every-path) reverse-anchored quantified pattern: the pattern is bound on its far node `b` (= Y1) and traverses `road` backwards, so `PathExpand` runs reversed. The emitted path `p` must still read in the pattern's WRITTEN order (start `a` → end `b`), i.e. `[X, road:xy1, Y1]`, not the traversal order `[Y1, road:xy1, X]`. Only X reaches Y1 (single edge), so one row with a 3-element path."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1', pth: [{ id: wp:x, name: 'X' }, { id: road:xy1, in: wp:x, out: wp:y1 }, { id: wp:y1, name: 'Y1' }] }]"
+*/
+
+MATCH (b:wp WHERE b.name = 'Y1'), p = (a)-[:road]->+(b)
+RETURN a.name AS an, b.name AS bn, p AS pth ORDER BY an

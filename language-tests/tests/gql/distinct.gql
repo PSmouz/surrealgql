@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "RETURN DISTINCT deduplicates rows (b = person:1 is reached from both person:2 and person:3) and ORDER BY on the returned item is allowed."
+
+[[test.results]]
+value = "[{ name: 'A' }, { name: 'B' }, { name: 'C' }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN DISTINCT b.name AS name ORDER BY name

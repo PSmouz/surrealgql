@@ -4,6 +4,7 @@ use reblessive::tree::Stk;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::doc::CursorDoc;
+use crate::err::Error;
 use crate::expr::FlowResultExt as _;
 use crate::expr::paths::ID;
 use crate::val::{RecordId, Value};
@@ -13,7 +14,15 @@ pub async fn exists(
 	(arg,): (RecordId,),
 ) -> Result<Value> {
 	if let Some(opt) = opt {
-		let v = Value::RecordId(arg).get(stk, ctx, opt, doc, ID.as_ref()).await.catch_return()?;
+		let v = match Value::RecordId(arg).get(stk, ctx, opt, doc, ID.as_ref()).await.catch_return()
+		{
+			Ok(v) => v,
+			// An undefined table means the record cannot exist.
+			Err(e) if matches!(e.downcast_ref(), Some(Error::TbNotFound { .. })) => {
+				return Ok(Value::Bool(false));
+			}
+			Err(e) => return Err(e),
+		};
 		Ok(Value::Bool(!v.is_none()))
 	} else {
 		Ok(Value::None)

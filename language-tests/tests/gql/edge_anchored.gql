@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "EDGE-ANCHORED multi-pattern (worked tree ii): the nodes carry NO label but the edges are labeled `:knows`, so each pattern is planned edge-first — TableScan(knows) + Bind + EndpointBind(in) + EndpointBind(out) to recover the endpoint nodes — and the two patterns HashJoin on the shared far node `b`. Because the nodes are unlabeled, the far-label filter that excludes the person->city edge in the node-anchored corpus is GONE here, so k1c (A->city:1) participates. R2 spans the single statement (both `knows` edges must be distinct records). Hand-derived by target b: b=B {k12}, b=A {k21,k31}, b=C {k23}, b=city:1 {k1c}; only b=A offers two distinct in-edges, so after R2 the survivors are (a=B via k21, c=C via k31) and (a=C via k31, c=B via k21), both reaching b=A. The single-edge targets (B, C, city:1) collapse to the same edge in both positions and are dropped."
+
+[[test.results]]
+value = "[{ a: 'B', b: 'A', c: 'C' }, { a: 'C', b: 'A', c: 'B' }]"
+*/
+
+MATCH (a)-[:knows]->(b), (c)-[:knows]->(b)
+RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, c

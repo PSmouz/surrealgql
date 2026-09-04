@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL bulk create mutation inserts multiple records at once"
+
+[[test.results]]
+value = "{ createPersons: [{ id: 'person:dave', name: 'Dave' }, { id: 'person:erin', name: 'Erin' }] }"
+*/
+mutation {
+	createPersons(data: [
+		{ id: "dave", name: "Dave", age: 41, active: true, score: 2.5, tags: [], address: { city: "Oslo", country: "NO" } },
+		{ id: "erin", name: "Erin", age: 28, active: false, score: 4.0, tags: ["qa"], address: { city: "Rome", country: "IT" } }
+	]) {
+		id
+		name
+	}
+}

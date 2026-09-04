@@ -39,10 +39,10 @@ impl Resolved {
 /// - Maintains bidirectional mappings between DocIds and record IDs
 /// - Supports efficient ID resolution, retrieval, and removal
 /// - Enables concurrent document indexing operations
-/// - Allocates IDs in batches for better performance
+/// - Allocates IDs in batches for better performance (configurable via
+///   `SURREAL_FTS_DOC_IDS_BATCH_SIZE`; see [`crate::cnf::CommonConfig`])
 pub(crate) struct SeqDocIds {
 	ikb: IndexKeyBase,
-	batch: u32,
 }
 
 impl SeqDocIds {
@@ -54,7 +54,6 @@ impl SeqDocIds {
 	/// * `ikb` - The index key base containing namespace, database, table, and index information
 	pub(in crate::idx) fn new(ikb: IndexKeyBase) -> Self {
 		Self {
-			batch: 1000, // TODO ekeller: Make that configurable?
 			ikb,
 		}
 	}
@@ -106,7 +105,7 @@ impl SeqDocIds {
 		// If not, let's get one from the sequence
 		let new_doc_id = ctx
 			.try_get_sequences()?
-			.next_fts_doc_id(Some(ctx), self.ikb.clone(), self.batch)
+			.next_fts_doc_id(Some(ctx), self.ikb.clone(), ctx.config.fts_doc_ids_batch_size)
 			.await? as DocId;
 		{
 			tx.set(&id_key, &new_doc_id).await?;

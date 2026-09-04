@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Parse rejection: a path-search count must be a positive integer; `SHORTEST 0` selects no paths."
+
+[test.results]
+parsing-error = """
+A path search count must be a positive integer
+  --> [15:16]
+   |
+15 | MATCH SHORTEST 0 (a:wp)-[:road]->+(b:wp) RETURN a.name AS an
+   |                ^
+"""
+*/
+
+MATCH SHORTEST 0 (a:wp)-[:road]->+(b:wp) RETURN a.name AS an

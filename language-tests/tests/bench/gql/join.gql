@@ -1,0 +1,17 @@
+/**
+[bench]
+reason = "GQL multi-pattern shared-variable join: three comma-separated patterns all fanning out from the same start node `a` over the 5000-node knows graph (out-degree 4). The planner equi-joins the three Expands on `a` (HashJoin) and DIFFERENT EDGES (R2) drops rows reusing an edge, stressing the multi-pattern join + DistinctEdges path. Each `a` contributes 4*3*2 = 24 ordered distinct-edge triples -> 120000 result paths."
+run = true
+rebuild = false
+imports = ["bench/gql/util/knows-graph-5000.surql"]
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+MATCH (a:person)-[:knows]->(b:person),
+      (a)-[:knows]->(c:person),
+      (a)-[:knows]->(d:person)
+RETURN a.name AS a, b.name AS b, c.name AS c, d.name AS d

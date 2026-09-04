@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "The far-end label filter (record::tb on the edge's out field) selects only edges into the labeled table: just the single person->city edge."
+
+[[test.results]]
+value = "[{ an: 'A', cn: 'London' }]"
+*/
+
+MATCH (a:person)-[k:knows]->(c:city) RETURN a.name AS an, c.name AS cn ORDER BY cn

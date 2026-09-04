@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL update mutation merges data into an existing record"
+
+[[test.results]]
+value = "{ updatePerson: { active: true, age: 26, name: 'Bob', score: 3.5f } }"
+*/
+mutation {
+	updatePerson(id: "bob", data: { age: 26, active: true }) {
+		name
+		age
+		active
+		score
+	}
+}

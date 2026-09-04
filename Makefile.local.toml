@@ -1,5 +1,5 @@
 [env]
-RUSTFLAGS = { value = "-D warnings --cfg tokio_unstable", condition = { env_not_set = [
+RUSTFLAGS = { value = "-D warnings", condition = { env_not_set = [
     "RUSTFLAGS",
 ] } }
 
@@ -121,7 +121,7 @@ args = [
 
 [tasks.profile]
 category = "LOCAL USAGE"
-description = "Build the SurrealDB database server with the `profiling` profile (release optimisations + symbols, no strip). Same default features as `cargo make release` — both inherit the root crate's `default` from Cargo.toml. Binary lands at target/profiling/surreal; use for `sample`, `perf`, flamegraphs, etc."
+description = "Build the SurrealDB database server with the `profiling` profile"
 command = "cargo"
 args = [
     "build",
@@ -129,3 +129,9 @@ args = [
     "profiling",
     "${@}",
 ]
+
+[tasks.bench]
+category = "LOCAL USAGE"
+description = "Measure a single language-test bench"
+command = "scripts/bench/bench.sh"
+args = ["${@}"]

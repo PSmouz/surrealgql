@@ -1,9 +1,7 @@
 use std::mem;
 
-use crate::cmd::bench::stats::{
-	rand_util::{Rng, new_rng},
-	univariate::Sample,
-};
+use crate::cmd::bench::stats::rand_util::{Rng, new_rng};
+use crate::cmd::bench::stats::univariate::Sample;
 
 pub struct Resamples<'a> {
 	rng: Rng,
@@ -56,7 +54,8 @@ impl<'a> Resamples<'a> {
 
 #[cfg(test)]
 mod test {
-	use crate::cmd::bench::stats::univariate::{Sample, resamples::Resamples};
+	use crate::cmd::bench::stats::univariate::Sample;
+	use crate::cmd::bench::stats::univariate::resamples::Resamples;
 
 	#[test]
 	fn different_subsets() {

@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "The generic _get query fetches any record by its full id and supports inline fragments"
+
+[[test.results]]
+value = "{ _get: { __typename: 'person', age: 25, name: 'Bob' } }"
+*/
+query {
+	_get(id: "person:bob") {
+		__typename
+		... on person {
+			name
+			age
+		}
+	}
+}

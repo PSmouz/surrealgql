@@ -29,6 +29,7 @@ use crate::exec::operators::{
 };
 #[cfg(all(storage, not(target_family = "wasm")))]
 use crate::exec::operators::{ExternalSort, ExternalSortByKey};
+use crate::exec::topk_pushdown::{TopKPushdownHandle, TopKPushdownReason};
 use crate::exec::{ExecOperator, OperatorMetrics};
 use crate::expr::field::Fields;
 use crate::expr::{Cond, Expr, Idiom};
@@ -74,6 +75,10 @@ pub(crate) struct SelectPipelineConfig {
 	pub start: Option<crate::expr::start::Start>,
 	pub omit: Vec<Expr>,
 	pub tempfiles: bool,
+	/// TopK threshold pushdown handle created by source planning; installed
+	/// into the sort operator by [`Planner::plan_sort_consolidated`] when the
+	/// sort plan matches the probe the scan was compiled against.
+	pub topk_pushdown: Option<TopKPushdownHandle>,
 }
 
 /// Describes how the WHERE predicate should be handled after source planning.
@@ -97,6 +102,9 @@ pub(crate) struct PlannedSource {
 	pub(crate) filter_action: FilterAction,
 	/// The limit and start values were consumed by the source operator.
 	pub(crate) limit_pushed: bool,
+	/// TopK threshold pushdown handle when the source built a scan-side
+	/// probe (TableScan only); the pipeline hands it to sort planning.
+	pub(crate) topk_pushdown: Option<TopKPushdownHandle>,
 }
 
 /// Determine `FilterAction` when a scan predicate has been compiled.
@@ -113,6 +121,147 @@ pub(crate) fn filter_action_for_predicate(
 	} else {
 		FilterAction::UseOriginal
 	}
+}
+
+// ============================================================================
+// TopK threshold pushdown request
+// ============================================================================
+
+/// First ORDER BY key analysis for TopK threshold pushdown, computed by
+/// [`compute_topk_pushdown_request`] before source planning.
+pub(crate) struct TopKFirstKeySpec {
+	/// The first ORDER BY key exactly as [`Planner::plan_sort_consolidated`]
+	/// will build it — the install guard compares against this.
+	pub(crate) first_key: SortKey,
+	/// Total ORDER BY key count; `1` lets the scan probe reject ties.
+	pub(crate) key_count: usize,
+}
+
+/// Whether (and why not) the SELECT's ORDER BY + LIMIT shape allows the scan
+/// to reject rows against the TopK heap's threshold before record decode.
+///
+/// Computed once in `plan_select` and threaded to `plan_table_scan_source`,
+/// which builds the probe ([`crate::exec::topk_pushdown`]) for `Eligible`
+/// and surfaces `Ineligible` reasons in EXPLAIN.
+pub(crate) enum TopKPushdownRequest {
+	/// No pushdown opportunity at all (no ORDER BY, `ORDER BY RAND()`,
+	/// first key `id`, SPLIT/GROUP/KNN shapes, feature disabled) — the
+	/// `topk_pushdown` EXPLAIN attribute is omitted.
+	NotApplicable,
+	/// An ORDER BY + LIMIT opportunity exists but the shape disqualifies it;
+	/// surfaced as `topk_pushdown: no (…)` in EXPLAIN.
+	Ineligible(TopKPushdownReason),
+	/// The first key is a raw field path the scan can probe on wire bytes.
+	Eligible(TopKFirstKeySpec),
+}
+
+/// Analyse the SELECT's ORDER BY / LIMIT / START for TopK threshold pushdown.
+///
+/// Mirrors [`Planner::plan_sort_consolidated`]'s first-key resolution: any
+/// shape that would route the first key through the expression registry
+/// (alias to expression, multi-part alias idiom, lookup, unconvertible idiom)
+/// produces a synthetic post-decode sort key that cannot be probed on raw
+/// bytes. The mirror need not be perfect — the install guard in
+/// `plan_sort_consolidated` re-checks the actually-built sort keys against
+/// [`TopKFirstKeySpec::first_key`], so a divergence only leaves the probe
+/// dormant.
+///
+/// `disqualified` covers plan shapes where rows are duplicated, regrouped, or
+/// ranked between scan and sort (SPLIT, GROUP BY, brute-force KNN).
+pub(crate) fn compute_topk_pushdown_request(
+	order: Option<&crate::expr::order::Ordering>,
+	start: &Option<crate::expr::start::Start>,
+	limit: &Option<crate::expr::limit::Limit>,
+	fields: &Fields,
+	tempfiles: bool,
+	disqualified: bool,
+	max_priority_queue_size: usize,
+) -> TopKPushdownRequest {
+	use crate::expr::order::Ordering;
+	use crate::expr::part::Part;
+
+	if disqualified {
+		return TopKPushdownRequest::NotApplicable;
+	}
+	// `Random` uses RandomShuffle; no heap, no threshold.
+	let Some(Ordering::Order(order_list)) = order else {
+		return TopKPushdownRequest::NotApplicable;
+	};
+	let Some(first) = order_list.0.first() else {
+		return TopKPushdownRequest::NotApplicable;
+	};
+	// No LIMIT clause means no top-K at all — not an opportunity that was
+	// missed, so the EXPLAIN attribute is omitted rather than surfaced as a
+	// bail reason.
+	if limit.is_none() {
+		return TopKPushdownRequest::NotApplicable;
+	}
+	// Without a literal effective limit within the priority-queue bound
+	// (parameter / expression limits, or START pushing the effective limit
+	// over the cap), the plan uses a full sort — no heap threshold exists.
+	match get_effective_limit_literal(start, limit) {
+		Some(effective_limit) if effective_limit <= max_priority_queue_size => {}
+		_ => return TopKPushdownRequest::Ineligible(TopKPushdownReason::LimitTooLarge),
+	}
+	// TEMPFILES routes to disk-backed sort before the LIMIT-based heap
+	// selection (see plan_sort_consolidated).
+	if tempfiles {
+		return TopKPushdownRequest::Ineligible(TopKPushdownReason::Tempfiles);
+	}
+	// COLLATE / NUMERIC comparison modes are not replicated by the wire probe.
+	if first.collate || first.numeric {
+		return TopKPushdownRequest::Ineligible(TopKPushdownReason::UnsupportedOrder);
+	}
+	// Resolve the first key the way plan_sort_consolidated will: alias
+	// resolution first, then FieldPath conversion. Registry-computed shapes
+	// (the `registry.register` branches there) are synthetic post-decode
+	// fields — not probeable.
+	let idiom = &first.value;
+	let field_path = if let Some((resolved_expr, _alias)) = resolve_order_by_alias(idiom, fields) {
+		match &resolved_expr {
+			Expr::Idiom(inner_idiom)
+				if inner_idiom.len() == 1
+					&& !inner_idiom.0.iter().any(|p| matches!(p, Part::Lookup(_))) =>
+			{
+				match FieldPath::try_from(inner_idiom) {
+					Ok(path) => path,
+					Err(_) => {
+						return TopKPushdownRequest::Ineligible(
+							TopKPushdownReason::UnsupportedOrder,
+						);
+					}
+				}
+			}
+			_ => return TopKPushdownRequest::Ineligible(TopKPushdownReason::UnsupportedOrder),
+		}
+	} else {
+		match FieldPath::try_from(idiom) {
+			Ok(path) => path,
+			Err(_) => return TopKPushdownRequest::Ineligible(TopKPushdownReason::UnsupportedOrder),
+		}
+	};
+	// Non-Field parts (indices, lookups) cannot be walked on wire bytes, and
+	// `id` is synthetic (derived from the KV key, owned by the scan-direction
+	// optimisation) — `field_path_wire_segments` re-checks this when the
+	// probe is built, but `id` specifically is NotApplicable rather than a
+	// surfaced bail.
+	use crate::exec::field_path::FieldPathPart;
+	if matches!(field_path.0.first(), Some(FieldPathPart::Field(f)) if f == "id") {
+		return TopKPushdownRequest::NotApplicable;
+	}
+	if crate::exec::topk_pushdown::field_path_wire_segments(&field_path).is_none() {
+		return TopKPushdownRequest::Ineligible(TopKPushdownReason::UnsupportedOrder);
+	}
+	let mut first_key = SortKey::new(field_path);
+	first_key.direction = if first.direction {
+		SortDirection::Asc
+	} else {
+		SortDirection::Desc
+	};
+	TopKPushdownRequest::Eligible(TopKFirstKeySpec {
+		first_key,
+		key_count: order_list.0.len(),
+	})
 }
 
 // ============================================================================
@@ -136,7 +285,18 @@ impl<'ctx> Planner<'ctx> {
 			start,
 			omit,
 			tempfiles,
+			topk_pushdown,
 		} = config;
+
+		// Defensive: the pushdown request is NotApplicable for SPLIT/GROUP
+		// shapes, so the handle should already be None here — but row
+		// duplication between scan and sort would be unsound, so drop it
+		// structurally rather than rely on the upstream gate alone.
+		let topk_pushdown = if split.is_some() || group.is_some() {
+			None
+		} else {
+			topk_pushdown
+		};
 
 		let filtered = match where_clause {
 			WhereClauseState::None => source,
@@ -206,6 +366,7 @@ impl<'ctx> Planner<'ctx> {
 					&limit,
 					tempfiles,
 					&mut registry,
+					topk_pushdown,
 				)
 				.await?
 			}
@@ -359,6 +520,7 @@ impl<'ctx> Planner<'ctx> {
 		limit: &Option<crate::expr::limit::Limit>,
 		#[allow(unused)] tempfiles: bool,
 		registry: &mut ExpressionRegistry,
+		topk_pushdown: Option<TopKPushdownHandle>,
 	) -> Result<(Arc<dyn ExecOperator>, Vec<String>), Error> {
 		use crate::expr::order::Ordering;
 		use crate::expr::part::Part;
@@ -487,11 +649,21 @@ impl<'ctx> Planner<'ctx> {
 					&& effective_limit
 						<= self.ctx.config.max_order_limit_priority_queue_size as usize
 				{
-					return Ok((
-						Arc::new(SortTopKByKey::new(computed, sort_keys, effective_limit))
-							as Arc<dyn ExecOperator>,
-						sort_only_fields,
-					));
+					let mut topk = SortTopKByKey::new(computed, sort_keys, effective_limit);
+					// Install the TopK threshold publish side only when the
+					// sort keys actually built here match what the scan-side
+					// probe was compiled against (path, direction, modifiers,
+					// key count). Any divergence — alias resolution or
+					// registry compute differing from the request-time
+					// analysis — leaves the cell unpublished, keeping the
+					// scan probe dormant rather than wrong.
+					if let Some(handle) = topk_pushdown
+						&& topk.sort_keys.first() == Some(&handle.expected_first_key)
+						&& topk.sort_keys.len() == handle.expected_key_count
+					{
+						topk = topk.with_threshold_cell(handle.cell);
+					}
+					return Ok((Arc::new(topk) as Arc<dyn ExecOperator>, sort_only_fields));
 				}
 
 				Ok((

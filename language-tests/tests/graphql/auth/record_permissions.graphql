@@ -1,0 +1,17 @@
+/**
+[env]
+imports = ["./_auth.surql"]
+auth = { namespace = "test", database = "test", access = "user", rid = "user:alice" }
+
+[test]
+reason = "GraphQL queries run under the session's auth: a record user only sees records its permissions allow"
+
+[[test.results]]
+value = "{ users: [{ email: 'alice@example.com', id: 'user:alice' }] }"
+*/
+query {
+	users {
+		id
+		email
+	}
+}

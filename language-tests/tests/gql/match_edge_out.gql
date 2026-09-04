@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "One outgoing hop with far-end label: one row per (anchor, edge) binding; the person->city edge is excluded by the far label, the edge without since surfaces NONE and sorts first under ASC."
+
+[[test.results]]
+value = "[{ an: 'C', bn: 'A', since: NONE }, { an: 'B', bn: 'A', since: 2018 }, { an: 'B', bn: 'C', since: 2020 }, { an: 'A', bn: 'B', since: 2021 }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS an, k.since AS since, b.name AS bn ORDER BY since

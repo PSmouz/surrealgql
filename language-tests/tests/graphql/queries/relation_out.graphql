@@ -1,0 +1,21 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Outgoing relation fields traverse the relation with ordering, and record links on the relation resolve"
+
+[[test.results]]
+value = "{ person: { likes: [{ out: { title: 'Hello world' }, rating: 5 }, { out: { title: 'Intro to GraphQL' }, rating: 3 }], name: 'Alice' } }"
+*/
+query {
+	person(id: "alice") {
+		name
+		likes(order: {desc: rating}) {
+			rating
+			out {
+				title
+			}
+		}
+	}
+}

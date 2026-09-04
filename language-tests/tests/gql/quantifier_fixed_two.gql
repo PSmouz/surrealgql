@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: fixed quantifier `{2}` == `{2,2}` — emit at exactly depth 2 only. In v1 a minimum above one was a lowering rejection ('Variable-length quantifiers with a minimum greater than one are not supported yet'); v2's PathExpand has a real emit window so min > 1 is supported. On the triangle the unique two-hop path from each source lands on the hub two steps ahead: D->E->F (F), E->F->D (D), F->D->E (E). 3 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'F' }, { an: 'E', bn: 'D' }, { an: 'F', bn: 'E' }]"
+*/
+
+MATCH (a:hub)-[:link]->{2}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

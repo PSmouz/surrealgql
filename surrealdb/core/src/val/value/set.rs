@@ -146,24 +146,36 @@ impl Value {
 						_ => return Ok(()),
 					}
 				}
-				Part::First => {
-					let Value::Array(arr) = place else {
-						return Ok(());
-					};
-					let Some(x) = arr.first_mut() else {
-						return Ok(());
-					};
-					place = x
-				}
-				Part::Last => {
-					let Value::Array(arr) = place else {
-						return Ok(());
-					};
-					let Some(x) = arr.last_mut() else {
-						return Ok(());
-					};
-					place = x
-				}
+				Part::First => match place {
+					Value::Array(arr) => {
+						let Some(x) = arr.first_mut() else {
+							return Ok(());
+						};
+						place = x;
+					}
+					Value::Set(set) => {
+						let Some(x) = set.first_mut() else {
+							return Ok(());
+						};
+						place = x;
+					}
+					_ => return Ok(()),
+				},
+				Part::Last => match place {
+					Value::Array(arr) => {
+						let Some(x) = arr.last_mut() else {
+							return Ok(());
+						};
+						place = x;
+					}
+					Value::Set(set) => {
+						let Some(x) = set.last_mut() else {
+							return Ok(());
+						};
+						place = x;
+					}
+					_ => return Ok(()),
+				},
 				Part::All => {
 					let path = iter.as_slice();
 					match place {
@@ -300,6 +312,36 @@ impl Value {
 					arr[last_idx] = val;
 				} else {
 					arr[last_idx].set_at_field_path_owned_depth(path, val, depth + 1);
+				}
+			}
+			// Index on set - must come before the catch-all set pattern
+			(Value::Set(set), FieldPathPart::Index(i)) if set.nth(*i).is_some() => {
+				if let Some(elem) = set.nth_mut(*i) {
+					if is_last {
+						*elem = val;
+					} else {
+						elem.set_at_field_path_owned_depth(path, val, depth + 1);
+					}
+				}
+			}
+			// First element of set
+			(Value::Set(set), FieldPathPart::First) if !set.is_empty() => {
+				if let Some(elem) = set.first_mut() {
+					if is_last {
+						*elem = val;
+					} else {
+						elem.set_at_field_path_owned_depth(path, val, depth + 1);
+					}
+				}
+			}
+			// Last element of set
+			(Value::Set(set), FieldPathPart::Last) if !set.is_empty() => {
+				if let Some(elem) = set.last_mut() {
+					if is_last {
+						*elem = val;
+					} else {
+						elem.set_at_field_path_owned_depth(path, val, depth + 1);
+					}
 				}
 			}
 			// Array with Field/Lookup key: apply remaining path to all elements.

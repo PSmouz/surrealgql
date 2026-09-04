@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Inline WHERE inside a node pattern merges into the predicate set with the same guards as a clause-level WHERE."
+
+[[test.results]]
+value = "[{ name: 'A' }, { name: 'B' }]"
+*/
+
+MATCH (n:person WHERE n.age > 18) RETURN n.name AS name ORDER BY name

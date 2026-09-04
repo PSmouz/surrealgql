@@ -21,6 +21,7 @@ mod api;
 mod batch;
 mod clock;
 mod consts;
+mod cursor;
 mod direction;
 mod ds;
 mod err;
@@ -49,7 +50,7 @@ pub(crate) mod tasklease;
 pub(crate) mod version;
 
 pub use api::{
-	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanLimit, ScanResult, Transactable,
+	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanResult, Transactable,
 };
 pub use consts::{
 	COUNT_BATCH_SIZE, ESTIMATED_BYTES_PER_KEY, ESTIMATED_BYTES_PER_KV, INDEXING_BATCH_SIZE,
@@ -169,6 +170,7 @@ pub(crate) mod testing {
 		retryable_conflicts().lock().unwrap().get(&(site, node_id)).copied().unwrap_or(0)
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn inject_non_retryable_error(
 		site: NonRetryableErrorSite,
 		node_id: Uuid,
@@ -176,6 +178,7 @@ pub(crate) mod testing {
 		inject_non_retryable_errors(site, node_id, 1)
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) fn inject_non_retryable_errors(
 		site: NonRetryableErrorSite,
 		node_id: Uuid,
@@ -215,6 +218,7 @@ pub(crate) mod testing {
 		}
 	}
 
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) struct NonRetryableErrorGuard {
 		site: NonRetryableErrorSite,
 		node_id: Uuid,

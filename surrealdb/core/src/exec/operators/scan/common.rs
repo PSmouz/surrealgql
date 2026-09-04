@@ -5,12 +5,15 @@
 
 use std::sync::Arc;
 
+use super::pipeline::{
+	FieldState, build_field_state, compute_fields_for_value, filter_fields_by_permission,
+};
 use crate::catalog::providers::TableProvider;
 use crate::catalog::{DatabaseId, NamespaceId};
 use crate::exec::{ControlFlowExt, EvalContext, ExecutionContext, PhysicalExpr};
 use crate::expr::ControlFlow;
 use crate::kvs::{CachePolicy, Transaction};
-use crate::val::{RecordId, RecordIdKey, Value};
+use crate::val::{RecordId, RecordIdKey, TableName, Value};
 
 /// Default value for [`crate::cnf::CommonConfig::scan_batch_size`] — the
 /// number of records each scan operator buffers before yielding a batch
@@ -126,6 +129,18 @@ pub(crate) async fn resolve_version_stamp(
 /// fetching records and just wraps each id as `Value::RecordId`. Any other
 /// combination requires reading the record so the permission predicate (if
 /// any) can be evaluated against the actual data.
+///
+/// SECURITY: when `fetch_full` is `true` the materialised record must go
+/// through the *same* field-level processing as an ordinary table scan
+/// ([`super::pipeline::filter_and_process_batch`]) and [`fetch_record`]
+/// ([`crate::exec::operators::fetch::process_fetched_record`]): read-time
+/// `COMPUTED` fields are always evaluated, and field-level SELECT
+/// permissions are applied whenever `check_perms` is set. Resolving only the
+/// table-level permission here (the previous behaviour) let a graph or
+/// reference traversal that yields full edge/record objects expose
+/// field-restricted data to callers whose field permissions should hide it,
+/// and dropped computed fields — diverging from both the legacy compute
+/// engine and a direct `SELECT *` on the same table.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_record_batch(
 	ctx: &ExecutionContext,
@@ -180,6 +195,20 @@ pub(crate) async fn resolve_record_batch(
 		.await
 		.context("Failed to fetch records")?;
 
+	// Per-table field state (computed fields + field-level SELECT
+	// permissions), built lazily and reused across the records of this batch.
+	// `build_field_state` is itself cached per `(table, check_perms)` on the
+	// database context, so the cross-batch cost is just a lookup + clone; the
+	// local map avoids even that for the common single-table batch.
+	let mut field_state_cache: std::collections::HashMap<TableName, FieldState> =
+		std::collections::HashMap::new();
+	// Computed-field record dereferences must reuse the ambient
+	// `skip_fetch_perms` so that, when this runs inside a permission predicate,
+	// they don't recurse back into permission checks on cyclic links — matching
+	// `fetch_record` (false) vs `fetch_record_no_perms` (true). `check_perms`
+	// is always false in the `skip_fetch_perms` case (see `should_check_perms`).
+	let skip_fetch_perms = ctx.root().skip_fetch_perms;
+
 	let mut values = Vec::with_capacity(rids.len());
 	for (rid, record) in rids.iter().zip(records) {
 		// Missing records cannot disclose information.
@@ -198,10 +227,27 @@ pub(crate) async fn resolve_record_batch(
 		}
 
 		if fetch_full {
-			let value = match Arc::try_unwrap(record) {
+			let mut value = match Arc::try_unwrap(record) {
 				Ok(rec) => rec.data,
 				Err(arc) => arc.data.clone(),
 			};
+
+			// Apply the same field-level processing as ordinary table scans
+			// and `fetch_record`: evaluate read-time computed fields, then
+			// (when permissions are enforced) cut field-restricted values.
+			// Without this, a graph/reference traversal yielding full
+			// records would bypass field-level SELECT permissions and omit
+			// computed fields. See the SECURITY note on this function.
+			if !field_state_cache.contains_key(&rid.table) {
+				let fs = build_field_state(ctx, &rid.table, check_perms, None).await?;
+				field_state_cache.insert(rid.table.clone(), fs);
+			}
+			let field_state = &field_state_cache[&rid.table];
+			compute_fields_for_value(ctx, field_state, &mut value, skip_fetch_perms).await?;
+			if check_perms {
+				filter_fields_by_permission(ctx, field_state, &mut value).await?;
+			}
+
 			values.push(value);
 		} else {
 			values.push(Value::RecordId(rid.clone()));

@@ -597,6 +597,13 @@ impl Parse for ast::Relate {
 		let start = parser.expect(T![RELATE])?;
 		let only = parser.eat(T![ONLY])?.is_some();
 
+		let or_update = if parser.eat(T![OR])?.is_some() {
+			let _ = parser.expect(T![UPDATE])?;
+			true
+		} else {
+			false
+		};
+
 		let first = parse_relate_expr(parser).await?;
 
 		let peek = parser.peek_expect("`->` or `<-`")?;
@@ -693,6 +700,7 @@ impl Parse for ast::Relate {
 		let span = parser.span_since(start.span);
 		Ok(ast::Relate {
 			only,
+			or_update,
 			from,
 			through,
 			to,

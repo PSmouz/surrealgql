@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: node label expressions have no table mapping."
+
+[test.results]
+parsing-error = '''
+Label expressions (`!`, `&`, `|`, `%`) are not supported yet
+  --> [15:10]
+   |
+15 | MATCH (n:person|animal) RETURN n
+   |          ^^^^^^^^^^^^^ use a single label name
+'''
+*/
+
+MATCH (n:person|animal) RETURN n

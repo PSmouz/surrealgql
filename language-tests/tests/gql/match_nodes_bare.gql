@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Whole-node binding: RETURN n yields the full record per row; ordered by the aliased name column."
+
+[[test.results]]
+value = "[{ n: { active: true, age: 30, city: 'London', id: person:1, name: 'A' }, name: 'A' }, { n: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' }, name: 'B' }, { n: { city: 'London', id: person:3, name: 'C' }, name: 'C' }]"
+*/
+
+MATCH (n:person) RETURN n, n.name AS name ORDER BY name

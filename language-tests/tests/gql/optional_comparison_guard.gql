@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A comparison guard on an OPTIONAL binding's property EXCLUDES non-matching candidates and never errors (R3 + 3VL). The predicate `b.age = 20` rides the optional match pre-null. Hand-derived over the person->person knows graph (A->B; B->A, B->C; C->A) with ages A=30, B=20, C=(none): for A the only neighbour B has age 20 -> kept (friend = 'B'); for B the neighbours are A (age 30, 30=20 false) and C (NO age field, so `none = 20` is 3VL-false — it FILTERS, it does not throw) -> zero survivors -> null-fill (friend = NONE); for C the only neighbour A (age 30) fails -> null-fill (friend = NONE). The mandatory `a` rows are preserved throughout."
+
+[[test.results]]
+value = "[{ friend: 'B', name: 'A' }, { friend: NONE, name: 'B' }, { friend: NONE, name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b.age = 20 RETURN a.name AS name, b.name AS friend ORDER BY name, friend

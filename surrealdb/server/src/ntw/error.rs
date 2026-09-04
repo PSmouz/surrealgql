@@ -15,6 +15,9 @@ pub enum Error {
 	#[error("The server is unable to handle the request")]
 	ServerOverloaded,
 
+	#[error("The server is still starting up and is not ready to serve requests")]
+	NotReady,
+
 	#[error("The request body contains invalid data")]
 	Request,
 
@@ -80,6 +83,13 @@ impl IntoResponse for Error {
 					code: StatusCode::INTERNAL_SERVER_ERROR,
 					details: Some("Health check failed".to_string()),
 					description: Some("The database health check for this instance failed. There was an issue with the underlying storage engine.".to_string()),
+					information: Some(self.to_string()),
+				}.into_response(),
+			Error::NotReady =>
+				ErrorMessage {
+					code: StatusCode::SERVICE_UNAVAILABLE,
+					details: Some("Service unavailable".to_string()),
+					description: Some("The server is still starting up and cannot serve this request yet. Retry once the instance is ready.".to_string()),
 					information: Some(self.to_string()),
 				}.into_response(),
 			_ => ErrorMessage {

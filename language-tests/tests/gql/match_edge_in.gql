@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "One incoming hop: the anchor is the leftmost node (here b), the far node derives from the edge's in field; same binding set as the outgoing form, mirrored."
+
+[[test.results]]
+value = "[{ an: 'C', bn: 'A', since: NONE }, { an: 'B', bn: 'A', since: 2018 }, { an: 'B', bn: 'C', since: 2020 }, { an: 'A', bn: 'B', since: 2021 }]"
+*/
+
+MATCH (b:person)<-[k:knows]-(a:person) RETURN a.name AS an, b.name AS bn, k.since AS since ORDER BY since

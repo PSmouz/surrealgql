@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search composes with aggregation (#419): a path-search MATCH produces binding rows that a trailing GROUP BY folds. `ANY SHORTEST` from X reaches five terminals, so `count(*)` grouped by the start name is 5."
+
+[[test.results]]
+value = "[{ an: 'X', c: 5 }]"
+*/
+
+MATCH ANY SHORTEST (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, count(*) AS c GROUP BY a.name

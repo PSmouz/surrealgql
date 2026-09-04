@@ -1,0 +1,23 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Datetime, duration, uuid, geometry, and decimal fields serialize through GraphQL. The geometry `type` field is aliased because a literal `{ type: 'Point', coordinates: [..] }` expectation would be parsed back as a SurrealQL geometry value instead of an object."
+
+[[test.results]]
+value = "{ event: { amount: '19.99', at: '2024-01-15T10:00:00+00:00', label: 'Launch', loc: { coordinates: [51.5f, -0.12f], kind: 'Point' }, took: '2h30m', uid: '018e3b1c-7c5d-7c5e-8f30-111111111111' } }"
+*/
+query {
+	event(id: "launch") {
+		label
+		at
+		took
+		uid
+		loc {
+			kind: type
+			coordinates
+		}
+		amount
+	}
+}

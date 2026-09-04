@@ -20,7 +20,7 @@ use crate::auth::{self, BoundSubject};
 use crate::cnf::McpConfig;
 use crate::metrics::{McpMetricsRecorder, McpToolOutcome};
 use crate::session::McpSession;
-use crate::tools::{connection, crud, query, run as run_tool, schema};
+use crate::tools::{connection, crud, gql, graphql, query, run as run_tool, schema};
 use crate::{audit, completions, prompts, resources};
 
 const LOG: &str = "surrealdb::mcp";
@@ -734,6 +734,42 @@ impl McpService {
 		ctx: RequestContext<RoleServer>,
 	) -> Result<CallToolResult, McpError> {
 		self.dispatch_tool("run", &ctx, async |s| run_tool::run(s, p).await).await
+	}
+
+	#[tool(
+		description = "Execute a GQL (ISO/IEC 39075) query with optional parameter bindings, e.g. `MATCH (p:person) RETURN p.name AS name`. GQL is an experimental capability that must be enabled on the server (`--allow-experimental gql`); otherwise the call returns a capability error.",
+		annotations(
+			title = "Run GQL",
+			read_only_hint = true,
+			destructive_hint = false,
+			idempotent_hint = true,
+			open_world_hint = false
+		)
+	)]
+	async fn gql(
+		&self,
+		Parameters(p): Parameters<gql::GqlParams>,
+		ctx: RequestContext<RoleServer>,
+	) -> Result<CallToolResult, McpError> {
+		self.dispatch_tool("gql", &ctx, async |s| gql::execute(s, p).await).await
+	}
+
+	#[tool(
+		description = "Execute a GraphQL query or mutation against the active namespace and database. The database must have a `DEFINE CONFIG GRAPHQL` statement. Provide GraphQL variables as a JSON object; returns the GraphQL `{ data, errors }` response envelope (GraphQL execution errors appear in `errors`, not as a tool error).",
+		annotations(
+			title = "Run GraphQL",
+			read_only_hint = false,
+			destructive_hint = true,
+			idempotent_hint = false,
+			open_world_hint = false
+		)
+	)]
+	async fn graphql(
+		&self,
+		Parameters(p): Parameters<graphql::GraphqlParams>,
+		ctx: RequestContext<RoleServer>,
+	) -> Result<CallToolResult, McpError> {
+		self.dispatch_tool("graphql", &ctx, async |s| graphql::execute(s, p).await).await
 	}
 }
 

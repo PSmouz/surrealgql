@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "R1 EDGE-DISTINCTNESS-SCOPE PIN. Same pattern SHAPE as multi_pattern_shared_node — two `(_)-[:knows]->(b)` patterns sharing the far node `b` — but split across two SEPARATE MATCH statements instead of one comma clause. R2 (DIFFERENT EDGES) is scoped PER MATCH statement, so the two `knows` edges here live in different statements and are NOT required to be distinct. That flips the count vs the comma form. COMMA form (multi_pattern_shared_node, one statement, R2 spans both edges): the a==c rows where both positions bind the SAME edge are dropped, leaving 2 rows {a:B,c:C},{a:C,c:B}. SEQUENTIAL form (here, R2 per statement): those same-edge rows SURVIVE, so a==c reappears. Hand-derived over (k12:A->B, k21:B->A, k23:B->C, k31:C->A): join on b gives b=B:(a=A,c=A); b=A:(B,B),(B,C),(C,B),(C,C); b=C:(B,B). Returning a,b,c (so the two distinct b's for the B/B pair stay visible) yields 6 rows: (A,B,A),(B,A,B),(B,A,C),(C,A,B),(C,A,C),(B,C,B). 6 (sequential) != 2 (comma) is the R1 scope distinction made executable."
+
+[[test.results]]
+value = "[{ a: 'A', b: 'B', c: 'A' }, { a: 'B', b: 'A', c: 'B' }, { a: 'B', b: 'A', c: 'C' }, { a: 'B', b: 'C', c: 'B' }, { a: 'C', b: 'A', c: 'B' }, { a: 'C', b: 'A', c: 'C' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person)
+MATCH (c:person)-[:knows]->(b:person)
+RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c

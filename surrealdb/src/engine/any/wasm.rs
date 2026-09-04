@@ -1,15 +1,18 @@
 use std::collections::HashSet;
 
 use tokio::sync::watch;
+#[allow(unused_imports, reason = "Used by the DB engines.")]
 use wasm_bindgen_futures::spawn_local;
 
+#[allow(unused_imports, reason = "Used by the DB engines.")]
+use crate::ExtraFeatures;
 use crate::conn::Router;
 #[allow(unused_imports, reason = "Used by the DB engines.")]
 use crate::engine;
 use crate::engine::any::Any;
 use crate::method::BoxFuture;
 use crate::opt::{Endpoint, EndpointKind, WaitFor};
-use crate::{Error, ExtraFeatures, Result, SessionClone, Surreal, conn};
+use crate::{Error, Result, SessionClone, Surreal, conn};
 
 impl crate::Connection for Any {}
 impl conn::Sealed for Any {

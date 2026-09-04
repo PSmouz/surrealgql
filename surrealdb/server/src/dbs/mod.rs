@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::Config;
 use crate::core::dbs::capabilities::{
-	ArbitraryQueryTarget, Capabilities, ExperimentalTarget, FuncTarget, MethodTarget, NetTarget,
-	RouteTarget, Targets,
+	ArbitraryQueryTarget, Capabilities, EvalQueryTarget, ExperimentalTarget, FuncTarget,
+	MethodTarget, NetTarget, RouteTarget, Targets,
 };
 use crate::core::dbs::{NewPlannerStrategy, Session};
 
@@ -150,6 +150,21 @@ User groups must be one of "guest", "record" or "system".
 	allow_arbitrary_query: Option<Targets<ArbitraryQueryTarget>>,
 
 	#[arg(
+		help = "Allow the eval::* functions to be invoked by certain user groups. Denied for everyone by default.",
+		long_help = r#"Allow the eval::surql / eval::gql functions to be invoked by certain user groups. Provide a comma-separated list of user groups to allow. This is an additive gate on top of arbitrary-query: an eval invocation must also satisfy the arbitrary-query capability.
+Specifically denied user groups prevail over any other allowed user group.
+User groups must be one of "guest", "record" or "system".
+Denied for everyone by default (even under --allow-all); must be explicitly enabled.
+"#
+	)]
+	#[arg(env = "SURREAL_CAPS_ALLOW_EVAL_QUERY", long)]
+	// If the arg is provided without value, then assume it's "", which gets parsed into
+	// Targets::All
+	#[arg(default_missing_value_os = "", num_args = 0..)]
+	#[arg(value_parser = super::cli::validator::eval_query_targets)]
+	allow_eval_query: Option<Targets<EvalQueryTarget>>,
+
+	#[arg(
 		help = "Allow all outbound network connections except for network targets that are specifically denied. Alternatively, you can provide a comma-separated list of network targets to allow",
 		long_help = r#"Allow all outbound network connections except for network targets that are specifically denied. Alternatively, you can provide a comma-separated list of network targets to allow
 Specifically denied network targets prevail over any other allowed outbound network connections.
@@ -240,6 +255,20 @@ User groups must be one of "guest", "record" or "system".
 	#[arg(default_missing_value_os = "", num_args = 0..)]
 	#[arg(value_parser = super::cli::validator::query_arbitrary_targets)]
 	deny_arbitrary_query: Option<Targets<ArbitraryQueryTarget>>,
+
+	#[arg(
+		help = "Deny the eval::* functions for certain user groups except when specifically allowed.",
+		long_help = r#"Deny the eval::surql / eval::gql functions for certain user groups. Provide a comma-separated list of user groups to deny.
+Specifically denied user groups prevail over any allowed user group.
+User groups must be one of "guest", "record" or "system".
+"#
+	)]
+	#[arg(env = "SURREAL_CAPS_DENY_EVAL_QUERY", long)]
+	// If the arg is provided without value, then assume it's "", which gets parsed into
+	// Targets::All
+	#[arg(default_missing_value_os = "", num_args = 0..)]
+	#[arg(value_parser = super::cli::validator::eval_query_targets)]
+	deny_eval_query: Option<Targets<EvalQueryTarget>>,
 
 	#[arg(
 		help = "Deny all outbound network connections except for network targets that are specifically allowed. Alternatively, you can provide a comma-separated list of network targets to deny",
@@ -509,6 +538,22 @@ impl DbsCapabilities {
 		self.allow_arbitrary_query.clone().unwrap_or(Targets::All) // arbitrary queries are enabled by default for the server
 	}
 
+	fn get_allow_eval_query(&self) -> Targets<EvalQueryTarget> {
+		// If there was a general deny for eval queries, we allow only the
+		// specific eval query subjects that are explicitly allowed.
+		if let Some(Targets::All) = self.deny_eval_query {
+			match &self.allow_eval_query {
+				Some(t @ Targets::Some(_)) => return t.clone(),
+				_ => return Targets::None,
+			}
+		}
+
+		// Unlike arbitrary queries, eval is NOT enabled by `--allow-all`: it must
+		// be explicitly enabled per subject group. If nothing was provided, eval
+		// is denied for everyone (Targets::None).
+		self.allow_eval_query.clone().unwrap_or(Targets::None)
+	}
+
 	fn get_deny_funcs(&self) -> Targets<FuncTarget> {
 		// Allowed functions already consider a global deny and a general deny for
 		// functions On top of what is explicitly allowed, we deny what is
@@ -582,6 +627,15 @@ impl DbsCapabilities {
 		}
 	}
 
+	fn get_deny_eval_query(&self) -> Targets<EvalQueryTarget> {
+		// On top of what is explicitly allowed, we deny what is specifically denied.
+		if let Some(t @ Targets::Some(_)) = &self.deny_eval_query {
+			t.clone()
+		} else {
+			Targets::None
+		}
+	}
+
 	pub fn into_cli_capabilities(self) -> Capabilities {
 		merge_capabilities(SdkCapabilities::all().into(), &self)
 	}
@@ -603,6 +657,8 @@ fn merge_capabilities(initial: Capabilities, caps: &DbsCapabilities) -> Capabili
 		.without_experimental(caps.get_deny_experimental())
 		.with_arbitrary_query(caps.get_allow_arbitrary_query())
 		.without_arbitrary_query(caps.get_deny_arbitrary_query())
+		.with_eval_query(caps.get_allow_eval_query())
+		.without_eval_query(caps.get_deny_eval_query())
 		.with_planner_strategy(caps.planner_strategy)
 }
 
@@ -719,6 +775,9 @@ where
 }
 
 #[instrument(level = "trace", target = "surreal::dbs", skip_all)]
+// The return tuple is the established shape of this internal startup
+// entrypoint; the pending import is just one more element on it.
+#[allow(clippy::type_complexity)]
 /// Initialise the database server
 ///
 /// Creates and configures the datastore with the provided options.
@@ -753,7 +812,7 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		#[cfg_attr(not(feature = "surrealism"), allow(unused_variables))]
 		lazy_surrealism,
 	}: StartCommandDbsOptions,
-) -> Result<(Datastore, Receiver<Notification>, C::RouterState)> {
+) -> Result<(Datastore, Receiver<Notification>, C::RouterState, PendingStartup)> {
 	// Warn about the strict mode flag being unused.
 	if let Some(true) = strict_mode {
 		warn!(
@@ -850,28 +909,36 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 		})
 		.await?;
 	}
-	// Import file at start, if provided
-	if let Some(file) = import_file {
-		// Log the startup import path
-		info!(target: TARGET, file = ?file, "Importing data from file");
-		// Read the full file contents
-		let sql = fs::read_to_string(file)?;
-		// Execute the SurrealQL file
-		retry_with_timeout("startup", startup_operation_timeout, || async {
-			dbs.startup(&sql, &Session::owner()).await
-		})
-		.await?;
-	}
-	// Setup initial server auth credentials
-	if let (Some(user), Some(pass)) = (opt.user.as_ref(), opt.pass.as_ref()) {
-		// Log the initialisation of credentials
-		info!(target: TARGET, user = %user, "Initialising credentials");
-		// Initialise the credentials
-		retry_with_timeout("initialise_credentials", startup_operation_timeout, || async {
-			dbs.initialise_credentials(user, pass).await
-		})
-		.await?;
-	}
+	// Defer the startup import so the caller can bind the HTTP listener first and
+	// run it concurrently (see [`finish_startup`]). A large or slow import no
+	// longer blocks the listener, so a pathological import cannot starve the
+	// liveness probe at startup.
+	//
+	// Credentials are created synchronously here when there is *no* import, so a
+	// plain server is fully ready the instant it starts serving (no readiness
+	// window for clients that don't poll `/ready`). When an import *is* present,
+	// credential creation is deferred to run after it, preserving the historical
+	// ordering: an import that supplies root users still suppresses creation of
+	// the CLI bootstrap user.
+	let credentials = opt.user.clone().zip(opt.pass.clone());
+	let deferred_credentials = match &import_file {
+		Some(_) => credentials,
+		None => {
+			if let Some((user, pass)) = &credentials {
+				info!(target: TARGET, user = %user, "Initialising credentials");
+				retry_with_timeout("initialise_credentials", startup_operation_timeout, || async {
+					dbs.initialise_credentials(user, pass).await
+				})
+				.await?;
+			}
+			None
+		}
+	};
+	let pending_startup = PendingStartup {
+		import_file,
+		credentials: deferred_credentials,
+		timeout: startup_operation_timeout,
+	};
 	// Bootstrap the datastore
 	retry_with_timeout("Insert node", startup_operation_timeout, || async {
 		dbs.insert_node().await
@@ -886,7 +953,55 @@ pub async fn init<C: TransactionBuilderFactory + BucketStoreProvider>(
 	})
 	.await?;
 	// All ok
-	Ok((dbs, recv, router_state))
+	Ok((dbs, recv, router_state, pending_startup))
+}
+
+/// Startup work deferred out of [`init`] so the caller can bind the HTTP
+/// listener first and run it concurrently (via [`finish_startup`]). While this
+/// is running the instance is not yet ready to serve queries (see the readiness
+/// gate in `ntw`).
+pub(crate) struct PendingStartup {
+	/// SurrealQL file to import on startup, if one was provided.
+	import_file: Option<PathBuf>,
+	/// Root credentials (user, pass) to create if no root user already exists.
+	credentials: Option<(String, String)>,
+	/// Per-operation retry budget (from `SURREAL_STARTUP_OPERATION_TIMEOUT`).
+	timeout: Duration,
+}
+
+impl PendingStartup {
+	/// Whether there is any deferred work to run. When `false`, the caller can
+	/// mark the instance ready before binding (no startup window).
+	pub(crate) fn has_work(&self) -> bool {
+		self.import_file.is_some() || self.credentials.is_some()
+	}
+}
+
+/// Run the deferred startup work: execute the import file (if any), then
+/// initialise the root credentials (if provided).
+///
+/// The import runs *before* credential initialisation so that an import which
+/// supplies root users suppresses creation of the CLI bootstrap user, matching
+/// the historical (pre-early-bind) ordering.
+pub(crate) async fn finish_startup(ds: &Datastore, pending: &PendingStartup) -> Result<()> {
+	// Import the startup file, discarding the per-statement results.
+	if let Some(file) = &pending.import_file {
+		info!(target: TARGET, file = ?file, "Importing data from file");
+		let sql = fs::read_to_string(file)?;
+		retry_with_timeout("startup", pending.timeout, || async {
+			ds.startup(&sql, &Session::owner()).await
+		})
+		.await?;
+	}
+	// Create the CLI-provided root user if no root user exists yet.
+	if let Some((user, pass)) = &pending.credentials {
+		info!(target: TARGET, user = %user, "Initialising credentials");
+		retry_with_timeout("initialise_credentials", pending.timeout, || async {
+			ds.initialise_credentials(user, pass).await
+		})
+		.await?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -1495,6 +1610,7 @@ mod tests {
 			allow_funcs: None,
 			allow_experimental: Some(Targets::All),
 			allow_arbitrary_query: Some(Targets::All),
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
@@ -1505,6 +1621,7 @@ mod tests {
 			deny_funcs: None,
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,
@@ -1512,6 +1629,43 @@ mod tests {
 		};
 		assert_eq!(caps.get_allow_experimental(), Targets::All);
 		assert_eq!(caps.get_allow_arbitrary_query(), Targets::All);
+	}
+
+	#[test]
+	fn test_dbs_capabilities_eval_query_denied_by_default() {
+		// Even with allow_all set, eval is denied unless explicitly enabled, and
+		// arbitrary-query (which it is also gated by) stays enabled.
+		let mut caps = DbsCapabilities {
+			allow_all: true,
+			#[cfg(feature = "scripting")]
+			allow_scripting: false,
+			allow_guests: false,
+			allow_funcs: None,
+			allow_experimental: None,
+			allow_arbitrary_query: None,
+			allow_eval_query: None,
+			allow_net: None,
+			allow_rpc: None,
+			allow_http: None,
+			deny_all: false,
+			#[cfg(feature = "scripting")]
+			deny_scripting: false,
+			deny_guests: false,
+			deny_funcs: None,
+			deny_experimental: None,
+			deny_arbitrary_query: None,
+			deny_eval_query: None,
+			deny_net: None,
+			deny_rpc: None,
+			deny_http: None,
+			planner_strategy: NewPlannerStrategy::default(),
+		};
+		assert_eq!(caps.get_allow_arbitrary_query(), Targets::All);
+		assert_eq!(caps.get_allow_eval_query(), Targets::None, "eval is not enabled by allow_all");
+
+		// Explicitly enabling a subject group turns it on.
+		caps.allow_eval_query = Some(Targets::from(EvalQueryTarget::System));
+		assert_eq!(caps.get_allow_eval_query(), Targets::from(EvalQueryTarget::System));
 	}
 
 	#[test]
@@ -1526,6 +1680,7 @@ mod tests {
 			allow_funcs: Some(Targets::All),
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
@@ -1536,6 +1691,7 @@ mod tests {
 			deny_funcs: Some(Targets::All),
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,
@@ -1557,6 +1713,7 @@ mod tests {
 			allow_funcs: None,
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: Some(Targets::All),
@@ -1567,6 +1724,7 @@ mod tests {
 			deny_funcs: None,
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: Some(Targets::All),
@@ -1588,6 +1746,7 @@ mod tests {
 			allow_funcs: Some(Targets::None),
 			allow_experimental: None,
 			allow_arbitrary_query: None,
+			allow_eval_query: None,
 			allow_net: None,
 			allow_rpc: None,
 			allow_http: None,
@@ -1598,6 +1757,7 @@ mod tests {
 			deny_funcs: Some(Targets::All),
 			deny_experimental: None,
 			deny_arbitrary_query: None,
+			deny_eval_query: None,
 			deny_net: None,
 			deny_rpc: None,
 			deny_http: None,

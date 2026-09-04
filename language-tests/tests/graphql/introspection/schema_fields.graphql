@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Schema introspection lists the generated query root fields"
+
+[[test.results]]
+value = "{ __schema: { queryType: { fields: [{ name: 'events' }, { name: 'event' }, { name: 'events_aggregate' }, { name: 'eventsConnection' }, { name: 'likes' }, { name: '_get_likes' }, { name: 'likes_aggregate' }, { name: 'likesConnection' }, { name: 'persons' }, { name: 'person' }, { name: 'persons_aggregate' }, { name: 'personsConnection' }, { name: 'posts' }, { name: 'post' }, { name: 'posts_aggregate' }, { name: 'postsConnection' }, { name: '_get' }, { name: 'fn_alice' }, { name: 'fn_double' }, { name: 'fn_greet' }, { name: 'fn_num' }] } } }"
+*/
+query {
+	__schema {
+		queryType {
+			fields {
+				name
+			}
+		}
+	}
+}

@@ -19,7 +19,7 @@ transport-io = ["rmcp/transport-io"]
 
 [dependencies]
 rmcp = { workspace = true, features = ["server", "macros"] }
-surrealdb-core = { workspace = true }
+surrealdb-core = { workspace = true, features = ["graphql", "gql"] }
 surrealdb-types = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -32,7 +32,7 @@ tracing = { workspace = true }
 web-time = { workspace = true }
 
 [dev-dependencies]
-surrealdb-core = { workspace = true, features = ["kv-mem"] }
+surrealdb-core = { workspace = true, features = ["kv-mem", "graphql", "gql"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }
 # Enable `client` so integration tests can drive the MCP server over an
 # in-process duplex transport (same code path as `serve_stdio`).

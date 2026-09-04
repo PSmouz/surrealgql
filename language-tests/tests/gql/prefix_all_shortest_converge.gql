@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "ALL SHORTEST through a converging intermediate. From S, J is reached by two shortest sub-paths (S→P→J and S→Q→J, both depth 2) which then share the J→T suffix, so T has two shortest paths (depth 3). Exercises the all-shortest tie-extension (the shortest-path DAG must extend J from BOTH depth-2 arrivals). Per (S, terminal): P@1, Q@1, J@2 (×2), T@3 (×2) = 6 rows."
+
+[[test.results]]
+value = "[{ an: 'S', bn: 'J' }, { an: 'S', bn: 'J' }, { an: 'S', bn: 'P' }, { an: 'S', bn: 'Q' }, { an: 'S', bn: 'T' }, { an: 'S', bn: 'T' }]"
+*/
+
+MATCH ALL SHORTEST (a:cv WHERE a.name = 'S')-[:cvedge]->+(b:cv)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

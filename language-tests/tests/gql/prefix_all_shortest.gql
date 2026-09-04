@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `ALL SHORTEST`: every minimum-hop path per endpoint pair. Anchored on X, Z is reached by two distinct length-2 paths (X→Y1→Z and X→Y2→Z) so it appears twice, while Y1/Y2/Y3/Y4 each have a single shortest path — six rows (vs five for ANY SHORTEST)."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1' }, { an: 'X', bn: 'Y2' }, { an: 'X', bn: 'Y3' }, { an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ALL SHORTEST (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

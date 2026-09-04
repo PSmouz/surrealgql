@@ -1,0 +1,20 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL upsert mutation updates an existing record and creates a missing one; like create, its input requires all non-optional fields"
+
+[[test.results]]
+value = "{ created: { age: 41, name: 'Dave' }, existing: { age: 31, name: 'Alice' } }"
+*/
+mutation {
+	existing: upsertPerson(id: "alice", data: { name: "Alice", age: 31, active: true, score: 4.5, tags: ["admin", "dev"], address: { city: "London", country: "UK" } }) {
+		name
+		age
+	}
+	created: upsertPerson(id: "dave", data: { name: "Dave", age: 41, active: true, score: 1.0, tags: [], address: { city: "Oslo", country: "NO" } }) {
+		name
+		age
+	}
+}

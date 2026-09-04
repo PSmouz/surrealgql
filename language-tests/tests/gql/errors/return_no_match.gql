@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a RETURN-only query has no MATCH clause to lower."
+
+[test.results]
+parsing-error = '''
+A query without a MATCH clause is not supported yet
+  --> [15:1]
+   |
+15 | RETURN 1
+   | ^^^^^^^^ start the query with a MATCH clause
+'''
+*/
+
+RETURN 1

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-C): a query cannot LEAD with OPTIONAL — OPTIONAL is a left-outer join and needs a preceding MATCH to join against (R3). Rejected cleanly at lowering instead of reaching a planner internal error."
+
+[test.results]
+parsing-error = """
+A query cannot start with OPTIONAL MATCH: OPTIONAL is a left-outer join and needs a preceding MATCH to join against
+  --> [15:1]
+   |
+15 | OPTIONAL MATCH (a:person) RETURN a.name AS name
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^ begin with a plain `MATCH …` clause before any `OPTIONAL`
+"""
+*/
+
+OPTIONAL MATCH (a:person) RETURN a.name AS name

@@ -161,6 +161,7 @@ fn scaffold_rust(path: &Path, name: &str) -> Result<()> {
 	run_cargo_init(path, name)?;
 	rewrite_cargo_toml(path, name)?;
 	write_lib_rs(path)?;
+	super::wasm_target::ensure_cargo_config(path)?;
 	Ok(())
 }
 
@@ -194,8 +195,8 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 surrealism = "{surrealism}"
-surrealdb = {{ version = "{surrealdb}", default-features = false }}
 surrealdb-types = "{surrealdb}"
+# surrealdb = {{ version = "{surrealdb}", default-features = false }}  # optional; only if you need the full SDK crate
 "#,
 		name = name,
 		surrealism = SURREALISM_VERSION,

@@ -8,13 +8,15 @@ use crate::err::Error;
 
 /// Checks if the requested file path is within any of the allowed directories.
 pub(crate) fn check_is_path_allowed(path: &Path, allowed_paths: &[PathBuf]) -> Result<PathBuf> {
+	// An empty allowlist denies all access (secure by default). File access
+	// (e.g. `DEFINE ANALYZER ... mapper('<path>')`) requires the operator to
+	// explicitly configure `file_allowlist`; otherwise no path is permitted.
+	if allowed_paths.is_empty() {
+		return Err(Error::FileAccessDenied(path.to_string_lossy().to_string()).into());
+	}
+
 	// Convert the requested path to its canonical form.
 	let canonical_path = fs::canonicalize(path)?;
-
-	// If the list is empty, we don't operate any control
-	if allowed_paths.is_empty() {
-		return Ok(canonical_path);
-	}
 
 	// Check if the canonical path starts with any of the allowed paths.
 	if allowed_paths.iter().any(|allowed| {
@@ -95,15 +97,15 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn test_empty_allow_list_allows_access() {
+	fn test_empty_allow_list_denies_access() {
 		// Create a temporary file in a temp directory.
 		let dir = tempdir().expect("failed to create temp dir");
 		let file_path = dir.path().join("test.txt");
 		fs::write(&file_path, "content").expect("failed to write file in file_path");
 
-		// With an empty allowlist, access should be allowed.
+		// With an empty allowlist, access must be denied (secure by default).
 		let result = check_is_path_allowed(&file_path, &[]);
-		assert!(result.is_ok(), "File access should be allowed when no restrictions are set");
+		assert!(result.is_err(), "File access must be denied when no allowlist is configured");
 	}
 
 	#[test]

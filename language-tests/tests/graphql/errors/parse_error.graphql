@@ -1,0 +1,14 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Syntactically invalid GraphQL reports a parse error in the response. Matched with an expression because the error's position depends on this file's length."
+
+[[test.results]]
+match = "$error CONTAINS 'expected selection_set'"
+error = true
+*/
+query {
+	persons {
+		name

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `ANY` (= `ANY 1`): one arbitrary path per endpoint pair, regardless of length. Anchored on X, one row per reachable terminal (Y1/Y2/Y3/Y4/Z) — five rows, vs seven for `ALL`."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1' }, { an: 'X', bn: 'Y2' }, { an: 'X', bn: 'Y3' }, { an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ANY (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

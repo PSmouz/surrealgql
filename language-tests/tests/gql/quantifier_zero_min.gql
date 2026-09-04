@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: `min == 0` is legal and emits the zero-length path (target == source, empty group, [node] path). In v1 a zero minimum was a lowering rejection ('Variable-length quantifiers must have a minimum of at least one'); v2 supports it. `{0,3}` on the triangle covers depths 0..3: the zero-hop self-row plus depths 1..3 which (being edge-unique) reach each of the three hubs once. From D the tips are D(d0),E(d1),F(d2),D(d3) -> D,D,E,F; symmetric for E and F. 12 rows (identical to `*` here because the triangle has only three edges)."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'D' }, { an: 'D', bn: 'E' }, { an: 'D', bn: 'F' }, { an: 'E', bn: 'D' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'F' }, { an: 'F', bn: 'D' }, { an: 'F', bn: 'E' }, { an: 'F', bn: 'F' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->{0,3}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

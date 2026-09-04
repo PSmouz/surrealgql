@@ -6,6 +6,8 @@
 
 pub mod connection;
 pub mod crud;
+pub mod gql;
+pub mod graphql;
 pub mod output;
 pub(crate) mod output_schemas;
 pub mod query;
@@ -19,7 +21,8 @@ use surrealdb_core::cnf::CommonConfig;
 use surrealdb_types::{Decimal, Number, SurrealValue, Value, Variables};
 
 pub(crate) use self::output::{
-	multi_statement_result, single_statement_result, structured_success, tool_error_from_surreal,
+	multi_statement_result, single_statement_result, structured_success, tool_error,
+	tool_error_from_surreal,
 };
 use crate::cnf::McpConfig;
 

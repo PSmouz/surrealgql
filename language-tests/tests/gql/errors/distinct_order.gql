@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (V2_DESIGN R7): under RETURN DISTINCT, ORDER BY may only reference the returned columns — the DISTINCT pipeline projects before sorting (Project -> Distinct -> Sort), so a non-returned sort key has no column to read. v1 wording was 'ORDER BY may only reference RETURN items'; v2 specialises the DISTINCT case to 'With RETURN DISTINCT, ORDER BY may only reference returned columns' (the non-DISTINCT case is now allowed entirely, see order_by_non_returned.gql)."
+
+[test.results]
+parsing-error = """
+With RETURN DISTINCT, ORDER BY may only reference returned columns
+  --> [15:80]
+   |
+15 | ... ORDER BY k.since
+   |              ^^^^^^^ return the sort expression under an alias and order by the alias
+"""
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN DISTINCT b.name AS name ORDER BY k.since

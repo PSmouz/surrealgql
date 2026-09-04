@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::Error;
-
 use crate::tests::TestLoadError;
 use crate::tests::case::{CaseSet, TestCase};
 
@@ -17,6 +15,13 @@ pub struct CaseImports {
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct TestRunId(usize);
+
+impl TestRunId {
+	#[allow(dead_code)]
+	pub fn new(id: usize) -> Self {
+		TestRunId(id)
+	}
+}
 
 /// A single instance of test being run with a given configuration of datastore.
 #[derive(Debug)]
@@ -72,37 +77,15 @@ impl<'set, 'error, 'a, T: RunConfig> RunSetBuilder<'set, 'error, 'a, T> {
 		let mut runs = Vec::new();
 
 		for case in self.set.iter() {
-			// TODO: Also resolve imports for imports
-			let mut imports = Vec::new();
-			let mut had_errors = false;
-			for import in case.config.parsed.env.imports.iter() {
-				match self.set.find_import(import, case.id) {
-					Some(x) => {
-						if x.len() > 1 {
-							self.errors.push(TestLoadError {
-								origin: case.origin.clone(),
-								error: Error::msg(format!(
-									"Import `{import}` refered to a file which contained multiple tests"
-								)),
-							});
-							had_errors = true;
-						} else {
-							imports.push(x[0].clone());
-						}
-					}
-					None => {
-						self.errors.push(TestLoadError {
-							origin: case.origin.clone(),
-							error: Error::msg(format!("Could not find import `{import}`")),
-						});
-						had_errors = true;
-					}
-				}
-			}
-
-			if had_errors {
+			// Resolve imports transitively (imports-of-imports included).
+			let Some(imports) = self.set.resolve_imports(
+				&case.config.parsed.env.imports,
+				case.id,
+				&case.origin,
+				self.errors,
+			) else {
 				continue;
-			}
+			};
 
 			let case_imports = CaseImports {
 				test: case.clone(),

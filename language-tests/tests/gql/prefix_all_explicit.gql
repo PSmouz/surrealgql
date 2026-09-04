@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `ALL`: every path (the default — identical to no prefix). Anchored on X, Z is reached by three paths (two length-2 and one length-3 via Y3→Y4), so seven rows — distinguishing ALL from ANY (which keeps one per terminal)."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1' }, { an: 'X', bn: 'Y2' }, { an: 'X', bn: 'Y3' }, { an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ALL (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

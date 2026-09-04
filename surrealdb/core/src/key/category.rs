@@ -35,6 +35,8 @@ pub enum Category {
 	RootConfig,
 	/// crate::key::root::ic                 /!ic{ns}{db}{tb}{ix}{nid}{uuid}
 	IndexCompaction,
+	/// crate::key::root::rc                 /!rc{kind}{ns}{db}{tb}{ix}{expunge}{uuid}
+	Reclaim,
 	/// crate::key::root::eq                 /!eq{ns}{db}{tb}{ev}{ts}{nid}
 	EventQueue,
 	///
@@ -190,6 +192,8 @@ pub enum Category {
 	///
 	/// crate::key::change                   /*{ns}*{db}#{ts}
 	ChangeFeed,
+	/// crate::key::lqe                      /*{ns}*{db}%{ts}
+	LiveQueryEvent,
 	///
 	/// ------------------------------
 	///
@@ -281,6 +285,7 @@ impl Display for Category {
 			Self::IndexPrimaryAppending => "IndexPrimaryAppending",
 			Self::Index => "Index",
 			Self::ChangeFeed => "ChangeFeed",
+			Self::LiveQueryEvent => "LiveQueryEvent",
 			Self::Record => "Record",
 			Self::Graph => "Graph",
 			Self::Ref => "Ref",
@@ -293,6 +298,7 @@ impl Display for Category {
 			Self::IndexFullTextDocCountAndLength => "IndexFullTextDocCountAndLength",
 			Self::IndexTermDocuments => "IndexTermDocuments",
 			Self::IndexCompaction => "IndexCompaction",
+			Self::Reclaim => "Reclaim",
 			Self::IndexCountState => "IndexCountState",
 			Self::IndexBuildState => "IndexBuildState",
 			Self::IndexBuildReservation => "IndexBuildReservation",

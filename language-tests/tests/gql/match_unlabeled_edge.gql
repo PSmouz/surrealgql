@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Unlabeled edge: the lookup scans all edge tables (?) with the far-end label filter still applied; with only knows edges present this matches the labeled form."
+
+[[test.results]]
+value = "[{ an: 'A', bn: 'B' }, { an: 'B', bn: 'A' }, { an: 'B', bn: 'C' }, { an: 'C', bn: 'A' }]"
+*/
+
+MATCH (a:person)-[]->(b:person) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

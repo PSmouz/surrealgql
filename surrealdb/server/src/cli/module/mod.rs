@@ -5,6 +5,7 @@ mod init_cmd;
 mod run;
 mod sig;
 mod version;
+mod wasm_target;
 
 use std::path::PathBuf;
 

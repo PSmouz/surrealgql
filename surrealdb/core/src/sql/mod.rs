@@ -3,6 +3,7 @@
 pub(crate) mod access;
 pub(crate) mod access_type;
 pub(crate) mod algorithm;
+pub(crate) mod analyzer_function;
 pub(crate) mod ast;
 pub(crate) mod base;
 pub(crate) mod block;

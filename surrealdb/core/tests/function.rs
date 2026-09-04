@@ -268,6 +268,24 @@ async fn function_record_exists() -> Result<()> {
 }
 
 #[tokio::test]
+async fn function_record_exists_undefined_table() -> Result<()> {
+	let sql = r#"
+		USE NS test DB test;
+		RETURN record::exists(r"person:tobie");
+	"#;
+	let mut test = Test::new(sql).await?;
+	// USE NS test DB test;
+	let tmp = test.next()?.result;
+	tmp.unwrap();
+	// RETURN record::exists(r"person:tobie");
+	let tmp = test.next()?.result?;
+	let val = Value::Bool(false);
+	assert_eq!(tmp, val);
+	//
+	Ok(())
+}
+
+#[tokio::test]
 async fn function_record_id() -> Result<()> {
 	let sql = r#"
 		RETURN record::id(r"person:tobie");

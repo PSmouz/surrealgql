@@ -166,6 +166,11 @@ impl RpcProtocol for Http {
 		&self.kvs
 	}
 
+	/// The datastore for this RPC interface as a shared handle.
+	fn kvs_arc(&self) -> Arc<Datastore> {
+		Arc::clone(&self.kvs)
+	}
+
 	/// The version information for this RPC context
 	fn version_data(&self) -> DbResult {
 		let value = Value::String(format!("{PKG_NAME}-{}", *PKG_VERSION));

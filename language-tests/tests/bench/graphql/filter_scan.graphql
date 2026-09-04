@@ -1,0 +1,18 @@
+/**
+[bench]
+reason = "GraphQL filtered list query scanning the full table"
+run = true
+rebuild = false
+datasets = { "10k" = "bench/util/graphql-items-10000.surql" }
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+query {
+	items(filter: {number: {eq: 42}}, limit: 100) {
+		label
+	}
+}

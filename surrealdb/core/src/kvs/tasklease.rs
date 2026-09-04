@@ -26,8 +26,12 @@ pub(crate) enum TaskLeaseType {
 	ChangeFeedCleanup,
 	/// Index compaction
 	IndexCompaction,
+	/// Resuming index builds left unfinished by a crashed or expired owner node
+	IndexBuildResume,
 	/// Event processing
 	EventProcessing,
+	/// Background reclaim of tombstoned namespace/database/index data
+	ReclaimTombstones,
 }
 
 /// Represents a distributed task lease stored in the datastore.

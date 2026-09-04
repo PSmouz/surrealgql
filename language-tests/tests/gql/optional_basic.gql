@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "R3 basic OPTIONAL: a single single-hop optional clause whose source `a` is bound by the mandatory clause left-outer-joins onto it (OptionalExpand fast path). Hand-derived over the seed graph (the only knows->city edge is person:1 -> city:1): person:1/A matches it, so `b` = city:1 and `b.name` = 'London'; person:2/B (knows edges -> person:1, person:3) and person:3/C (knows edge -> person:1) have NO knows->city edge, so the optional misses and binds `b` = Value::Null. The mandatory `a` rows are ALL preserved (left-outer never drops the anchor), and on a miss `b.name` over Null yields NONE — the optional-miss-is-Null rule made visible."
+
+[[test.results]]
+value = "[{ city: 'London', name: 'A' }, { city: NONE, name: 'B' }, { city: NONE, name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b:city) RETURN a.name AS name, b.name AS city ORDER BY name

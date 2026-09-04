@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "REVERSE bound-variable expansion path: the second pattern (c)-[]->(b) has no labeled element and reuses only its FAR node `b` (already bound). The planner cannot self-root it and cannot expand forward from its start `c` (unbound), so it expands `b -> c` with the edge direction REVERSED off the accumulator's rows. Single MATCH statement, so R2 makes the two edges distinct. Hand-derived over the knows graph: pattern 1 gives (a,b) in {(A,B),(B,A),(B,C),(C,A)}; for each, find a DISTINCT incoming edge to b giving c. b=B's only in-edge is k12 (already used) -> dropped; b=C's only in-edge is k23 (used) -> dropped; b=A has in-edges k21 and k31, so the (a=B via k21) row pairs with the distinct k31 -> c=C, and the (a=C via k31) row pairs with the distinct k21 -> c=B. Survivors: (a=B,c=C),(a=C,c=B)."
+
+[[test.results]]
+value = "[{ a: 'B', c: 'C' }, { a: 'C', c: 'B' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (c)-[]->(b)
+RETURN a.name AS a, c.name AS c ORDER BY a, c

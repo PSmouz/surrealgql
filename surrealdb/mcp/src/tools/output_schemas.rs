@@ -147,6 +147,28 @@ fn list_schema() -> JsonObject {
 	}))
 }
 
+/// Schema for the `graphql` tool response: the standard GraphQL response
+/// envelope (`{ data, errors }`).
+fn graphql_schema() -> JsonObject {
+	to_object(json!({
+		"type": "object",
+		"description": "A GraphQL response envelope. GraphQL execution errors are reported in `errors` rather than as a tool error.",
+		"properties": {
+			"data": {
+				"description": "The data returned by the operation, or null if execution failed before producing data.",
+			},
+			"errors": {
+				"type": "array",
+				"description": "GraphQL errors raised while validating or executing the operation, if any.",
+				"items": {
+					"type": "object",
+					"additionalProperties": true,
+				},
+			},
+		},
+	}))
+}
+
 fn to_object(value: Value) -> JsonObject {
 	match value {
 		Value::Object(map) => map,
@@ -159,7 +181,9 @@ fn to_object(value: Value) -> JsonObject {
 pub(crate) fn attach<S>(router: &mut ToolRouter<S>) {
 	for (name, route) in router.map.iter_mut() {
 		let schema = match name.as_ref() {
-			"query" => multi_statement_schema(),
+			// `gql` (GQL) returns the same multi-statement shape as `query`.
+			"query" | "gql" => multi_statement_schema(),
+			"graphql" => graphql_schema(),
 			"use" => use_schema(),
 			"list" => list_schema(),
 			// All other tools (select, create, insert, upsert, update, delete,

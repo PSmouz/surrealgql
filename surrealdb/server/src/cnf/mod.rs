@@ -45,6 +45,11 @@ pub static HTTP_MAX_ML_BODY_SIZE: LazyLock<usize> =
 pub static HTTP_MAX_SQL_BODY_SIZE: LazyLock<usize> =
 	lazy_env_parse!(bytes, "SURREAL_HTTP_MAX_SQL_BODY_SIZE", usize, 1 << 20);
 
+/// The maximum HTTP body size of the HTTP /gql endpoint (default: 1 MiB)
+#[cfg(feature = "gql")]
+pub static HTTP_MAX_GQL_BODY_SIZE: LazyLock<usize> =
+	lazy_env_parse!(bytes, "SURREAL_HTTP_MAX_GQL_BODY_SIZE", usize, 1 << 20);
+
 /// The maximum HTTP body size of the HTTP /api endpoint (default: 1 MiB)
 pub static HTTP_MAX_API_BODY_SIZE: LazyLock<usize> =
 	lazy_env_parse!(bytes, "SURREAL_HTTP_MAX_API_BODY_SIZE", usize, 4 << 20);
@@ -167,8 +172,8 @@ pub static WEBSOCKET_RESPONSE_FLUSH_PERIOD: LazyLock<u64> =
 /// How many notifications can be buffered per GraphQL subscription before
 /// backpressure drops new notifications (default: 1024)
 #[cfg(feature = "graphql")]
-pub static GQL_SUBSCRIPTION_CHANNEL_CAPACITY: LazyLock<usize> =
-	lazy_env_parse!("SURREAL_GQL_SUBSCRIPTION_CHANNEL_CAPACITY", usize, 1024);
+pub static GRAPHQL_SUBSCRIPTION_CHANNEL_CAPACITY: LazyLock<usize> =
+	lazy_env_parse!("SURREAL_GRAPHQL_SUBSCRIPTION_CHANNEL_CAPACITY", usize, 1024);
 
 /// The number of runtime worker threads to start (default: the number of CPU
 /// cores, minimum 4).
@@ -269,14 +274,8 @@ pub static PKG_VERSION: LazyLock<String> = LazyLock::new(|| {
 	}
 });
 
-/// Whether to enable Tokio Console
+/// Whether to enable Tokio Console. Read unconditionally (not feature-gated) so
+/// the server can warn when it is requested on a build compiled without the
+/// `tokio-console` feature.
 pub static ENABLE_TOKIO_CONSOLE: LazyLock<bool> =
 	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_ENABLED", bool, false);
-
-/// The socket address that Tokio Console will bind on
-pub static TOKIO_CONSOLE_SOCKET_ADDR: LazyLock<Option<String>> =
-	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_SOCKET_ADDR", Option<String>);
-
-/// How long, in seconds, to retain data for completed events (default: 60)
-pub static TOKIO_CONSOLE_RETENTION: LazyLock<u64> =
-	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_RETENTION", u64, 60);

@@ -1,0 +1,21 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL single-record query fetches a record by its id"
+
+[[test.results]]
+value = "{ person: { active: true, age: 30, email: 'alice@example.com', id: 'person:alice', name: 'Alice', score: 4.5f, tags: ['admin', 'dev'] } }"
+*/
+query {
+	person(id: "alice") {
+		id
+		name
+		age
+		active
+		score
+		email
+		tags
+	}
+}

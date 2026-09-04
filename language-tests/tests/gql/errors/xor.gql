@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: XOR has no exact three-valued lowering for composite operands."
+
+[test.results]
+parsing-error = '''
+`XOR` is not supported yet
+  --> [15:24]
+   |
+15 | MATCH (n:person) WHERE n.active XOR n.age > 25 RETURN n
+   |                        ^^^^^^^^^^^^^^^^^^^^^^^ rewrite `a XOR b` as `(a OR b) AND NOT (a AND b)`
+'''
+*/
+
+MATCH (n:person) WHERE n.active XOR n.age > 25 RETURN n

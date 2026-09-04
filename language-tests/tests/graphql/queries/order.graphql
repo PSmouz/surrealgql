@@ -1,0 +1,20 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL list queries support ascending and descending ordering"
+
+[[test.results]]
+value = "{ oldestFirst: [{ age: 35, name: 'Carol' }, { age: 30, name: 'Alice' }, { age: 25, name: 'Bob' }], youngestFirst: [{ age: 25, name: 'Bob' }, { age: 30, name: 'Alice' }, { age: 35, name: 'Carol' }] }"
+*/
+query {
+	youngestFirst: persons(order: {asc: age}) {
+		name
+		age
+	}
+	oldestFirst: persons(order: {desc: age}) {
+		name
+		age
+	}
+}

@@ -6,7 +6,6 @@ use clap::{ArgMatches, Command, ValueEnum, arg, command, value_parser};
 use rust_decimal::serde::str;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-
 #[cfg(feature = "bench")]
 use surrealdb_types::SurrealValue;
 

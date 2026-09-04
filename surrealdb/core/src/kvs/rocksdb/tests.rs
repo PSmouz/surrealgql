@@ -458,7 +458,7 @@ async fn shutdown_compacts_to_bottommost_when_opted_in() {
 async fn concurrent_cursors_do_not_evict() {
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, NORMAL_BATCH_SIZE, ScanLimit};
+	use crate::kvs::{Direction, NORMAL_BATCH_SIZE};
 
 	const PREFIX_COUNT: usize = 8;
 	const KEYS_PER_PREFIX: usize = 1500;
@@ -498,7 +498,7 @@ async fn concurrent_cursors_do_not_evict() {
 	// batch size we force several rounds, so each cursor's iterator
 	// would be evicted under an LRU(4) policy long before the prefix is
 	// exhausted.
-	let batch_limit = ScanLimit::Count(NORMAL_BATCH_SIZE.min(200));
+	let batch_limit = NORMAL_BATCH_SIZE.min(200);
 	let mut active = [true; PREFIX_COUNT];
 	while active.iter().any(|a| *a) {
 		for (p, cursor) in cursors.iter_mut().enumerate() {
@@ -514,7 +514,7 @@ async fn concurrent_cursors_do_not_evict() {
 				// cursor; copy each slice into an owned `Vec<u8>` so we can hold
 				// it after the next `next_batch` invalidates the borrow.
 				collected[p].extend(batch.iter().map(|k| k.to_vec()));
-				if matches!(batch_limit, ScanLimit::Count(c) if batch_len < c as usize) {
+				if batch_len < batch_limit as usize {
 					active[p] = false;
 				}
 			}
@@ -554,7 +554,7 @@ async fn concurrent_cursors_do_not_evict() {
 async fn concurrent_cursors_on_writable_tx() {
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, NORMAL_BATCH_SIZE, ScanLimit};
+	use crate::kvs::{Direction, NORMAL_BATCH_SIZE};
 
 	const PREFIX_COUNT: usize = 6;
 	const KEYS_PER_PREFIX: usize = 300;
@@ -587,7 +587,7 @@ async fn concurrent_cursors_on_writable_tx() {
 		cursors.push(cursor);
 	}
 
-	let batch_limit = ScanLimit::Count(NORMAL_BATCH_SIZE.min(64));
+	let batch_limit = NORMAL_BATCH_SIZE.min(64);
 	let mut totals = [0usize; PREFIX_COUNT];
 	let mut active = [true; PREFIX_COUNT];
 	while active.iter().any(|a| *a) {
@@ -607,12 +607,7 @@ async fn concurrent_cursors_on_writable_tx() {
 			// pump one extra empty batch before the short-batch heuristic
 			// fires, which is correct but loops one round longer than
 			// intended. See [DefaultKeysCursor] for the heuristic.
-			if len == 0
-				|| len
-					< match batch_limit {
-						ScanLimit::Count(c) => c as usize,
-						_ => unreachable!(),
-					} {
+			if len == 0 || len < batch_limit as usize {
 				active[p] = false;
 			}
 		}
@@ -638,9 +633,9 @@ async fn concurrent_cursors_on_writable_tx() {
 /// if state leaked between cursors.
 #[tokio::test(flavor = "multi_thread")]
 async fn cursor_drop_releases_slot() {
+	use crate::kvs::Direction;
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, ScanLimit};
 
 	let path = TempDir::new().unwrap().path().to_string_lossy().to_string();
 	let ds = RocksDbDatastore::new(&path, RocksDbConfig::default()).await.unwrap();
@@ -671,7 +666,7 @@ async fn cursor_drop_releases_slot() {
 	let rng = prefix_byte_range("drop_test/");
 	let mut cursor =
 		Transactable::open_keys_cursor(tx_ref, rng, Direction::Forward, 0, None).await.unwrap();
-	let batch = cursor.next_batch(ScanLimit::Count(100)).await.unwrap();
+	let batch = cursor.next_batch(100).await.unwrap();
 	assert_eq!(batch.len(), 10, "fresh cursor should observe all seeded keys");
 	drop(cursor);
 
@@ -683,9 +678,9 @@ async fn cursor_drop_releases_slot() {
 /// cursor's internal buffer doesn't bleed bytes between batches.
 #[tokio::test(flavor = "multi_thread")]
 async fn next_batch_borrowed_slices_match_owned_scan() {
+	use crate::kvs::Direction;
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, ScanLimit};
 
 	const N: usize = 1500;
 
@@ -711,7 +706,7 @@ async fn next_batch_borrowed_slices_match_owned_scan() {
 		Transactable::open_keys_cursor(tx_ref, rng, Direction::Forward, 0, None).await.unwrap();
 	let mut collected: Vec<Vec<u8>> = Vec::with_capacity(N);
 	loop {
-		let batch = cursor.next_batch(ScanLimit::Count(200)).await.unwrap();
+		let batch = cursor.next_batch(200).await.unwrap();
 		let batch_len = batch.len();
 		collected.extend(batch.iter().map(|k| k.to_vec()));
 		if batch_len < 200 {
@@ -740,9 +735,9 @@ async fn commit_blocks_until_live_cursor_drops() {
 
 	use futures::FutureExt;
 
+	use crate::kvs::Direction;
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, ScanLimit};
 
 	let path = TempDir::new().unwrap().path().to_string_lossy().to_string();
 	let ds = RocksDbDatastore::new(&path, RocksDbConfig::default()).await.unwrap();
@@ -774,7 +769,7 @@ async fn commit_blocks_until_live_cursor_drops() {
 	// iterator is fully initialised and references `inner.tx` /
 	// `self.db`, so a premature commit would be a use-after-free, not a
 	// no-op on an unallocated iterator.
-	let _ = cursor.next_batch(ScanLimit::Count(4)).await.unwrap();
+	let _ = cursor.next_batch(4).await.unwrap();
 
 	// Kick off the commit. The first poll runs synchronously until the
 	// first `.await` point, which is `drain_cursors`. After that point
@@ -827,9 +822,9 @@ async fn cancel_blocks_until_live_cursor_drops() {
 
 	use futures::FutureExt;
 
+	use crate::kvs::Direction;
 	use crate::kvs::api::Transactable;
 	use crate::kvs::rocksdb::{Datastore as RocksDbDatastore, RocksDbConfig};
-	use crate::kvs::{Direction, ScanLimit};
 
 	let path = TempDir::new().unwrap().path().to_string_lossy().to_string();
 	let ds = RocksDbDatastore::new(&path, RocksDbConfig::default()).await.unwrap();
@@ -853,7 +848,7 @@ async fn cancel_blocks_until_live_cursor_drops() {
 	let rng = prefix_byte_range("cancel_race/");
 	let mut cursor =
 		Transactable::open_keys_cursor(tx_ref, rng, Direction::Forward, 0, None).await.unwrap();
-	let _ = cursor.next_batch(ScanLimit::Count(4)).await.unwrap();
+	let _ = cursor.next_batch(4).await.unwrap();
 
 	let mut cancel_fut = tx_ref.cancel();
 	for round in 0..32 {

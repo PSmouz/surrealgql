@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (V2_DESIGN §8 new rule): a path variable holds an alternating array of records, so a scalar property access like `p.id` is not resolvable. PR-A rejects property access on group/path variables with 'Property access on a group or path variable is not supported yet'; a path variable may only be returned whole (see path_var_return.gql). Pairs with group_var_property.gql for the EdgeGroup form. No schema import: rejected during lowering before execution."
+
+[test.results]
+parsing-error = '''
+Property access on a group or path variable is not supported yet
+  --> [15:50]
+   |
+15 | MATCH p = (a:hub)-[:link]->{1,2}(b:hub) RETURN p.id AS pid
+   |                                                  ^^ return the variable itself
+'''
+*/
+
+MATCH p = (a:hub)-[:link]->{1,2}(b:hub) RETURN p.id AS pid

@@ -42,6 +42,13 @@ impl DefineFunctionStatement {
 		// Validate any GRAPHQL_ALIAS at definition time so typos surface here
 		// rather than silently falling back at schema-generation time.
 		super::validate_graphql_alias(&self.graphql_alias, "function")?;
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "function",
+				name: format!("fn::{}", self.name),
+			});
+		}
 		// Fetch the transaction
 		let txn = ctx.tx();
 		// Check if the definition exists
@@ -51,7 +58,7 @@ impl DefineFunctionStatement {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::FcAlreadyExists {
-							name: self.name.to_string(),
+							name: format!("fn::{}", self.name),
 						});
 					}
 				}

@@ -40,6 +40,10 @@ use crate::key::index::dr::{DiskAnnRecordPending, DiskAnnRecordPendingPrefix};
 #[cfg(diskann)]
 use crate::key::index::ds::Ds;
 use crate::key::index::dv::Dv;
+#[cfg(diskann)]
+use crate::key::index::dw::{DiskAnnRecordPendingShard, DiskAnnRecordPendingShardPrefix};
+#[cfg(diskann)]
+use crate::key::index::dy::Dy;
 use crate::key::index::hd::{Hd, HdRoot};
 use crate::key::index::he::He;
 use crate::key::index::hg::Hg;
@@ -256,10 +260,24 @@ impl IndexKeyBase {
 		Dn::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, element_id)
 	}
 
-	/// Key storing one shard of the distributed-safe DiskANN pending-state guard.
+	/// Key storing one shard of the legacy DiskANN pending-state guard (tracks `!dr` records).
+	///
+	/// New code never constructs this — the sharded layout uses [`Self::new_dy_key`], and old nodes
+	/// own `!dp`. Retained for tests that simulate a pre-change node and for the legacy on-disk
+	/// family; hence `dead_code` in a non-test build.
 	#[cfg(diskann)]
+	#[allow(dead_code)]
 	fn new_dp_key(&self, shard: u16) -> Dp<'_> {
 		Dp::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, shard)
+	}
+
+	/// Key storing one shard of the sharded DiskANN pending-state guard (tracks `!dw` records).
+	///
+	/// Separate from `!dp` so a pre-change node's compactor — which only knows `!dp`/`!dr` — cannot
+	/// clear the guard for sharded data it can't see during a mixed-version rolling upgrade.
+	#[cfg(diskann)]
+	fn new_dy_key(&self, shard: u16) -> Dy<'_> {
+		Dy::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, shard)
 	}
 
 	/// Key mapping an exact serialized vector to its DiskANN document set.
@@ -268,13 +286,32 @@ impl IndexKeyBase {
 		Dq::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, vec)
 	}
 
-	/// Key storing the pending DiskANN update for one record.
+	/// Key storing one shard's sharded pending DiskANN update (`!dw{shard}{id}`) for one record.
+	///
+	/// `shard` is the writer's pending-state shard (see `pending_state_shard`); prefixing it lets
+	/// compaction drain — and lookup scan — one shard at a time. New writes always use this layout.
+	#[cfg(diskann)]
+	fn new_dw_key<'a>(&'a self, shard: u16, id: &'a RecordIdKey) -> DiskAnnRecordPendingShard<'a> {
+		DiskAnnRecordPendingShard::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, shard, id)
+	}
+
+	/// Range covering the sharded `!dw` pending updates for one shard.
+	#[cfg(diskann)]
+	fn new_dw_shard_range(&self, shard: u16) -> Result<Range<Key>> {
+		DiskAnnRecordPendingShardPrefix::range(self.0.ns, self.0.db, &self.0.tb, self.0.ix, shard)
+	}
+
+	/// Key storing the legacy unsharded pending DiskANN update for one record.
+	///
+	/// New writes use the sharded `!dw` layout; this legacy key is read and deleted by the write
+	/// path's dual-read fold, and scanned/range-deleted by lookup and compaction, until the legacy
+	/// range drains empty.
 	#[cfg(diskann)]
 	fn new_dr_key<'a>(&'a self, id: &'a RecordIdKey) -> DiskAnnRecordPending<'a> {
 		DiskAnnRecordPending::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix, id)
 	}
 
-	/// Range covering record-keyed DiskANN pending updates.
+	/// Range covering legacy unsharded record-keyed DiskANN pending updates.
 	#[cfg(diskann)]
 	fn new_dr_range(&self) -> Result<Range<Key>> {
 		DiskAnnRecordPendingPrefix::range(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
@@ -367,6 +404,7 @@ impl IndexKeyBase {
 	}
 
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	/// Range covering primary-appending markers for one build generation.
 	pub(crate) fn new_bp_range(&self, generation: BuildGeneration) -> Result<Range<Key>> {
 		Bp::range(self.0.ns, self.0.db, &self.0.tb, self.0.ix, generation)

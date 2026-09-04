@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Passing a value of the wrong type to an argument fails validation"
+
+[[test.results]]
+error = 'Invalid value for argument "x", expected type "Int"'
+*/
+query {
+	fn_double(x: "not-a-number")
+}

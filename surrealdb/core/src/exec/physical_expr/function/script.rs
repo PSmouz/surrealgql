@@ -18,6 +18,12 @@ pub struct JsFunctionExec {
 	#[allow(dead_code)]
 	pub(crate) script: Script,
 	pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
+	/// Expression-nesting depth recorded when this node was planned. A script
+	/// can re-enter SurrealQL (via `surrealdb.query`), so the remaining
+	/// computation-depth budget handed to it is reduced by this much, keeping
+	/// the limit continuous across the boundary.
+	#[allow(dead_code)]
+	pub(crate) plan_depth: u32,
 }
 impl PhysicalExpr for JsFunctionExec {
 	fn name(&self) -> &'static str {
@@ -50,6 +56,12 @@ impl PhysicalExpr for JsFunctionExec {
 				.options()
 				.ok_or_else(|| anyhow::anyhow!("Script functions require Options context"))?
 				.clone();
+
+			// Continue the depth count across the JS boundary: a script that
+			// re-enters SurrealQL (via `surrealdb.query`, which runs on the legacy
+			// `compute` path) must keep counting from the depth the streaming
+			// planner already reached, rather than getting a fresh budget.
+			let opt = opt.with_dive_consumed(self.plan_depth);
 
 			// Check if scripting is allowed
 			frozen_ctx.check_allowed_scripting()?;

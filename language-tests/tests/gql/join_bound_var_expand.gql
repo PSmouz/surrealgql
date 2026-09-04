@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "BOUND-VARIABLE expansion path: the second pattern (b)-[]->(c) has no labeled element of its own and reuses the already-bound start node `b`, so the planner expands it directly off the accumulator's rows (no second scan, no HashJoin) rather than self-rooting it. The unlabeled edge resolves to the only edge table present (knows). Both edge positions are in ONE MATCH statement, so R2 requires the two edges to be distinct records — making this the two-distinct-edge 2-hop chain a->b->c. Over the person knows graph this gives (a,c): (A,A),(A,C),(B,A),(B,B),(C,B) — the same rows as the node-anchored multi_hop_chain, reached through the bound-variable expand path instead."
+
+[[test.results]]
+value = "[{ a: 'A', c: 'A' }, { a: 'A', c: 'C' }, { a: 'B', c: 'A' }, { a: 'B', c: 'B' }, { a: 'C', c: 'B' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (b)-[]->(c:person)
+RETURN a.name AS a, c.name AS c ORDER BY a, c

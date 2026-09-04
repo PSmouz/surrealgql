@@ -15,7 +15,7 @@ value = ''''Project [ctx: Db]\n  field.recurse: Recurse [ctx: Db] [depth: 1..3, 
 value = ''''Project [ctx: Db]\n    RecordIdScan [ctx: Db] [record_id: shape:1]\n''''
 
 [[test.results]]
-value = ''''SelectProject [ctx: Db] [projections: *]\n    Limit [ctx: Db] [limit: 2, offset: 1]\n        SortTopKByKey [ctx: Db] [sort_keys: label DESC, limit: 3]\n            TableScan [ctx: Db] [table: node, direction: Forward]\n''''
+value = ''''SelectProject [ctx: Db] [projections: *]\n    Limit [ctx: Db] [limit: 2, offset: 1]\n        SortTopKByKey [ctx: Db] [sort_keys: label DESC, limit: 3]\n            TableScan [ctx: Db] [table: node, direction: Forward, topk_pushdown: yes]\n''''
 
 [[test.results]]
 value = ''''Fetch [ctx: Db] [fields: child]\n    SelectProject [ctx: Db] [projections: label, child]\n        RecordIdScan [ctx: Db] [record_id: node:a]\n''''

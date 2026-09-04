@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Parse rejection: ISO has no bare `SHORTEST`; it requires a path count (`SHORTEST k`) or a `GROUP` form."
+
+[test.results]
+parsing-error = """
+`SHORTEST` requires a path count (`SHORTEST k`) or `GROUP`
+  --> [15:7]
+   |
+15 | MATCH SHORTEST (a:wp)-[:road]->+(b:wp) RETURN a.name AS an
+   |       ^^^^^^^^
+"""
+*/
+
+MATCH SHORTEST (a:wp)-[:road]->+(b:wp) RETURN a.name AS an

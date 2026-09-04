@@ -583,6 +583,61 @@ impl Parser<'_> {
 		// Safety: Parser guarentees no null bytes.
 		Ok(name.into())
 	}
+
+	/// Parses an analyzer `FUNCTION` reference. Accepts `fn::` user-defined
+	/// functions and `mod::` Surrealism module functions.
+	pub fn parse_analyzer_function_name(&mut self) -> ParseResult<Strand> {
+		let peek = self.peek();
+		let name = match peek.kind {
+			t!("fn") => self.parse_custom_function_name()?,
+			t!("mod") => {
+				self.pop_peek();
+				if !self.settings.surrealism_enabled {
+					bail!(
+						"Experimental capability `surrealism` is not enabled",
+						@self.last_span() => "Use of `mod::` is still experimental"
+					);
+				}
+				expected!(self, t!("::"));
+				let module = self.parse_ident()?.into_string();
+				let mut name = format!("mod::{module}");
+				if self.eat(t!("::")) {
+					name.push_str("::");
+					name.push_str(&self.parse_ident()?.into_string());
+					while self.eat(t!("::")) {
+						name.push_str("::");
+						name.push_str(self.parse_ident_str()?);
+					}
+				}
+				name.into()
+			}
+			t!("ml") => {
+				self.pop_peek();
+				bail!(
+					"Analyzers cannot use model functions",
+					@self.last_span() => "Model functions cannot be used in an analyzer `FUNCTION` clause"
+				);
+			}
+			t!("silo") => {
+				self.pop_peek();
+				bail!(
+					"Analyzers cannot use silo functions",
+					@self.last_span() => "Silo functions cannot be used in an analyzer `FUNCTION` clause"
+				);
+			}
+			_ => unexpected!(self, peek, "`fn::` or `mod::`"),
+		};
+
+		if self.peek_kind() == t!("(") {
+			let call_span = self.peek().span;
+			bail!(
+				"Analyzer FUNCTION expects a function name, not a function call",
+				@call_span => "Remove `()` from the analyzer FUNCTION clause (for example: `fn::some` or `mod::demo::some`)"
+			);
+		}
+
+		Ok(name)
+	}
 	pub(super) fn try_parse_explain(&mut self) -> ParseResult<Option<Explain>> {
 		Ok(self.eat(t!("EXPLAIN")).then(|| Explain(self.eat(t!("FULL")))))
 	}

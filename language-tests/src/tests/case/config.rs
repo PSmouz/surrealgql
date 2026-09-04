@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde::de::IntoDeserializer;
 use toml_edit::DocumentMut;
 
-use crate::tests::schema::TestConfig;
+use super::Dialect;
+use crate::tests::schema::{NewPlannerStrategyConfig, TestConfig};
 
 #[derive(Debug)]
 pub struct CaseConfig {
@@ -95,15 +96,25 @@ impl<'a> Parser<'a> {
 }
 
 impl CaseConfig {
-	pub fn parse(source: &str) -> Result<Self> {
+	pub fn parse(source: &str, dialect: Dialect) -> Result<Self> {
 		if let Some(config_range) = Parser::extract_config(source)? {
 			let config_source = &source[config_range.clone()];
 
 			let toml: DocumentMut =
 				config_source.parse().context("Could not parse test case config toml")?;
 
-			let config = TestConfig::deserialize(toml.clone().into_deserializer())
+			let mut config = TestConfig::deserialize(toml.clone().into_deserializer())
 				.context("Could not deserialize test case config")?;
+
+			// `planner-strategy` defaults are dialect-aware. A `.gql` test
+			// lowers to an `Expr::Match` that only runs on the streaming
+			// engine; the `compute-only` strategy hard-errors on it. So when a
+			// GQL test does not pin its own strategy, default it away from
+			// `compute-only`. Explicit presence is detected from the raw TOML
+			// (serde defaults erase the omitted-vs-default distinction).
+			if dialect == Dialect::Gql && !planner_strategy_present(&toml) {
+				config.env.planner_strategy = default_gql_planner_strategy();
+			}
 
 			Ok(Self {
 				range: Some(config_range),
@@ -111,11 +122,29 @@ impl CaseConfig {
 				parsed: config,
 			})
 		} else {
+			let mut parsed = TestConfig::default();
+			// No config block: a `.gql` test still needs the dialect-aware
+			// strategy default (see the configured branch above).
+			if dialect == Dialect::Gql {
+				parsed.env.planner_strategy = default_gql_planner_strategy();
+			}
 			Ok(Self {
 				range: None,
 				toml: None,
-				parsed: Default::default(),
+				parsed,
 			})
 		}
 	}
+}
+
+/// The planner strategies a `.gql` test runs under when it does not pin its
+/// own `planner-strategy`. `compute-only` is omitted because `Expr::Match`
+/// only executes on the streaming engine.
+fn default_gql_planner_strategy() -> Vec<NewPlannerStrategyConfig> {
+	vec![NewPlannerStrategyConfig::AllRo, NewPlannerStrategyConfig::BestEffortRo]
+}
+
+/// Whether the raw TOML config explicitly sets `env.planner-strategy`.
+fn planner_strategy_present(toml: &DocumentMut) -> bool {
+	toml.get("env").and_then(|env| env.get("planner-strategy")).is_some()
 }

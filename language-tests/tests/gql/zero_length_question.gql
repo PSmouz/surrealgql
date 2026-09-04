@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: the `?` quantifier (`{0,1}`) emits the zero-length path plus at most one hop. Returning both the group and the path pins the exact zero-length shape: at depth 0 the group is [] and the PATH is the single-node array [source] (a 1-element array, per R5's '[node]' for a zero-hop path); at depth 1 the group is the single traversed edge and the path is the 3-element alternating [node, edge, node]. On the triangle each source yields its self-row (D->D) and its one out-neighbour (D->E). 6 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D', grp: [], pth: [{ age: 40, id: hub:4, name: 'D' }] }, { an: 'D', bn: 'E', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }], pth: [{ age: 40, id: hub:4, name: 'D' }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { age: 50, id: hub:5, name: 'E' }] }, { an: 'E', bn: 'E', grp: [], pth: [{ age: 50, id: hub:5, name: 'E' }] }, { an: 'E', bn: 'F', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }], pth: [{ age: 50, id: hub:5, name: 'E' }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { age: 60, id: hub:6, name: 'F' }] }, { an: 'F', bn: 'D', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }], pth: [{ age: 60, id: hub:6, name: 'F' }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { age: 40, id: hub:4, name: 'D' }] }, { an: 'F', bn: 'F', grp: [], pth: [{ age: 60, id: hub:6, name: 'F' }] }]"
+*/
+
+MATCH p = (a:hub)-[g:link]->?(b:hub) RETURN a.name AS an, b.name AS bn, g AS grp, p AS pth ORDER BY an, bn

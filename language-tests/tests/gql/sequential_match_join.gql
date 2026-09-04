@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Sequential MATCH statements joined on a shared node (PR-B flip): v1/PR-A rejected multiple MATCH clauses. The second clause reuses `b`, so the planner equi-joins the two clauses on `b` (R1: identical join semantics to a comma pattern). DIFFERENT EDGES (R2) is scoped per MATCH statement, so the two `knows` edges live in separate statements and are not mutually edge-unique — the result is every 2-hop chain a->b->c over the person-only knows graph (1->2, 2->1, 2->3, 3->1)."
+
+[[test.results]]
+value = "[{ a: 'A', b: 'B', c: 'A' }, { a: 'A', b: 'B', c: 'C' }, { a: 'B', b: 'A', c: 'B' }, { a: 'B', b: 'C', c: 'A' }, { a: 'C', b: 'A', c: 'B' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person)
+MATCH (b:person)-[:knows]->(c:person)
+RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c

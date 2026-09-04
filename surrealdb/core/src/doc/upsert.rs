@@ -108,12 +108,14 @@ impl Document {
 		self.check_table_type_upsert()?;
 		// Ensure we can write to the table at all
 		self.check_permissions_quick_create(ctx, opt)?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Ensure any input data is computed
 		self.compute_input_data(stk, ctx, opt, stm).await?;
 		// Set the specified record content
 		self.process_record_data(stk, ctx, opt).await?;
 		// Generate a new record id if necessary
-		self.generate_record_id()?;
+		self.generate_record_id(stk, ctx, opt).await?;
 		// Ensure all special fields are valid
 		self.check_data_fields()?;
 		// Set the default record field values
@@ -157,6 +159,8 @@ impl Document {
 		// Otherwise a `WHERE THROW ...` / `SET x = THROW ...` could exfiltrate
 		// field values before the permission check rejects the operation.
 		self.check_update_permissions(stk, ctx, opt, &self.current).await?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Ensure any input data is computed
 		self.compute_input_data(stk, ctx, opt, stm).await?;
 		// Ensure all special fields are valid

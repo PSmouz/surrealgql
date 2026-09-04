@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Unlabeled far node: no record::tb filter, so the person->city edge is included and b binds to the city record too."
+
+[[test.results]]
+value = "[{ an: 'B', bn: 'A' }, { an: 'C', bn: 'A' }, { an: 'A', bn: 'B' }, { an: 'B', bn: 'C' }, { an: 'A', bn: 'London' }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b) RETURN a.name AS an, b.name AS bn ORDER BY bn, an

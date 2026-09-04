@@ -653,9 +653,47 @@ impl Parser<'_> {
 		})
 	}
 
+	/// Account for one additional level of expression-operator nesting against
+	/// the dedicated depth budget, returning a syntax error when it is
+	/// exhausted.
+	///
+	/// This guards the otherwise-unbounded depth of the `Expr` tree built by
+	/// [`Self::pratt_parse_expr`]; see `ParserSettings::expr_recursion_limit`
+	/// for why an unbounded operator chain is a denial-of-service vector.
+	fn enter_expr_depth(&mut self) -> ParseResult<()> {
+		if self.settings.expr_recursion_limit == 0 {
+			bail!("Exceeded expression recursion depth limit",
+				@self.last_span() => "this expression nests or chains operators too deeply");
+		}
+		self.settings.expr_recursion_limit -= 1;
+		Ok(())
+	}
+
 	/// The pratt parsing loop.
 	/// Parses expression according to binding power.
+	///
+	/// This is a thin wrapper around [`Self::pratt_parse_expr_inner`] that
+	/// charges the expression-depth budget for the level introduced by this
+	/// call (so prefix chains, which recurse through here, are bounded) and
+	/// restores it on return so that sibling expressions are not charged for
+	/// one another. The inner loop charges the budget again for every operator
+	/// it appends to the left-associative spine.
 	async fn pratt_parse_expr(&mut self, stk: &mut Stk, min_bp: BindingPower) -> ParseResult<Expr> {
+		let restore_to = self.settings.expr_recursion_limit;
+		self.enter_expr_depth()?;
+		let res = self.pratt_parse_expr_inner(stk, min_bp).await;
+		// Restore everything this call consumed, including the levels charged by
+		// the spine loop. Nested `pratt_parse_expr` calls restore themselves, so
+		// `restore_to` is exactly this call's entry value.
+		self.settings.expr_recursion_limit = restore_to;
+		res
+	}
+
+	async fn pratt_parse_expr_inner(
+		&mut self,
+		stk: &mut Stk,
+		min_bp: BindingPower,
+	) -> ParseResult<Expr> {
 		let peek = self.peek();
 		let (mut lhs, mut lhs_prime) = if let Some(bp) = self.prefix_binding_power(peek.kind) {
 			(self.parse_prefix_op(stk, bp).await?, false)
@@ -671,6 +709,8 @@ impl Parser<'_> {
 					break;
 				}
 
+				// Appending a postfix operator deepens the spine by one level.
+				self.enter_expr_depth()?;
 				lhs = self.parse_postfix(stk, lhs, lhs_prime).await?;
 				lhs_prime = false;
 				continue;
@@ -690,6 +730,8 @@ impl Parser<'_> {
 				break;
 			}
 
+			// Appending an infix operator deepens the spine by one level.
+			self.enter_expr_depth()?;
 			lhs = self.parse_infix_op(stk, bp, lhs, lhs_prime).await?;
 			lhs_prime = false;
 		}

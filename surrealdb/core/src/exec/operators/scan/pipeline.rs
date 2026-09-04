@@ -22,6 +22,7 @@ use crate::exec::permission::{
 	PhysicalPermission, check_permission_for_value, convert_permission_to_physical,
 };
 use crate::exec::pre_decode_filter::{PreDecodeFilter, PreDecodeFilterOutcome};
+use crate::exec::topk_pushdown::TopKThresholdProbe;
 use crate::exec::{EvalContext, ExecutionContext, PhysicalExpr, ValueBatch, ValueBatchStream};
 use crate::expr::{ControlFlow, ControlFlowExt};
 use crate::idx::planner::ScanDirection;
@@ -207,7 +208,7 @@ pub(crate) fn determine_scan_direction(
 /// `START` without a pushdown predicate).
 ///
 /// When `limit_hint` is provided, the first batch is capped to that count so
-/// small-limit queries (e.g. `LIMIT 10`) don't fetch 500 records from
+/// small-limit queries (e.g. `LIMIT 10`) don't fetch a full batch from
 /// storage. Subsequent batches use [`crate::kvs::NORMAL_BATCH_SIZE`].
 ///
 /// Iterates the cursor's borrowed `&[u8]` slices directly — record decode
@@ -223,6 +224,7 @@ pub(crate) fn kv_scan_stream(
 	pre_skip: usize,
 	limit_hint: Option<u32>,
 	pre_decode_filter: Option<Arc<PreDecodeFilter>>,
+	topk_probe: Option<Arc<TopKThresholdProbe>>,
 ) -> ValueBatchStream {
 	let skip = pre_skip.min(u32::MAX as usize) as u32;
 	let stream = async_stream::try_stream! {
@@ -253,35 +255,74 @@ pub(crate) fn kv_scan_stream(
 			if batch_size == 0 {
 				break;
 			}
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(batch_size))
+			// Drive the cursor one borrowed row at a time. The visitor runs the
+			// pre-decode filter and decodes survivors straight from the engine's
+			// borrowed bytes; `decode_record` yields a fully owned `Value`, so
+			// the raw bytes are never retained and the engine hands them over
+			// with no per-row copy.
+			let mut decoded: Vec<Value> = Vec::with_capacity(batch_size as usize);
+			// `decode_record`'s error is a `ControlFlow`, which can't travel
+			// through the visitor's storage-error channel — stash it and
+			// re-raise it below, outside the cursor borrow.
+			let mut decode_err: Option<ControlFlow> = None;
+			let pdf = pre_decode_filter.as_ref();
+			// Snapshot the TopK rejection threshold once per cursor batch.
+			// The sort publishes monotonically-tightening values, so a stale
+			// snapshot only under-rejects (bounded by one batch) — sound, and
+			// it keeps the lock off the per-row path. `None` until the
+			// downstream heap fills (or when no publisher was installed).
+			let topk_threshold = topk_probe.as_ref().and_then(|p| p.snapshot());
+			let mut topk_skipped: u64 = 0;
+			let stats = cursor
+				.for_each(batch_size, &mut |key, val| {
+					if let Some(pdf) = pdf
+						&& pdf.apply(key, val) == PreDecodeFilterOutcome::Reject
+					{
+						// Rejected rows are still counted as scanned (the cursor
+						// read them), so `stats.rows` matches the old batch len.
+						return Ok(std::ops::ControlFlow::Continue(()));
+					}
+					// After the (cheaper, more selective) WHERE probe: skip
+					// decode when the row's ORDER BY key provably cannot beat
+					// the downstream top-K heap's worst entry.
+					if let (Some(probe), Some(threshold)) =
+						(topk_probe.as_ref(), topk_threshold.as_deref())
+						&& probe.rejects(threshold, val)
+					{
+						topk_skipped += 1;
+						return Ok(std::ops::ControlFlow::Continue(()));
+					}
+					match decode_record(key, val) {
+						Ok(v) => {
+							decoded.push(v);
+							Ok(std::ops::ControlFlow::Continue(()))
+						}
+						Err(cf) => {
+							decode_err = Some(cf);
+							Ok(std::ops::ControlFlow::Break(()))
+						}
+					}
+				})
 				.await
 				.context("Failed to scan record")?;
-			if batch.is_empty() {
-				break;
+			if topk_skipped > 0
+				&& let Some(m) = topk_probe.as_ref().and_then(|p| p.metrics())
+			{
+				m.add_skipped_rows(topk_skipped);
 			}
-			let mut decoded = Vec::with_capacity(batch.len());
-			// Hoist the pre-decode-filter branch out of the per-item loop:
-			// `pre_decode_filter` is `Option<Arc<…>>` and doesn't change
-			// across iterations, so we pay the `Option`-check once per
-			// batch instead of per row.
-			match &pre_decode_filter {
-				Some(pdf) => {
-					for (key, val) in &batch {
-						if pdf.apply(key, val) == PreDecodeFilterOutcome::Reject {
-							continue;
-						}
-						decoded.push(decode_record(key, val)?);
-					}
-				}
-				None => {
-					for (key, val) in &batch {
-						decoded.push(decode_record(key, val)?);
-					}
-				}
+			// Re-raise a stashed decode error as the stream's terminal error,
+			// now that the cursor borrow has ended. `?` on an `Err` already
+			// ends the stream, so no explicit `return` is needed.
+			if let Some(cf) = decode_err {
+				Err(cf)?;
 			}
 			first = false;
-			yielded += batch.len();
+			// `stats.rows` counts every row the cursor advanced over (including
+			// pre-decode-filter rejects), matching the previous `batch.len()`.
+			yielded += stats.rows as usize;
+			if stats.rows == 0 {
+				break;
+			}
 			if !decoded.is_empty() {
 				yield ValueBatch { values: decoded };
 			}
@@ -560,6 +601,17 @@ impl ComputedFieldDef {
 	pub(crate) fn field_name(&self) -> &str {
 		&self.field_name
 	}
+
+	/// Test-only constructor: production definitions are built exclusively by
+	/// [`build_field_state_raw`] from catalog field definitions.
+	#[cfg(test)]
+	pub(crate) fn for_test(field_name: impl Into<String>) -> Self {
+		Self {
+			field_name: field_name.into(),
+			expr: Arc::new(crate::exec::physical_expr::Literal(Value::None)),
+			kind: None,
+		}
+	}
 }
 
 /// Build field state from raw transaction and context parameters.
@@ -801,6 +853,17 @@ pub(crate) fn filter_field_state_for_projection(
 
 	FieldState {
 		computed_fields,
+		// SECURITY: `field_permissions` is retained in full here — it is
+		// deliberately NOT filtered down to the projection. Field-level SELECT
+		// permissions must be enforced for every restricted field on the table
+		// regardless of whether it appears in the projection (a restricted
+		// field can be referenced only by WHERE/ORDER BY). The value-ordering
+		// guard in `operators/scan/dynamic.rs`
+		// (`order_touches_restricted_select_field`) also reads this list to
+		// decide whether an `ORDER BY` targets a restricted field, so filtering
+		// it by projection would let `SELECT id ... ORDER BY <restricted>`
+		// (where the field is sorted on but not projected) slip past the guard
+		// and re-open the value-ordering oracle.
 		field_permissions: Arc::clone(&full_state.field_permissions),
 		dep_map: Arc::clone(&full_state.dep_map),
 		permission_field_deps: Arc::clone(&full_state.permission_field_deps),
@@ -898,13 +961,22 @@ pub(crate) async fn filter_fields_by_permission(
 			PhysicalPermission::Allow => continue,
 			PhysicalPermission::Deny => {
 				let original = snapshot.get_or_insert_with(|| value.clone());
-				for path in original.each(&idiom.0) {
+				// SECURITY: iterate in reverse. `each` yields ascending
+				// array indices and `Value::cut` removes via `Vec::remove`
+				// (shifting later indices down), so a forward pass would
+				// let each removal invalidate the pending indices and leak
+				// the odd-indexed elements (issue #7356). Removing higher
+				// indices first keeps the pending lower indices valid.
+				for path in original.each(&idiom.0).into_iter().rev() {
 					value.cut(&path.0);
 				}
 			}
 			PhysicalPermission::Conditional(_) => {
 				let original = snapshot.get_or_insert_with(|| value.clone());
-				for path in original.each(&idiom.0) {
+				// SECURITY: iterate in reverse (see the Deny arm above and
+				// issue #7356). Predicates read from `original` (immutable),
+				// so evaluation order is irrelevant.
+				for path in original.each(&idiom.0).into_iter().rev() {
 					let field_value = original.pick(&path.0);
 					let allowed =
 						check_permission_for_value(perm, original, Some(&field_value), ctx)

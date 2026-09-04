@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: range quantifier `{2,3}` with min > 1 — emit at depths 2 and 3 only. In v1 a range minimum above one was a lowering rejection ('Variable-length quantifiers with a minimum greater than one are not supported yet'); v2 supports it. On the triangle, depth 2 gives D->F, E->D, F->E and depth 3 (the full cycle back to the source) gives D->D, E->E, F->F. 6 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'F' }, { an: 'E', bn: 'D' }, { an: 'E', bn: 'E' }, { an: 'F', bn: 'E' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->{2,3}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

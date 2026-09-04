@@ -47,6 +47,28 @@ impl Value {
 						}
 					}
 				},
+				// Current value at path is a set
+				Value::Set(v) => match p {
+					Part::All => Value::Set(v.iter().map(|v| v.pick(path.next())).collect()),
+					Part::First => match v.first() {
+						Some(v) => v.pick(path.next()),
+						None => Value::None,
+					},
+					Part::Last => match v.last() {
+						Some(v) => v.pick(path.next()),
+						None => Value::None,
+					},
+					x => {
+						if let Some(idx) = x.as_old_index() {
+							match v.nth(idx) {
+								Some(v) => v.pick(path.next()),
+								None => Value::None,
+							}
+						} else {
+							Value::Set(v.iter().map(|v| v.pick(path)).collect())
+						}
+					}
+				},
 				// Ignore everything else
 				_ => Value::None,
 			},

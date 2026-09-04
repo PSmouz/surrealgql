@@ -87,6 +87,14 @@ impl DefineTableStatement {
 		let name =
 			TableName::new(expr_to_ident(stk, ctx, opt, doc, &self.name, "table name").await?);
 
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "table",
+				name: name.as_str().to_string(),
+			});
+		}
+
 		// Get the NS and DB
 		let (ns_name, db_name) = opt.ns_db()?;
 

@@ -112,10 +112,27 @@ pub(crate) struct NsDbCtx {
 /// live queries) lives on [`NsDbTbMutCtx`] instead.
 #[derive(Clone, Debug)]
 pub(crate) struct NsDbTbCtx {
+	/// The namespace this document belongs to.
 	pub(crate) ns: Arc<NamespaceDefinition>,
+	/// The database this document belongs to.
 	pub(crate) db: Arc<DatabaseDefinition>,
+	/// The definition of the table this document belongs to.
 	pub(crate) tb: Arc<TableDefinition>,
+	/// The table's field definitions, eagerly loaded so the per-row hot path
+	/// can run permission reduction, computed fields, and projection without
+	/// async catalog calls.
 	pub(crate) fields: Arc<[FieldDefinition]>,
+	/// Index into `fields` of the `id` field definition, if one is defined.
+	/// Precomputed once so the write path can read the id field's kind and
+	/// default in O(1) without rescanning the field list per record.
+	pub(crate) id_field_idx: Option<usize>,
+}
+
+/// Find the index of the `id` field within a table's field set, if one is
+/// defined. Computed once when a table context is built so the record write
+/// path never has to rescan the field list per record.
+fn id_field_index(fields: &[FieldDefinition]) -> Option<usize> {
+	fields.iter().position(|fd| fd.name.is_id())
 }
 
 impl NsDbTbCtx {
@@ -156,22 +173,28 @@ impl NsDbTbCtx {
 					}
 				}
 			};
+			// Locate the id field once for the write path
+			let id_field_idx = id_field_index(&fields);
 			// Return the document context
 			Ok(Self {
 				ns: Arc::clone(&parent.ns),
 				db: Arc::clone(&parent.db),
 				tb,
 				fields,
+				id_field_idx,
 			})
 		} else {
 			// Fetch the definitions
 			let fields = txn.all_tb_fields(ns, db, table, version).await?;
+			// Locate the id field once for the write path
+			let id_field_idx = id_field_index(&fields);
 			// Return the document context
 			Ok(Self {
 				ns: Arc::clone(&parent.ns),
 				db: Arc::clone(&parent.db),
 				tb,
 				fields,
+				id_field_idx,
 			})
 		}
 	}
@@ -185,14 +208,29 @@ impl NsDbTbCtx {
 /// write.
 #[derive(Clone, Debug)]
 pub(crate) struct NsDbTbMutCtx {
+	/// The namespace this document belongs to.
 	pub(crate) ns: Arc<NamespaceDefinition>,
+	/// The database this document belongs to.
 	pub(crate) db: Arc<DatabaseDefinition>,
+	/// The definition of the table this document belongs to.
 	pub(crate) tb: Arc<TableDefinition>,
+	/// The table's field definitions, used to apply the schema (types,
+	/// defaults, assertions, permissions) to the record being written.
 	pub(crate) fields: Arc<[FieldDefinition]>,
+	/// The table's event definitions, triggered after the record is written.
 	pub(crate) events: Arc<[EventDefinition]>,
+	/// The table's foreign (view) tables, recomputed after the record is
+	/// written to keep their aggregates consistent.
 	pub(crate) tables: Arc<[TableDefinition]>,
+	/// The table's index definitions, maintained after the record is written.
 	pub(crate) indexes: Arc<[IndexDefinition]>,
+	/// The table's live query subscriptions, notified after the record is
+	/// written.
 	pub(crate) lives: Arc<[SubscriptionDefinition]>,
+	/// Index into `fields` of the `id` field definition, if one is defined.
+	/// Precomputed once so the write path can read the id field's kind and
+	/// default in O(1) without rescanning the field list per record.
+	pub(crate) id_field_idx: Option<usize>,
 }
 
 impl NsDbTbMutCtx {
@@ -287,6 +325,8 @@ impl NsDbTbMutCtx {
 			// Fetch the definitions
 			let (fields, events, tables, indexes, lives) =
 				futures::try_join!(fields(), events(), tables(), indexes(), lives())?;
+			// Locate the id field once for the write path
+			let id_field_idx = id_field_index(&fields);
 			// Return the document context
 			Ok(Self {
 				ns: Arc::clone(&parent.ns),
@@ -297,6 +337,7 @@ impl NsDbTbMutCtx {
 				tables,
 				indexes,
 				lives,
+				id_field_idx,
 			})
 		} else {
 			// Fetch the definitions
@@ -307,6 +348,8 @@ impl NsDbTbMutCtx {
 				txn.all_tb_indexes(ns, db, table, version),
 				txn.all_tb_lives(ns, db, table, version),
 			)?;
+			// Locate the id field once for the write path
+			let id_field_idx = id_field_index(&fields);
 			// Return the document context
 			Ok(Self {
 				ns: Arc::clone(&parent.ns),
@@ -317,6 +360,7 @@ impl NsDbTbMutCtx {
 				tables,
 				indexes,
 				lives,
+				id_field_idx,
 			})
 		}
 	}
@@ -412,6 +456,20 @@ impl DocumentContext {
 			)),
 			DocumentContext::NsDbTbCtx(ctx) => Ok(&ctx.fields),
 			DocumentContext::NsDbTbMutCtx(ctx) => Ok(&ctx.fields),
+		}
+	}
+
+	/// Get the precomputed `id` field definition, if one is defined. Located
+	/// once when the table context is built (see [`id_field_index`]), so the
+	/// record write path reads the id field's kind and default in O(1) instead
+	/// of rescanning the fields per record.
+	pub(crate) fn id_field(&self) -> Result<Option<&FieldDefinition>> {
+		match self {
+			DocumentContext::NsDbCtx(_) => Err(anyhow::anyhow!(
+				"Id field not defined in DocumentContext, this is certainly a bug and should be reported."
+			)),
+			DocumentContext::NsDbTbCtx(ctx) => Ok(ctx.id_field_idx.map(|i| &ctx.fields[i])),
+			DocumentContext::NsDbTbMutCtx(ctx) => Ok(ctx.id_field_idx.map(|i| &ctx.fields[i])),
 		}
 	}
 

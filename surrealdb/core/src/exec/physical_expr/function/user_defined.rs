@@ -25,6 +25,10 @@ pub struct UserDefinedFunctionExec {
 	/// Function name without the "fn::" prefix
 	pub(crate) name: String,
 	pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
+	/// Expression-nesting depth recorded when this call was planned. The body,
+	/// planned lazily on call, is seeded with it so nested `eval`/UDF recursion
+	/// keeps counting toward `max_computation_depth` instead of resetting.
+	pub(crate) plan_depth: u32,
 }
 impl PhysicalExpr for UserDefinedFunctionExec {
 	fn name(&self) -> &'static str {
@@ -78,6 +82,7 @@ impl PhysicalExpr for UserDefinedFunctionExec {
 				document_root: ctx.document_root,
 				skip_fetch_perms: ctx.skip_fetch_perms,
 				computing_record: ctx.computing_record,
+				plan_depth: ctx.plan_depth,
 			};
 
 			// 5. Check permissions (with limited auth)
@@ -121,6 +126,10 @@ impl PhysicalExpr for UserDefinedFunctionExec {
 				document_root: None,
 				skip_fetch_perms: ctx.skip_fetch_perms,
 				computing_record: ctx.computing_record.clone(),
+				// The body is one re-entry deeper than the call, so continue the
+				// depth count at `plan_depth + 1` (it is planned lazily below, in
+				// BlockPhysicalExpr) to keep nested recursion bounded.
+				plan_depth: self.plan_depth + 1,
 			};
 			let result = match block_expr.evaluate(eval_ctx).await {
 				Ok(v) => v,

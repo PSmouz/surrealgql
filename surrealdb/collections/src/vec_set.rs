@@ -159,6 +159,18 @@ impl<T: Ord> VecSet<T> {
 		self.entries.last()
 	}
 
+	pub fn first_mut(&mut self) -> Option<&mut T> {
+		self.entries.first_mut()
+	}
+
+	pub fn last_mut(&mut self) -> Option<&mut T> {
+		self.entries.last_mut()
+	}
+
+	pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+		self.entries.get_mut(index)
+	}
+
 	pub fn retain<F>(&mut self, mut f: F)
 	where
 		F: FnMut(&T) -> bool,

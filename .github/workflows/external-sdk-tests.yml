@@ -1,13 +1,11 @@
-name: External SDK tests
+name: SDKs
 
 # Exercise external SDK repos against a freshly built surreal binary.
-# Most jobs use Depot runners; sdk-php uses ubuntu-latest because
-# shivammathur/setup-php expects a stock GitHub-hosted image. Not in PR required checks.
+# Runs on the org's amd64 spot runners against an amd64 surreal binary.
+# Not in PR required checks.
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"
   pull_request:
     types:
       - opened
@@ -25,25 +23,26 @@ defaults:
 permissions:
   contents: read
 
+# sccache → S3 backend (drop-in for the former Depot Cache). See ci.yml for
+# the rationale. Only the `build` job compiles Rust / uses sccache; the env is
+# inert elsewhere. Empty on fork PRs → sccache falls back to a local cache.
+env:
+  SCCACHE_BUCKET: ${{ secrets.AWS_S3_SCCACHE_BUCKET_NAME }}
+  SCCACHE_REGION: us-east-1
+  SCCACHE_S3_KEY_PREFIX: ${{ github.repository }}
+  SCCACHE_IDLE_TIMEOUT: "0"
+  AWS_ACCESS_KEY_ID: ${{ secrets.AMAZON_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AMAZON_SECRET_KEY }}
+
 jobs:
   # ----------------------------------------
   # Server build (shared by SDK matrices)
   # ----------------------------------------
 
   build:
-    name: Build binary (${{ matrix.name }})
-    strategy:
-      matrix:
-        include:
-          - name: amd64
-            runner: depot-ubuntu-24.04-8
-            target: x86_64-unknown-linux-gnu
-          - name: arm64
-            runner: depot-ubuntu-24.04-arm-8
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
+    name: Build binary (amd64)
+    runs-on: runner-amd-16-cores-spot
     steps:
-
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # (Actions must be pinned by commit hash) v6.0.2
 
@@ -51,21 +50,19 @@ jobs:
         uses: ./.github/actions/setup-environment
         with:
           save-cache: ${{ github.ref == 'refs/heads/main' }}
-          free-disk-space: 'false'
-          depot-runner: 'true'
 
       - name: Build binary
-        run: cargo build --target ${{ matrix.target }}
+        run: cargo build --target x86_64-unknown-linux-gnu
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # (Actions must be pinned by commit hash) v7.0.0
         with:
-          name: surreal-${{ matrix.name }}
-          path: target/${{ matrix.target }}/debug/surreal
+          name: surreal-amd64
+          path: target/x86_64-unknown-linux-gnu/debug/surreal
 
   sdk-javascript:
     name: SDK - JavaScript (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     needs: build
     permissions:
       contents: read
@@ -121,7 +118,7 @@ jobs:
 
   sdk-golang:
     name: SDK - Golang (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     needs: build
     strategy:
       fail-fast: false
@@ -183,7 +180,7 @@ jobs:
 
   sdk-python:
     name: SDK - Python (${{ matrix.version }}, ${{ matrix.protocol }})
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     needs: build
     strategy:
       fail-fast: false
@@ -261,7 +258,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - 8.2
+          - 8.4
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # (Actions must be pinned by commit hash) v6.0.2
@@ -281,11 +278,10 @@ jobs:
         uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # (Actions must be pinned by commit hash) v2.37.0
         with:
           php-version: ${{ matrix.version }}
+          extensions: openswoole-26.2.0
 
-      - name: Setup Composer
-        uses: php-actions/composer@8a65f0d3c6a1d17ca4800491a40b5756a4c164f3 # (Actions must be pinned by commit hash) v6.1.2
-        with:
-          php_version: ${{ matrix.version }}
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
 
       - name: Start SurrealDB
         run: ${{ github.workspace }}/artifacts/surreal start --allow-all -u root -p root &
@@ -312,11 +308,11 @@ jobs:
       - name: Run PHP tests
         timeout-minutes: 5
         continue-on-error: true
-        run: composer test-coverage-v2
+        run: composer test
 
   sdk-dotnet:
     name: SDK - .NET (${{ matrix.version }})
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     needs: build
     strategy:
       fail-fast: false
@@ -398,7 +394,7 @@ jobs:
 
   sdk-output:
     name: SDK test summary
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest
     if: always()
     needs:
       - sdk-javascript

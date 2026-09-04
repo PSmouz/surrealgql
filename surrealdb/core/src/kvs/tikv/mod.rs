@@ -17,10 +17,10 @@ use tikv::transaction::ResolveLocksOptions;
 use tikv::{CheckLevel, Config, TimestampExt, TransactionClient, TransactionOptions};
 use tokio::sync::RwLock;
 
-use super::api::{BoxFut, GetMultiResult, KeysResult, ScanLimit, ScanResult};
+use super::api::{BoxFut, GetMultiResult, KeysResult, ScanResult};
 use super::err::{Error, Result};
 use super::timestamp::MAX_TIMESTAMP_BYTES;
-use super::{ESTIMATED_BYTES_PER_KEY, ESTIMATED_BYTES_PER_KV, util};
+use super::util;
 use crate::key::debug::Sprintable;
 use crate::kvs::api::Transactable;
 use crate::kvs::timestamp::{BoxTimeStamp, BoxTimeStampImpl};
@@ -537,8 +537,8 @@ impl TikvOpsHandle {
 /// physical/logical decomposition as the rest of the engine. Returns
 /// `None` if the computed instant would precede the epoch.
 fn safepoint_from(now: &tikv::Timestamp, lifetime: Duration) -> Option<tikv::Timestamp> {
-	let micros: i64 = lifetime.as_micros().try_into().ok()?;
-	let physical = now.physical.checked_sub(micros)?;
+	let millis: i64 = lifetime.as_millis().try_into().ok()?;
+	let physical = now.physical.checked_sub(millis)?;
 	if physical < 0 {
 		return None;
 	}
@@ -741,23 +741,41 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
-			// Build an index from key bytes to original position so we can
-			// restore order without cloning values out of a HashMap.
-			let key_index: HashMap<&[u8], usize> =
-				keys.iter().enumerate().map(|(i, k)| (k.as_slice(), i)).collect();
+			// Build an index from key bytes to *every* original position that
+			// requested it. `batch_get` collapses duplicate keys to a single
+			// returned pair, so a key repeated in `keys` (common when several
+			// graph rows fetch a shared endpoint/target node in one batch) must
+			// fan its one result out to all of its positions — mirroring the
+			// per-position semantics of the mem/rocksdb engines. Mapping to a
+			// single position would leave the other slots `None`, silently
+			// dropping records.
+			let mut key_index: HashMap<&[u8], Vec<usize>> = HashMap::with_capacity(keys.len());
+			for (i, k) in keys.iter().enumerate() {
+				key_index.entry(k.as_slice()).or_default().push(i);
+			}
 			// Batch get the keys
 			let pairs = inner.tx.batch_get(keys.iter().cloned()).await?;
-			// Place each result directly at the correct position, accumulating
-			// the hit count and value bytes during the same pass so callers do
-			// not need to re-walk the result.
+			// Place each result at every position that requested its key,
+			// accumulating the hit count and value bytes during the same pass so
+			// callers do not need to re-walk the result. The value is cloned into
+			// each duplicate position and moved into the last, so the all-unique
+			// case incurs no extra clone.
 			let mut values: Vec<Option<Val>> = vec![None; keys.len()];
 			let mut records = 0u64;
 			let mut value_bytes = 0u64;
 			for kv in pairs {
-				if let Some(&idx) = key_index.get(Key::from(kv.0).as_slice()) {
+				if let Some(idxs) = key_index.get(Key::from(kv.0).as_slice())
+					&& let Some((&last, rest)) = idxs.split_last()
+				{
+					let len = kv.1.len() as u64;
+					for &i in rest {
+						records += 1;
+						value_bytes += len;
+						values[i] = Some(kv.1.clone());
+					}
 					records += 1;
-					value_bytes += kv.1.len() as u64;
-					values[idx] = Some(kv.1);
+					value_bytes += len;
+					values[last] = Some(kv.1);
 				}
 			}
 			Ok(GetMultiResult {
@@ -1041,7 +1059,7 @@ impl Transactable for Transaction {
 	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -1056,12 +1074,8 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
-			// Extract the limit count, adding skip to fetch enough entries
-			let count = match limit {
-				ScanLimit::Count(c) => c.saturating_add(skip),
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KEY).max(1).saturating_add(skip),
-				ScanLimit::BytesOrCount(_, c) => c.saturating_add(skip),
-			};
+			// Add skip to the row budget so enough entries are fetched
+			let count = limit.saturating_add(skip);
 			// Create the iterator
 			let mut iter = inner.tx.scan_keys(rng, count).await?;
 			// Consume the iterator
@@ -1074,7 +1088,7 @@ impl Transactable for Transaction {
 	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -1089,12 +1103,8 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
-			// Extract the limit count, adding skip to fetch enough entries
-			let count = match limit {
-				ScanLimit::Count(c) => c.saturating_add(skip),
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KEY).max(1).saturating_add(skip),
-				ScanLimit::BytesOrCount(_, c) => c.saturating_add(skip),
-			};
+			// Add skip to the row budget so enough entries are fetched
+			let count = limit.saturating_add(skip);
 			// Create the iterator
 			let mut iter = inner.tx.scan_keys_reverse(rng, count).await?;
 			// Consume the iterator
@@ -1107,7 +1117,7 @@ impl Transactable for Transaction {
 	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -1137,14 +1147,8 @@ impl Transactable for Transaction {
 			} else {
 				rng
 			};
-			// Extract the limit count
-			let count = match limit {
-				ScanLimit::Count(c) => c,
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KV).max(1),
-				ScanLimit::BytesOrCount(_, c) => c,
-			};
 			// Create the iterator
-			let mut iter = inner.tx.scan(rng, count).await?;
+			let mut iter = inner.tx.scan(rng, limit).await?;
 			// Consume the iterator
 			Ok(consume_vals(&mut iter, limit))
 		})
@@ -1155,7 +1159,7 @@ impl Transactable for Transaction {
 	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -1184,14 +1188,8 @@ impl Transactable for Transaction {
 			} else {
 				rng
 			};
-			// Extract the limit count
-			let count = match limit {
-				ScanLimit::Count(c) => c,
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KV).max(1),
-				ScanLimit::BytesOrCount(_, c) => c,
-			};
 			// Create the iterator
-			let mut iter = inner.tx.scan_reverse(rng, count).await?;
+			let mut iter = inner.tx.scan_reverse(rng, limit).await?;
 			// Consume the iterator
 			Ok(consume_vals(&mut iter, limit))
 		})
@@ -1335,7 +1333,11 @@ impl TimeStampImpl for TiKVStampImpl {
 	}
 
 	fn create_from_datetime(&self, dt: DateTime<Utc>) -> Option<BoxTimeStamp> {
-		let physical = dt.timestamp_micros();
+		// `physical` is the TiKV TSO physical component, which is measured in
+		// milliseconds (it is what `version()` shifts left by 18 bits, and what
+		// `current_timestamp()` returns). Using microseconds here overflows the
+		// `version()` packing for any realistic datetime.
+		let physical = dt.timestamp_millis();
 		Some(BoxTimeStamp::new(TiKVStamp(tikv::Timestamp {
 			physical,
 			logical: 0,
@@ -1396,13 +1398,13 @@ impl TimeStamp for TiKVStamp {
 	}
 
 	fn as_datetime(&self) -> Option<DateTime<Utc>> {
-		// Will truncate, but is only a problem far in the future
-		DateTime::from_timestamp_micros(self.0.physical)
+		// `physical` is in milliseconds (TiKV TSO physical component).
+		DateTime::from_timestamp_millis(self.0.physical)
 	}
 
 	fn sub_checked(&self, duration: Duration) -> Option<BoxTimeStamp> {
-		let micros = duration.as_micros().try_into().ok()?;
-		let physical = self.0.physical.checked_sub(micros)?;
+		let millis = duration.as_millis().try_into().ok()?;
+		let physical = self.0.physical.checked_sub(millis)?;
 		Some(BoxTimeStamp::new(TiKVStamp(tikv::Timestamp {
 			physical,
 			logical: self.0.logical,
@@ -1423,11 +1425,7 @@ impl TimeStamp for TiKVStamp {
 }
 
 // Consume and iterate over only keys
-fn consume_keys<I: Iterator<Item = tikv::Key>>(
-	iter: &mut I,
-	limit: ScanLimit,
-	skip: u32,
-) -> KeysResult {
+fn consume_keys<I: Iterator<Item = tikv::Key>>(iter: &mut I, limit: u32, skip: u32) -> KeysResult {
 	// Skip entries from the pre-fetched iterator
 	for _ in 0..skip {
 		if iter.next().is_none() {
@@ -1435,53 +1433,18 @@ fn consume_keys<I: Iterator<Item = tikv::Key>>(
 		}
 	}
 	let mut key_bytes = 0u64;
-	let keys = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(Key::from(k));
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut keys = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while keys.len() < limit as usize {
+		// Check the key
+		if let Some(k) = iter.next() {
+			key_bytes += k.len() as u64;
+			keys.push(Key::from(k));
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KEY).min(4096) as usize);
-			// Check that we don't exceed the byte limit
-			while key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(Key::from(k));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(Key::from(k));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	KeysResult {
 		keys,
 		key_bytes,
@@ -1489,78 +1452,25 @@ fn consume_keys<I: Iterator<Item = tikv::Key>>(
 }
 
 // Consume and iterate over keys and values
-fn consume_vals<I: Iterator<Item = tikv::KvPair>>(iter: &mut I, limit: ScanLimit) -> ScanResult {
-	// Track the cumulative key/value bytes for the metric. The byte-bounded
-	// limit branches still rely on `bytes_fetched` (key + value bytes) to
-	// decide when to stop, so the two counters are kept separate.
+fn consume_vals<I: Iterator<Item = tikv::KvPair>>(iter: &mut I, limit: u32) -> ScanResult {
+	// Track the cumulative key/value bytes for the scan metrics.
 	let mut key_bytes = 0u64;
 	let mut value_bytes = 0u64;
-	let values = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key and value
-				if let Some(kv) = iter.next() {
-					let key_len = kv.0.len() as u64;
-					let value_len = kv.1.len() as u64;
-					key_bytes += key_len;
-					value_bytes += value_len;
-					res.push((Key::from(kv.0), kv.1));
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut values = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while values.len() < limit as usize {
+		// Check the key and value
+		if let Some(kv) = iter.next() {
+			let key_len = kv.0.len() as u64;
+			let value_len = kv.1.len() as u64;
+			key_bytes += key_len;
+			value_bytes += value_len;
+			values.push((Key::from(kv.0), kv.1));
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KV).min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the byte limit
-			while bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some(kv) = iter.next() {
-					let key_len = kv.0.len() as u64;
-					let value_len = kv.1.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((Key::from(kv.0), kv.1));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some(kv) = iter.next() {
-					let key_len = kv.0.len() as u64;
-					let value_len = kv.1.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((Key::from(kv.0), kv.1));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	ScanResult {
 		values,
 		key_bytes,
@@ -1583,7 +1493,8 @@ mod tests {
 			logical: 42,
 			suffix_bits: 7,
 		};
-		let safepoint = safepoint_from(&now, Duration::from_micros(250)).unwrap();
+		// `physical` is in milliseconds, so a 250 ms lifetime subtracts 250.
+		let safepoint = safepoint_from(&now, Duration::from_millis(250)).unwrap();
 		assert_eq!(safepoint.physical, 999_750);
 		// Logical and suffix bits ride along unchanged so the safepoint
 		// stays comparable to other timestamps in the same epoch.
@@ -1598,9 +1509,9 @@ mod tests {
 			logical: 0,
 			suffix_bits: 0,
 		};
-		// A 1 ms lifetime is 1000 micros; subtracting from `physical = 100`
-		// underflows past the epoch and should bail.
-		assert!(safepoint_from(&now, Duration::from_millis(1)).is_none());
+		// A 101 ms lifetime subtracted from `physical = 100` ms underflows
+		// past the epoch and should bail.
+		assert!(safepoint_from(&now, Duration::from_millis(101)).is_none());
 	}
 
 	#[test]
@@ -1610,7 +1521,7 @@ mod tests {
 			logical: 0,
 			suffix_bits: 0,
 		};
-		// `Duration::MAX.as_micros()` doesn't fit in `i64`; the
+		// `Duration::MAX.as_millis()` doesn't fit in `i64`; the
 		// `try_into` should bail rather than panic.
 		assert!(safepoint_from(&now, Duration::MAX).is_none());
 	}

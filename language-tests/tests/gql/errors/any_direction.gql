@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the any-direction edge has no lookup mapping."
+
+[test.results]
+parsing-error = '''
+Undirected and multi-directional edge patterns are not supported yet
+  --> [15:17]
+   |
+15 | MATCH (a:person)-(b:person) RETURN a
+   |                 ^ use a directed edge: `-[…]->` or `<-[…]-`
+'''
+*/
+
+MATCH (a:person)-(b:person) RETURN a

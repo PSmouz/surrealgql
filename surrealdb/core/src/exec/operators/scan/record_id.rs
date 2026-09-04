@@ -342,6 +342,8 @@ pub(crate) async fn execute_record_lookup(
 				pre_skip,
 				limit_hint,
 				pre_decode_filter,
+				// TopK threshold pushdown targets full table scans only.
+				None,
 			);
 
 			let mut pipeline = ScanPipeline::new(

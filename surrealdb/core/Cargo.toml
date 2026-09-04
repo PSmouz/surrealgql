@@ -15,7 +15,7 @@ license-file.workspace = true
 
 [features]
 # Public features
-default = ["kv-mem", "graphql"]
+default = ["kv-mem", "graphql", "gql"]
 kv-mem = [
     "dep:surrealmx",
     "tokio/time",
@@ -60,9 +60,12 @@ allocation-tracking = []
 # GraphQL support
 graphql = ["dep:async-graphql"]
 
+# GQL support
+gql = []
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
-features = ["kv-mem", "kv-rocksdb", "http", "scripting", "graphql"]
+features = ["kv-mem", "kv-rocksdb", "http", "scripting", "graphql", "gql"]
 targets = []
 
 [dependencies]
@@ -142,7 +145,6 @@ pbkdf2 = { workspace = true, features = ["simple"] }
 phf = { workspace = true, features = ["macros", "unicase"] }
 pin-project-lite.workspace = true
 quick_cache.workspace = true
-radix_trie = { workspace = true, features = ["serde"] }
 rand.workspace = true
 rand_core.workspace = true
 rayon.workspace = true

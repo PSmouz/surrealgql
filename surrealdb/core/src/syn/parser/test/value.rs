@@ -82,6 +82,7 @@ fn parse_large_depth_object() {
 		ParserSettings {
 			query_recursion_limit: 100000,
 			object_recursion_limit: 100000,
+			expr_recursion_limit: 100000,
 			..Default::default()
 		},
 	);
@@ -120,6 +121,7 @@ fn parse_large_depth_record_id() {
 		ParserSettings {
 			query_recursion_limit: 100000,
 			object_recursion_limit: 100000,
+			expr_recursion_limit: 100000,
 			..Default::default()
 		},
 	);

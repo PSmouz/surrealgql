@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path mode `SIMPLE`: no repeated node, except a path may close back onto its start. On the triangle D→E→F→D anchored at D, the walks are D→E, D→E→F and the closing D→E→F→D (start == end allowed) — three rows (D, E, F)."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'E' }, { an: 'D', bn: 'F' }]"
+*/
+
+MATCH SIMPLE (a:hub WHERE a.name = 'D')-[:link]->+(b:hub)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

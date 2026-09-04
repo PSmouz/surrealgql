@@ -149,7 +149,10 @@ impl ExecOperator for ReferenceScan {
 		let db_ctx = ctx.database()?.clone();
 		// SECURITY: reference scan results bypass `Document::pluck_select`, so
 		// the referencing table's SELECT permission must be enforced here
-		// (same family as the graph scan check).
+		// (same family as the graph scan check). `resolve_record_batch`
+		// enforces the table-level permission and — in `FullRecord` mode —
+		// additionally applies field-level SELECT permissions and computed
+		// fields, matching a direct `SELECT *` on the referencing table.
 		let check_perms = should_check_perms(&db_ctx, Action::View)?;
 		let input_stream = buffer_stream(
 			self.input.execute(ctx)?,
@@ -211,27 +214,37 @@ impl ExecOperator for ReferenceScan {
 						.await
 						.context("Failed to open reference cursor")?;
 					loop {
-						let batch = cursor
-							.next_batch(crate::kvs::ScanLimit::Count(
+						// Decode each ref key straight from the cursor's borrowed
+						// bytes into an owned `RecordId` — no per-key buffer copy.
+						let mut decode_err: Option<anyhow::Error> = None;
+						let stats = cursor
+							.for_each(
 								crate::kvs::NORMAL_BATCH_SIZE,
-							))
+								&mut |key| match crate::key::r#ref::Ref::decode_key(key) {
+									Ok(decoded) => {
+										rid_batch.push(RecordId {
+											table: decoded.ft.into_owned(),
+											key: decoded.fk.into_owned(),
+										});
+										Ok(std::ops::ControlFlow::Continue(()))
+									}
+									Err(e) => {
+										decode_err = Some(e);
+										Ok(std::ops::ControlFlow::Break(()))
+									}
+								},
+							)
 							.await
 							.context("Failed to scan reference")?;
-						if batch.is_empty() {
+						if let Some(e) = decode_err {
+							return Err(e).context("Failed to decode ref key")?;
+						}
+						if stats.rows == 0 {
 							break;
 						}
-						for key in &batch {
-							let decoded = crate::key::r#ref::Ref::decode_key(key)
-								.context("Failed to decode ref key")?;
-
-							rid_batch.push(RecordId {
-								table: decoded.ft.into_owned(),
-								key: decoded.fk.into_owned(),
-							});
-						}
-						// Resolve full batches before fetching the next batch
-						// from the cursor — keeps the cursor's reusable
-						// buffer free for the next call and bounds memory.
+						// Resolve full batches before fetching the next chunk
+						// from the cursor — keeps the cursor's reusable buffer
+						// free for the next call and bounds memory.
 						if rid_batch.len() >= scan_batch_size {
 							let values = resolve_record_batch(
 								&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms,

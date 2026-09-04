@@ -184,6 +184,9 @@ impl PhysicalExpr for ClosureCallExec {
 						document_root: None,
 						skip_fetch_perms: ctx.skip_fetch_perms,
 						computing_record: ctx.computing_record.clone(),
+						// The closure body is one re-entry deeper — continue the
+						// depth count so nested recursion stays bounded.
+						plan_depth: ctx.plan_depth + 1,
 					};
 
 					let result = match block_expr.evaluate(eval_ctx).await {

@@ -12,7 +12,7 @@ use surrealdb_types::{SqlFormat, ToSql};
 use crate::err::Error;
 use crate::exec::context::{ContextLevel, ExecutionContext};
 use crate::exec::plan_or_compute::{
-	block_required_context, evaluate_body_expr, evaluate_expr, expr_required_context,
+	block_required_context, evaluate_body_expr, evaluate_expr_at_depth, expr_required_context,
 };
 use crate::exec::{
 	AccessMode, CardinalityHint, ExecOperator, FlowResult, OperatorMetrics, ValueBatch,
@@ -43,15 +43,20 @@ pub struct ForeachPlan {
 	pub range: Expr,
 	/// Loop body block
 	pub body: Block,
+	/// Expression-nesting depth recorded when this operator was planned. The
+	/// deferred range/body planning below is seeded with it so re-entry nodes
+	/// (eval/UDF) keep counting toward `max_computation_depth`.
+	plan_depth: u32,
 }
 
 impl ForeachPlan {
-	pub(crate) fn new(param: Param, range: Expr, body: Block) -> Self {
+	pub(crate) fn new(param: Param, range: Expr, body: Block, plan_depth: u32) -> Self {
 		Self {
 			param,
 			range,
 			body,
 			metrics: Arc::new(OperatorMetrics::new()),
+			plan_depth,
 		}
 	}
 }
@@ -109,10 +114,13 @@ impl ExecOperator for ForeachPlan {
 		let param = self.param.clone();
 		let range = self.range.clone();
 		let body = self.body.clone();
+		// Range/body are re-planned one re-entry deeper than this operator, so the
+		// depth count continues at `plan_depth + 1` toward `max_computation_depth`.
+		let depth = self.plan_depth + 1;
 		let ctx = ctx.clone();
 
 		let stream =
-			stream::once(async move { execute_foreach(&param, &range, &body, &ctx).await });
+			stream::once(async move { execute_foreach(&param, &range, &body, &ctx, depth).await });
 
 		Ok(Box::pin(stream))
 	}
@@ -138,9 +146,10 @@ async fn execute_foreach(
 	range: &Expr,
 	body: &Block,
 	ctx: &ExecutionContext,
+	depth: u32,
 ) -> crate::expr::FlowResult<ValueBatch> {
 	// First, evaluate the range expression
-	let range_value = evaluate_expr(range, ctx).await?;
+	let range_value = evaluate_expr_at_depth(range, ctx, depth).await?;
 
 	// Create the iterator based on the range value
 	let iter = match range_value {
@@ -174,7 +183,7 @@ async fn execute_foreach(
 
 		// Execute each statement in the body
 		for expr in body.0.iter() {
-			let result = evaluate_body_expr(expr, &mut current_ctx, &param_name, &v).await;
+			let result = evaluate_body_expr(expr, &mut current_ctx, &param_name, &v, depth).await;
 
 			// Handle control flow signals
 			match result {

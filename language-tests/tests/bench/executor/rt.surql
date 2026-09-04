@@ -5,6 +5,7 @@ imports = ["./rt_import.surql"]
 [bench]
 reason = "Benching SurrealQL compute performance with a tiny raytracer"
 run = true
+rebuild = true
 
 [test]
 

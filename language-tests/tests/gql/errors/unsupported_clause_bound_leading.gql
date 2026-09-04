@@ -1,0 +1,17 @@
+/**
+[test]
+reason = "Lowering rejection (PR-B): a later clause whose LEADING pattern is anchored only by a bound variable (unlabeled start reusing `b`, unlabeled edge) cannot be planned as a standalone self-rooted sub-tree, so it is rejected cleanly with 'not supported yet' rather than a planner internal error (V2_DESIGN §6). Labelling the start (`(b:person)-[]->(c:person)`) makes it node-anchored and supported. (No schema import: a lowering rejection is evaluated before any data.)"
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [16:7]
+   |
+16 | MATCH (b)-[]->(c:person)
+   |       ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a:person)-[:knows]->(b:person)
+MATCH (b)-[]->(c:person)
+RETURN a.name AS a, c.name AS c

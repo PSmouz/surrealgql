@@ -1,0 +1,27 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Creating a record on a relation table issues a RELATE between in and out"
+
+[[test.results]]
+value = "{ createLikes: { id: 'likes:carol_likes_draft', in: { name: 'Carol' }, out: { title: 'Draft post' }, rating: 2 } }"
+*/
+mutation {
+	createLikes(data: {
+		id: "carol_likes_draft",
+		in: "person:carol",
+		out: "post:draft",
+		rating: 2
+	}) {
+		id
+		rating
+		in {
+			name
+		}
+		out {
+			title
+		}
+	}
+}

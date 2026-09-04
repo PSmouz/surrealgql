@@ -1,0 +1,17 @@
+/**
+[env]
+imports = ["./_no_introspection.surql"]
+
+[test]
+reason = "INTROSPECTION NONE rejects __schema queries while regular queries keep working"
+
+[[test.results]]
+error = 'Unknown field "__schema" on type "Query".'
+*/
+query {
+	__schema {
+		queryType {
+			name
+		}
+	}
+}

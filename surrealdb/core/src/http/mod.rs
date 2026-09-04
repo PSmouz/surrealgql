@@ -8,17 +8,8 @@ use url::Url;
 use crate::cnf::CommonConfig;
 use crate::dbs::capabilities::{NetTarget, Targets};
 
-#[cfg(not(target_family = "wasm"))]
-mod resolve;
-
 pub struct HttpClient {
 	client: Client,
-}
-
-#[cfg(not(target_family = "wasm"))]
-struct NetFilter {
-	allow: Targets<NetTarget>,
-	deny: Targets<NetTarget>,
 }
 
 impl HttpClient {
@@ -48,9 +39,9 @@ impl HttpClient {
 		use http::header::USER_AGENT;
 		use http::{HeaderMap, HeaderValue};
 		use reqwest::redirect::{Attempt, Policy};
-		use resolve::FilteringResolver;
 
 		use crate::dbs::capabilities::NetTarget;
+		use crate::net::{FilteringResolver, NetFilter};
 
 		let filter = Arc::new(NetFilter {
 			allow,

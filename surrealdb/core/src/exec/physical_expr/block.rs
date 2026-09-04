@@ -22,7 +22,7 @@ use crate::doc::CursorDoc;
 use crate::err::Error;
 use crate::exec::physical_expr::{EvalContext, PhysicalExpr};
 use crate::exec::plan_or_compute::{block_required_context, legacy_compute};
-use crate::exec::planner::expr_to_physical_expr;
+use crate::exec::planner::expr_to_physical_expr_at_depth;
 use crate::exec::{AccessMode, BoxFut};
 use crate::expr::{Block, ControlFlow, Expr, FlowResult};
 use crate::val::Value;
@@ -70,13 +70,24 @@ fn create_planning_context(
 ///
 /// Since the ExecutionContext's FrozenContext is the single source of truth
 /// for parameters, we can use it directly without reconstruction.
-fn get_legacy_context<'a>(
-	exec_ctx: &'a crate::exec::ExecutionContext,
+fn get_legacy_context(
+	exec_ctx: &crate::exec::ExecutionContext,
 	cached_ctx: &mut Option<FrozenContext>,
-) -> anyhow::Result<(&'a crate::dbs::Options, FrozenContext)> {
+	permission_predicate: bool,
+) -> anyhow::Result<(crate::dbs::Options, FrozenContext)> {
 	let options = exec_ctx
 		.options()
 		.ok_or_else(|| anyhow::anyhow!("Options not available for legacy compute fallback"))?;
+
+	// When this block is evaluated inside a PERMISSIONS predicate (signalled by
+	// `skip_fetch_perms`), block write side effects on the legacy compute
+	// fallback so a predicate cannot mutate data via a custom function body or
+	// nested statement (GHSA-66r2-5gwj-gxm2).
+	let options = if permission_predicate {
+		options.new_for_permission_predicate()
+	} else {
+		options.clone()
+	};
 
 	// Use or create a cached context for legacy compute
 	let frozen = if let Some(ctx) = cached_ctx.take() {
@@ -168,6 +179,9 @@ impl BlockPhysicalExpr {
 		legacy_ctx: &mut Option<FrozenContext>,
 		current_value_for_legacy: Option<&Value>,
 	) -> FlowResult<Value> {
+		// Block statements are re-planned one re-entry deeper than the block, so
+		// the depth count continues toward `max_computation_depth`.
+		let depth = ctx.plan_depth + 1;
 		match expr {
 			Expr::Let(set_stmt) => {
 				// Check for protected parameter names
@@ -181,55 +195,68 @@ impl BlockPhysicalExpr {
 				// Create a frozen context for planning that includes current params
 				let frozen_ctx = create_planning_context(current_exec_ctx, local_params);
 
-				// Try to plan and evaluate the value expression
-				let value = match expr_to_physical_expr(set_stmt.what.clone(), &frozen_ctx).await {
-					Ok(phys_expr) => {
-						let eval_ctx = EvalContext {
-							exec_ctx: current_exec_ctx,
-							current_value: ctx.current_value,
-							local_params: if local_params.is_empty() {
-								None
-							} else {
-								Some(local_params)
-							},
-							recursion_ctx: None,
-							document_root: ctx.document_root,
-							skip_fetch_perms: ctx.skip_fetch_perms,
-							computing_record: ctx.computing_record.clone(),
-						};
-						phys_expr.evaluate(eval_ctx).await?
-					}
-					Err(Error::PlannerUnimplemented(ref msg))
-						if *frozen_ctx.new_planner_strategy()
-							== NewPlannerStrategy::AllReadOnlyStatements =>
+				// Try to plan and evaluate the value expression. Seed the planner
+				// with the block's nesting depth so re-entry nodes inside it
+				// (eval/UDF) keep counting toward `max_computation_depth`.
+				let value =
+					match expr_to_physical_expr_at_depth(set_stmt.what.clone(), &frozen_ctx, depth)
+						.await
 					{
-						return Err(ControlFlow::Err(anyhow::anyhow!(Error::Query {
-							message: format!("New executor does not support: {msg}"),
-						})));
-					}
-					Err(e @ (Error::PlannerUnsupported(_) | Error::PlannerUnimplemented(_))) => {
-						match &e {
-							Error::PlannerUnimplemented(msg) => {
-								tracing::warn!(
-									"PlannerUnimplemented fallback in block (LET): {msg}"
-								);
-							}
-							Error::PlannerUnsupported(msg) => {
-								tracing::debug!(
-									"PlannerUnsupported fallback in block (LET): {msg}",
-								);
-							}
-							_ => {}
+						Ok(phys_expr) => {
+							let eval_ctx = EvalContext {
+								exec_ctx: current_exec_ctx,
+								current_value: ctx.current_value,
+								local_params: if local_params.is_empty() {
+									None
+								} else {
+									Some(local_params)
+								},
+								recursion_ctx: None,
+								document_root: ctx.document_root,
+								skip_fetch_perms: ctx.skip_fetch_perms,
+								computing_record: ctx.computing_record.clone(),
+								plan_depth: depth,
+							};
+							phys_expr.evaluate(eval_ctx).await?
 						}
-						let (opt, frozen) = get_legacy_context(current_exec_ctx, legacy_ctx)?;
-						let doc =
-							current_value_for_legacy.map(|v| CursorDoc::new(None, None, v.clone()));
-						legacy_compute(&set_stmt.what, &frozen, opt, doc.as_ref()).await?
-					}
-					Err(e) => {
-						return Err(ControlFlow::Err(e.into()));
-					}
-				};
+						Err(Error::PlannerUnimplemented(ref msg))
+							if *frozen_ctx.new_planner_strategy()
+								== NewPlannerStrategy::AllReadOnlyStatements =>
+						{
+							return Err(ControlFlow::Err(anyhow::anyhow!(Error::Query {
+								message: format!("New executor does not support: {msg}"),
+							})));
+						}
+						Err(
+							e @ (Error::PlannerUnsupported(_) | Error::PlannerUnimplemented(_)),
+						) => {
+							match &e {
+								Error::PlannerUnimplemented(msg) => {
+									tracing::warn!(
+										"PlannerUnimplemented fallback in block (LET): {msg}"
+									);
+								}
+								Error::PlannerUnsupported(msg) => {
+									tracing::debug!(
+										"PlannerUnsupported fallback in block (LET): {msg}",
+									);
+								}
+								_ => {}
+							}
+							let (opt, frozen) = get_legacy_context(
+								current_exec_ctx,
+								legacy_ctx,
+								ctx.skip_fetch_perms,
+							)?;
+							let opt = &opt.with_dive_consumed(depth);
+							let doc = current_value_for_legacy
+								.map(|v| CursorDoc::new(None, None, v.clone()));
+							legacy_compute(&set_stmt.what, &frozen, opt, doc.as_ref()).await?
+						}
+						Err(e) => {
+							return Err(ControlFlow::Err(e.into()));
+						}
+					};
 
 				// Apply type coercion if specified
 				let value = if let Some(kind) = &set_stmt.kind {
@@ -259,8 +286,10 @@ impl BlockPhysicalExpr {
 				// Create a frozen context for planning that includes current params
 				let frozen_ctx = create_planning_context(current_exec_ctx, local_params);
 
-				// Try to plan and evaluate the expression
-				match expr_to_physical_expr(other.clone(), &frozen_ctx).await {
+				// Try to plan and evaluate the expression. Seed the planner with the
+				// block's nesting depth so re-entry nodes inside it (eval/UDF) keep
+				// counting toward `max_computation_depth`.
+				match expr_to_physical_expr_at_depth(other.clone(), &frozen_ctx, depth).await {
 					Ok(phys_expr) => {
 						let eval_ctx = EvalContext {
 							exec_ctx: current_exec_ctx,
@@ -274,6 +303,7 @@ impl BlockPhysicalExpr {
 							document_root: ctx.document_root,
 							skip_fetch_perms: ctx.skip_fetch_perms,
 							computing_record: ctx.computing_record.clone(),
+							plan_depth: depth,
 						};
 						phys_expr.evaluate(eval_ctx).await
 					}
@@ -299,7 +329,9 @@ impl BlockPhysicalExpr {
 							}
 							_ => {}
 						}
-						let (opt, frozen) = get_legacy_context(current_exec_ctx, legacy_ctx)?;
+						let (opt, frozen) =
+							get_legacy_context(current_exec_ctx, legacy_ctx, ctx.skip_fetch_perms)?;
+						let opt = &opt.with_dive_consumed(depth);
 						let doc =
 							current_value_for_legacy.map(|v| CursorDoc::new(None, None, v.clone()));
 						legacy_compute(other, &frozen, opt, doc.as_ref()).await

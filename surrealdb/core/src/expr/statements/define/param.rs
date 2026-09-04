@@ -35,6 +35,14 @@ impl DefineParamStatement {
 		// Allowed to run?
 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Parameter, Base::Db)?;
 
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "param",
+				name: self.name.to_string(),
+			});
+		}
+
 		let value = stk.run(|stk| self.value.compute(stk, ctx, opt, doc)).await.catch_return()?;
 
 		// Fetch the transaction

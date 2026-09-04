@@ -1,0 +1,16 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Selecting a field that does not exist on the type fails validation"
+
+[[test.results]]
+error = 'Unknown field "nonexistent" on type "person".'
+*/
+query {
+	person(id: "alice") {
+		name
+		nonexistent
+	}
+}

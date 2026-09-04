@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: RETURN * expands to the named pattern variables, of which this pattern has none."
+
+[test.results]
+parsing-error = '''
+RETURN * requires at least one named pattern variable
+  --> [15:17]
+   |
+15 | MATCH (:person) RETURN *
+   |                 ^^^^^^^^ name a pattern element or list the return items explicitly
+'''
+*/
+
+MATCH (:person) RETURN *

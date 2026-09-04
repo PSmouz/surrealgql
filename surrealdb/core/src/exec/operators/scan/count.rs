@@ -413,7 +413,7 @@ async fn count_with_perm_fallback(
 			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 		}
 		let batch = cursor
-			.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
+			.next_batch(crate::kvs::NORMAL_BATCH_SIZE)
 			.await
 			.context("Failed to scan record")?;
 		if batch.is_empty() {

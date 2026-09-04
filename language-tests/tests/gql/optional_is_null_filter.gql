@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "The nullable() amendment (V2_DESIGN §8) + R3 pre-null evaluation. A bare optional-bound `Variable(b)` is nullable, so `b IS NULL` is a real 3VL test (not a statically-false guard). Written INSIDE the optional clause, the predicate evaluates PRE-null — it is part of the optional's own match, compiled into the OptionalExpand predicate slot. Hand-derived over the person->person knows graph (A->B; B->A, B->C; C->A): EVERY person has a matching `b`, but during the match `b` is always a real record, so `b IS NULL` is false and filters out every candidate. With zero survivors the left-outer null-fills `b`, so all three anchors surface with `friend` = NONE. This proves (1) `b IS NULL` is permitted on an optional binding (the amendment), (2) inside-WHERE is pre-null, and (3) the left-outer preserves the anchor even when the inside predicate rejects every candidate."
+
+[[test.results]]
+value = "[{ friend: NONE, name: 'A' }, { friend: NONE, name: 'B' }, { friend: NONE, name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b IS NULL RETURN a.name AS name, b.name AS friend ORDER BY name

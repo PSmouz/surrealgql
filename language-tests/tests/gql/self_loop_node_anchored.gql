@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A node variable repeated WITHIN one pattern (the self-loop `(a:person)-[:knows]->(a)`) requires the source and target to be the SAME record. No person in the corpus graph (knows edges 1->2, 2->1, 2->3, 3->1, 1->city) is its own knows-target, so the result is empty. The lowering rewrites the repeated `a` to a fresh hidden node and emits an `a.id = __v.id` equality (V2_DESIGN §2); without it the target overwrites the source on the row and every knows edge leaks through (over-returning A, A, B, C, London)."
+
+[[test.results]]
+value = "[]"
+*/
+
+MATCH (a:person)-[:knows]->(a) RETURN a.name AS a ORDER BY a

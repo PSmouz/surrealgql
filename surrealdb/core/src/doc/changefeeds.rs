@@ -39,6 +39,11 @@ impl Document {
 				);
 			}
 		}
+		// Independently of the user-facing changefeed, capture a live-query event
+		// for this change when the Router engine is active and the table has
+		// subscribers. This writes to a dedicated keyspace (see [`crate::lq`]) and
+		// does not affect changefeed semantics, retention, or `SHOW CHANGES`.
+		self.process_live_events(ctx, opt).await?;
 		// Carry on
 		Ok(())
 	}

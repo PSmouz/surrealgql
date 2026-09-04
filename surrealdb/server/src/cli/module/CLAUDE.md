@@ -12,9 +12,9 @@ The `surreal module` command provides tooling for developing, building, and insp
 
 Scaffolds a new Surrealism module project.
 
-- Creates `Cargo.toml`, `surrealism.toml`, and `src/lib.rs` with starter code.
+- Creates `Cargo.toml`, `surrealism.toml`, `.cargo/config.toml` (Tokio WASIp2 flags), and `src/lib.rs` with starter code.
 - Supports interactive and headless (`--headless --org <org>`) modes.
-- Pins the `surrealism` SDK dependency to `SURREALISM_VERSION` and `surrealdb` to `SURREALDB_VERSION`.
+- Pins the `surrealism` SDK dependency to `SURREALISM_VERSION` and `surrealdb-types` to `SURREALDB_VERSION`. The full `surrealdb` crate is omitted by default (commented in `Cargo.toml`) to keep WASM builds fast; most modules only need `surrealdb-types` for `SurrealValue` and related types.
 - Only Rust target is currently supported.
 
 ### `build` (`build.rs`)
@@ -24,7 +24,7 @@ Compiles a Rust project into a distributable `.surli` archive.
 Pipeline:
 1. Load and validate `surrealism.toml` config.
 2. Read `cargo metadata` to find the WASM target artifact.
-3. Run `cargo build --target wasm32-wasip2` (release or debug).
+3. Ensure `.cargo/config.toml` exists, then run `cargo build --target wasm32-wasip2` with `RUSTFLAGS` including `--cfg tokio_unstable` (release or debug).
 4. Validate the `surrealism` SDK version matches the server's expected version.
 5. Run `wasm-opt` to optimize the binary (skip in debug mode).
 6. Instantiate with a `DemoHost` to extract the exports manifest (function signatures).

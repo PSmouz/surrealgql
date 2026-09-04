@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[graphql]
+operation = "DoesNotExist"
+
+[test]
+reason = "Selecting an operation name that is not defined in the document fails"
+
+[[test.results]]
+error = 'Unknown operation named "DoesNotExist"'
+*/
+query OnlyAlice {
+	person(id: "alice") {
+		name
+	}
+}

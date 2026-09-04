@@ -396,11 +396,6 @@ impl ExecOperator for DynamicScan {
 				None => 0,
 			};
 
-			// Early exit if limit is 0
-			if limit_val == Some(0) {
-				return;
-			}
-
 			// VERSION stamp for metadata lookups (same evaluation as `resolve_table_scan_stream`).
 			let version_stamp: Option<u64> = match &version {
 				Some(expr) => {
@@ -444,8 +439,36 @@ impl ExecOperator for DynamicScan {
 				return;
 			}
 
+			if limit_val == Some(0) {
+				return;
+			}
+
 			// Eagerly initialize field state (computed fields + field permissions)
 			let field_state = build_field_state(&ctx, &table_name, check_perms, needed_fields.as_ref()).await?;
+
+			// SECURITY (value-ordering oracle): runtime counterpart to the
+			// plan-time guard in `planner/select`. The plan-time guard only
+			// runs when the access path is resolved at plan time; this
+			// `DynamicScan` is also reached when planning was txn-less or when
+			// plan-time access-path resolution returned `None`/`Err`, and it
+			// resolves the access path below using `order`. If `order` targets
+			// a field the current actor cannot fully read, an index that walks
+			// it in true value order would emit rows in that order; field
+			// reduction then nulls the value, but the row order would still
+			// encode the hidden values' relative ordering. Withholding `order`
+			// here keeps the scan in record-id order and forces the outer Sort
+			// to run over the reduced (NULL) keys. Unlike the plan-time path,
+			// this uses the actor's *resolved* field permissions
+			// (`field_state.field_permissions`, populated only when permissions
+			// are enforced), so it never over-applies to privileged users.
+			let order = if order_touches_restricted_select_field(
+				order.as_ref(),
+				&field_state.field_permissions,
+			) {
+				None
+			} else {
+				order
+			};
 
 			// Row-filtering (permissions, WHERE) prevents positional pushdown;
 			// row-modifying ops (computed fields, field perms) do not.
@@ -522,6 +545,38 @@ impl ExecOperator for DynamicScan {
 // ---------------------------------------------------------------------------
 // Source helpers
 // ---------------------------------------------------------------------------
+
+/// SECURITY (value-ordering oracle): returns `true` when any top-level
+/// `ORDER BY` idiom references a field carrying a non-`Full` SELECT permission
+/// for the current actor.
+///
+/// `field_permissions` are the per-field SELECT permissions resolved into
+/// [`crate::exec::operators::scan::pipeline::FieldState`]; `Permission::Full`
+/// fields are intentionally absent and the list is empty when permission
+/// enforcement is skipped (owner/root), so a privileged actor never matches
+/// here. The match is shallow — each `Order.value` is a plain top-level idiom
+/// and an index-ordering leak requires the index to cover the field directly,
+/// so a restricted field referenced only inside an idiom filter (e.g.
+/// `ORDER BY foo[WHERE code = …]`) is not an indexable ordering and cannot leak
+/// through this vector. Mirrors the plan-time `RestrictedPrefixes::order_touches`
+/// guard in `planner/select`, including its out-of-scope parent/child
+/// nested-field gap (ordering by a *parent* of a restricted child is not
+/// caught — see that guard's docs).
+fn order_touches_restricted_select_field(
+	order: Option<&Ordering>,
+	field_permissions: &[(crate::expr::Idiom, PhysicalPermission)],
+) -> bool {
+	// `ORDER BY RAND()` references no field and cannot leak ordering.
+	let Some(Ordering::Order(order_list)) = order else {
+		return false;
+	};
+	if field_permissions.is_empty() {
+		return false;
+	}
+	order_list
+		.iter()
+		.any(|o| field_permissions.iter().any(|(field, _)| o.value.starts_with(field.0.as_slice())))
+}
 
 /// Configuration bundle for [`resolve_table_scan_stream`].
 struct TableScanConfig {
@@ -752,6 +807,9 @@ async fn resolve_table_scan_stream(
 				cfg.pre_skip,
 				cfg.limit_hint,
 				cfg.pre_decode_filter.clone(),
+				// TopK threshold pushdown is plan-time-only (TableScan);
+				// DynamicScan resolves its access path at runtime.
+				None,
 			);
 			Ok((stream, cfg.pre_skip))
 		}

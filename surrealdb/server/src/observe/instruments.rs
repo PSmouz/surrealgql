@@ -173,6 +173,7 @@ pub mod names {
 
 	pub static LIVE_QUERY_ACTIVE: &str = "surrealdb.live_query.active";
 	pub static LIVE_QUERY_NOTIFICATIONS: &str = "surrealdb.live_query.notifications";
+	pub static LIVE_QUERY_ORPHANED: &str = "surrealdb.live_query.orphaned";
 
 	// --- Slow query (scope: SLOW_QUERY) --------------------------------
 

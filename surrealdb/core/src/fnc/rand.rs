@@ -11,21 +11,23 @@ use crate::err::Error;
 use crate::val::{Datetime, Duration, Number, Uuid, Value};
 
 pub fn rand(_: ()) -> Result<Value> {
-	Ok(rand::random::<f64>().into())
+	Ok(crate::rnd::with_rng(|rng| rng.random::<f64>()).into())
 }
 
 pub fn bool(_: ()) -> Result<Value> {
-	Ok(rand::random::<bool>().into())
+	Ok(crate::rnd::with_rng(|rng| rng.random::<bool>()).into())
 }
 
 pub fn r#enum(Any(mut args): Any) -> Result<Value> {
 	Ok(match args.len() {
 		0 => Value::None,
 		1 => match args.remove(0) {
-			Value::Array(v) => v.into_iter().choose(&mut rand::rng()).unwrap_or(Value::None),
+			Value::Array(v) => {
+				crate::rnd::with_rng(|rng| v.into_iter().choose(rng)).unwrap_or(Value::None)
+			}
 			v => v,
 		},
-		_ => args.into_iter().choose(&mut rand::rng()).expect("non-empty args"),
+		_ => crate::rnd::with_rng(|rng| args.into_iter().choose(rng)).expect("non-empty args"),
 	})
 }
 
@@ -73,9 +75,9 @@ pub fn float((NoneOrRange(range),): (NoneOrRange<f64>,)) -> Result<Value> {
 					.to_string(),
 			}
 		);
-		rand::rng().random_range(min..=max)
+		crate::rnd::with_rng(|rng| rng.random_range(min..=max))
 	} else {
-		rand::random::<f64>()
+		crate::rnd::with_rng(|rng| rng.random::<f64>())
 	};
 	Ok(Value::from(v))
 }
@@ -115,7 +117,7 @@ pub fn id((Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>)) -> R
 		);
 		let lower = to_random_len("rand::id", lower)?;
 		let upper = to_random_len("rand::id", upper)?;
-		rand::rng().random_range(lower..=upper)
+		crate::rnd::with_rng(|rng| rng.random_range(lower..=upper))
 	} else {
 		ensure!(
 			lower <= LIMIT,
@@ -130,8 +132,9 @@ pub fn id((Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>)) -> R
 	};
 
 	// Generate the random id
-	let mut rng = rand::rng();
-	let id: String = (0..len).map(|_| *ID_CHARS[..].choose(&mut rng).unwrap_or(&'0')).collect();
+	let id: String = crate::rnd::with_rng(|rng| {
+		(0..len).map(|_| *ID_CHARS[..].choose(&mut *rng).unwrap_or(&'0')).collect()
+	});
 	Ok(Value::from(id))
 }
 
@@ -145,9 +148,9 @@ pub fn int((NoneOrRange(range),): (NoneOrRange<i64>,)) -> Result<Value> {
 					.to_string(),
 			}
 		);
-		rand::rng().random_range(min..=max)
+		crate::rnd::with_rng(|rng| rng.random_range(min..=max))
 	} else {
-		rand::random::<i64>()
+		crate::rnd::with_rng(|rng| rng.random::<i64>())
 	}
 	.into())
 }
@@ -177,7 +180,7 @@ pub fn string((Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>)) 
 		);
 		let lower = to_random_len("rand::string", lower)?;
 		let upper = to_random_len("rand::string", upper)?;
-		rand::rng().random_range(lower..=upper)
+		crate::rnd::with_rng(|rng| rng.random_range(lower..=upper))
 	} else {
 		ensure!(
 			lower <= LIMIT,
@@ -191,7 +194,7 @@ pub fn string((Optional(arg1), Optional(arg2)): (Optional<i64>, Optional<i64>)) 
 		to_random_len("rand::string", lower)?
 	};
 	// Generate the random string
-	Ok(Alphanumeric.sample_string(&mut rand::rng(), len).into())
+	Ok(crate::rnd::with_rng(|rng| Alphanumeric.sample_string(rng, len)).into())
 }
 
 pub fn duration((dur1, dur2): (Duration, Duration)) -> Result<Value> {
@@ -204,7 +207,7 @@ pub fn duration((dur1, dur2): (Duration, Duration)) -> Result<Value> {
 		}
 	);
 
-	let rand = rand::rng().random_range(dur1.as_nanos()..=dur2.as_nanos());
+	let rand = crate::rnd::with_rng(|rng| rng.random_range(dur1.as_nanos()..=dur2.as_nanos()));
 
 	let nanos = (rand % 1_000_000_000) as u32;
 
@@ -265,7 +268,7 @@ pub fn time((NoneOrRange(range),): (NoneOrRange<Value>,)) -> Result<Value> {
 	};
 	// Generate the random time, try up to 5 times
 	for _ in 0..5 {
-		let val = rand::rng().random_range(min..=max);
+		let val = crate::rnd::with_rng(|rng| rng.random_range(min..=max));
 		if let Some(v) = Utc.timestamp_opt(val, 0).earliest() {
 			return Ok(v.into());
 		}

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Variable-length {1,3} under V2_DESIGN R6: ONE ROW PER PATH at every depth in [1,3], with edge-uniqueness within each path (R2). This is the canonical v1->v2 behavior change — v1 returned nine rows (distinct reachable (a,b) pairs on the cyclic 1/2/3 graph); v2 returns fourteen because a target reached by two different edge-paths produces two rows. Hand-derivation (edges 1->2,2->1,2->3,3->1; far label keeps every target a person): from A (1) paths to 2 / {1,3} / 1 = bn A,A,B,C; from B (2) paths to {1,3} / {2,1} / {3,2} = bn A,A,B,B,C,C; from C (3) paths to 1 / 2 / {1,3} = bn A,A,B,C. Totals A:4, B:6, C:4 = 14 rows."
+
+[[test.results]]
+value = "[{ an: 'A', bn: 'A' }, { an: 'A', bn: 'A' }, { an: 'A', bn: 'B' }, { an: 'A', bn: 'C' }, { an: 'B', bn: 'A' }, { an: 'B', bn: 'A' }, { an: 'B', bn: 'B' }, { an: 'B', bn: 'B' }, { an: 'B', bn: 'C' }, { an: 'B', bn: 'C' }, { an: 'C', bn: 'A' }, { an: 'C', bn: 'A' }, { an: 'C', bn: 'B' }, { an: 'C', bn: 'C' }]"
+*/
+
+MATCH (a:person)-[:knows]->{1,3}(b:person) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

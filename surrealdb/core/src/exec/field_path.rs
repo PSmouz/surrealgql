@@ -5,6 +5,7 @@
 //! like sorting where we need to extract values synchronously without
 //! database access or expression evaluation.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::err::Error;
@@ -110,66 +111,98 @@ impl FieldPath {
 
 	/// Extract the value at this path from a record.
 	/// Returns Value::None if the path doesn't exist.
-	pub fn extract(&self, value: &Value) -> Value {
-		let mut current = value.clone();
+	///
+	/// Borrows into the input wherever the path is pure navigation
+	/// (object fields, array/set element access), so the common case —
+	/// a sort key like `a.b.c` — never clones the record. An owned value
+	/// is produced only for synthesised results (field projection over an
+	/// array/set, missing paths) or when descending through one.
+	pub fn extract<'a>(&self, value: &'a Value) -> Cow<'a, Value> {
+		let mut current = Cow::Borrowed(value);
 		for part in &self.0 {
-			current = match (&current, part) {
-				// Field/Lookup access on object
-				(Value::Object(obj), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
-					obj.get(name).cloned().unwrap_or(Value::None)
-				}
-				// Index access on array
-				(Value::Array(arr), FieldPathPart::Index(i)) => {
-					arr.get(*i).cloned().unwrap_or(Value::None)
-				}
-				// Index access on set
-				(Value::Set(set), FieldPathPart::Index(i)) => {
-					set.nth(*i).cloned().unwrap_or(Value::None)
-				}
-				// First element of array
-				(Value::Array(arr), FieldPathPart::First) => {
-					arr.first().cloned().unwrap_or(Value::None)
-				}
-				// First element of set
-				(Value::Set(set), FieldPathPart::First) => {
-					set.first().cloned().unwrap_or(Value::None)
-				}
-				// Last element of array
-				(Value::Array(arr), FieldPathPart::Last) => {
-					arr.last().cloned().unwrap_or(Value::None)
-				}
-				// Last element of set
-				(Value::Set(set), FieldPathPart::Last) => {
-					set.last().cloned().unwrap_or(Value::None)
-				}
-				// Field/Lookup access on array applies to each element
-				(Value::Array(arr), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
-					Value::Array(
-						arr.iter()
-							.map(|v| match v {
-								Value::Object(obj) => obj.get(name).cloned().unwrap_or(Value::None),
-								_ => Value::None,
-							})
-							.collect::<Vec<_>>()
-							.into(),
-					)
-				}
-				// Field/Lookup access on set applies to each element
-				(Value::Set(set), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
-					Value::Set(Set::from(
-						set.iter()
-							.map(|v| match v {
-								Value::Object(obj) => obj.get(name).cloned().unwrap_or(Value::None),
-								_ => Value::None,
-							})
-							.collect::<Vec<_>>(),
-					))
-				}
-				// Any other combination returns None
-				_ => Value::None,
+			current = match current {
+				Cow::Borrowed(v) => match step(v, part) {
+					Step::Borrowed(b) => Cow::Borrowed(b),
+					Step::Owned(o) => Cow::Owned(o),
+				},
+				// The intermediate is already owned (a synthesised
+				// array/set projection), so a borrowed step result must be
+				// cloned out of it before it drops. These intermediates are
+				// path-local, never the whole record.
+				Cow::Owned(v) => Cow::Owned(match step(&v, part) {
+					Step::Borrowed(b) => b.clone(),
+					Step::Owned(o) => o,
+				}),
 			};
 		}
 		current
+	}
+}
+
+/// Result of navigating one [`FieldPathPart`] into a value: a borrow into
+/// the input where possible, an owned value where the step synthesises one.
+enum Step<'v> {
+	Borrowed(&'v Value),
+	Owned(Value),
+}
+
+/// Navigate a single path part. Pure-navigation arms borrow; projection
+/// arms (field access over an array/set) and misses produce owned values.
+fn step<'v>(value: &'v Value, part: &FieldPathPart) -> Step<'v> {
+	match (value, part) {
+		// Field/Lookup access on object
+		(Value::Object(obj), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
+			obj.get(name).map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// Index access on array
+		(Value::Array(arr), FieldPathPart::Index(i)) => {
+			arr.get(*i).map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// Index access on set
+		(Value::Set(set), FieldPathPart::Index(i)) => {
+			set.nth(*i).map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// First element of array
+		(Value::Array(arr), FieldPathPart::First) => {
+			arr.first().map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// First element of set
+		(Value::Set(set), FieldPathPart::First) => {
+			set.first().map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// Last element of array
+		(Value::Array(arr), FieldPathPart::Last) => {
+			arr.last().map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// Last element of set
+		(Value::Set(set), FieldPathPart::Last) => {
+			set.last().map_or(Step::Owned(Value::None), Step::Borrowed)
+		}
+		// Field/Lookup access on array applies to each element
+		(Value::Array(arr), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
+			Step::Owned(Value::Array(
+				arr.iter()
+					.map(|v| match v {
+						Value::Object(obj) => obj.get(name).cloned().unwrap_or(Value::None),
+						_ => Value::None,
+					})
+					.collect::<Vec<_>>()
+					.into(),
+			))
+		}
+		// Field/Lookup access on set applies to each element
+		(Value::Set(set), FieldPathPart::Field(name) | FieldPathPart::Lookup(name)) => {
+			Step::Owned(Value::Set(Set::from(
+				set.iter()
+					.map(|v| match v {
+						Value::Object(obj) => obj.get(name).cloned().unwrap_or(Value::None),
+						_ => Value::None,
+					})
+					.collect::<Vec<_>>(),
+			)))
+		}
+		// Any other combination returns None
+		_ => Step::Owned(Value::None),
 	}
 }
 
@@ -218,7 +251,9 @@ mod tests {
 		let value = Value::Object(obj);
 
 		let result = path.extract(&value);
-		assert_eq!(result, Value::from("Alice"));
+		assert_eq!(*result, Value::from("Alice"));
+		// Pure navigation must borrow, not clone.
+		assert!(matches!(result, Cow::Borrowed(_)));
 	}
 
 	#[test]
@@ -237,7 +272,9 @@ mod tests {
 		let value = Value::Object(user_obj);
 
 		let result = path.extract(&value);
-		assert_eq!(result, Value::from("Austin"));
+		assert_eq!(*result, Value::from("Austin"));
+		// Nested object navigation stays borrowed end-to-end.
+		assert!(matches!(result, Cow::Borrowed(_)));
 	}
 
 	#[test]
@@ -250,7 +287,8 @@ mod tests {
 		let value = Value::Object(obj);
 
 		let result = path.extract(&value);
-		assert_eq!(result, Value::from("first"));
+		assert_eq!(*result, Value::from("first"));
+		assert!(matches!(result, Cow::Borrowed(_)));
 	}
 
 	#[test]
@@ -263,7 +301,8 @@ mod tests {
 		let value = Value::Object(obj);
 
 		let result = path.extract(&value);
-		assert_eq!(result, Value::from("second"));
+		assert_eq!(*result, Value::from("second"));
+		assert!(matches!(result, Cow::Borrowed(_)));
 	}
 
 	#[test]
@@ -273,7 +312,26 @@ mod tests {
 		let value = Value::Object(obj);
 
 		let result = path.extract(&value);
-		assert_eq!(result, Value::None);
+		assert_eq!(*result, Value::None);
+		// A miss synthesises Value::None, so it is owned.
+		assert!(matches!(result, Cow::Owned(_)));
+	}
+
+	#[test]
+	fn test_field_path_extract_past_missing_stays_none() {
+		// Navigating further parts after a miss keeps returning None,
+		// exactly as the pre-Cow implementation did.
+		let path = FieldPath(vec![
+			FieldPathPart::Field("missing".into()),
+			FieldPathPart::Field("deeper".into()),
+			FieldPathPart::Index(3),
+		]);
+		let obj = make_obj(vec![("name", Value::from("Alice"))]);
+		let value = Value::Object(obj);
+
+		let result = path.extract(&value);
+		assert_eq!(*result, Value::None);
+		assert!(matches!(result, Cow::Owned(_)));
 	}
 
 	#[test]
@@ -291,13 +349,36 @@ mod tests {
 		let value = Value::Object(obj);
 
 		let result = path.extract(&value);
-		if let Value::Array(arr) = result {
+		// A projection over an array synthesises a new array, so it is owned.
+		assert!(matches!(result, Cow::Owned(_)));
+		if let Value::Array(arr) = result.into_owned() {
 			assert_eq!(arr.len(), 2);
 			assert_eq!(arr[0], Value::from("Alice"));
 			assert_eq!(arr[1], Value::from("Bob"));
 		} else {
 			panic!("Expected array result");
 		}
+	}
+
+	#[test]
+	fn test_field_path_extract_through_owned_intermediate() {
+		// users.name[0] — the projection synthesises an owned array, and the
+		// subsequent index step must clone out of it correctly.
+		let path = FieldPath(vec![
+			FieldPathPart::Field("users".into()),
+			FieldPathPart::Field("name".into()),
+			FieldPathPart::Index(0),
+		]);
+
+		let user1 = Value::Object(make_obj(vec![("name", Value::from("Alice"))]));
+		let user2 = Value::Object(make_obj(vec![("name", Value::from("Bob"))]));
+		let users = Value::Array(vec![user1, user2].into());
+		let obj = make_obj(vec![("users", users)]);
+		let value = Value::Object(obj);
+
+		let result = path.extract(&value);
+		assert_eq!(*result, Value::from("Alice"));
+		assert!(matches!(result, Cow::Owned(_)));
 	}
 
 	#[test]

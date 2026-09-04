@@ -225,7 +225,32 @@ impl<'ctx> Planner<'ctx> {
 		}: crate::expr::lookup::Lookup,
 	) -> Result<Arc<dyn ExecOperator>, Error> {
 		let needs_full_pipeline = expr.is_some() || group.is_some();
-		let needs_full_records = needs_full_pipeline || cond.is_some() || split.is_some();
+		let is_graph = matches!(&kind, crate::expr::lookup::LookupKind::Graph(_));
+		// For a graph lookup outside the full (expr/group) pipeline, compile
+		// the `cond` once and classify it so it can be pushed into the scan
+		// instead of a downstream `Filter`. A key-resident predicate (see
+		// `graph_predicate_is_key_resident`) is evaluated from the adjacency
+		// key alone, so the scan stays in `TargetId` mode and skips fetching
+		// non-matching edge records; a record-referencing predicate needs the
+		// full edge record.
+		let graph_pushdown: Option<(Arc<dyn crate::exec::PhysicalExpr>, bool)> =
+			if is_graph && !needs_full_pipeline {
+				match &cond {
+					Some(c) => {
+						let pred = self.physical_expr(c.0.clone()).await?;
+						let key_resident = Self::graph_predicate_is_key_resident(&pred);
+						Some((pred, key_resident))
+					}
+					None => None,
+				}
+			} else {
+				None
+			};
+		let cond_key_resident = graph_pushdown.as_ref().map(|(_, kr)| *kr).unwrap_or(false);
+		// A `cond` still forces full records unless it is a key-resident graph
+		// predicate; `SPLIT` and the expr/group pipeline force full as before.
+		let needs_full_records =
+			needs_full_pipeline || (cond.is_some() && !cond_key_resident) || split.is_some();
 		let output_mode = if needs_full_records {
 			GraphScanOutput::FullEdge
 		} else {
@@ -273,25 +298,41 @@ impl<'ctx> Planner<'ctx> {
 				// change the result count. This avoids scanning all edges
 				// when only a few are needed. When START is present, add
 				// the offset so the scan fetches enough rows for the skip.
-				let scan =
-					if cond.is_none() && split.is_none() && order.is_none() && group.is_none() {
-						if let Some(crate::expr::limit::Limit(crate::expr::Expr::Literal(
-							crate::expr::Literal::Integer(n),
-						))) = &limit
-						{
-							let offset = match &start {
-								Some(crate::expr::start::Start(crate::expr::Expr::Literal(
-									crate::expr::Literal::Integer(s),
-								))) => *s as usize,
-								_ => 0,
-							};
-							scan.with_limit(*n as usize + offset)
-						} else {
-							scan
-						}
+				// Only push the limit into the scan when the scan's output is the
+				// final filtered set: no downstream clause changes the row count. A
+				// `cond` is safe only when it was pushed into the scan
+				// (`graph_pushdown`); when it flows through the expr/group pipeline
+				// or a downstream Filter, limiting the scan first would drop rows the
+				// filter has not yet seen.
+				let scan = if (cond.is_none() || graph_pushdown.is_some())
+					&& split.is_none()
+					&& order.is_none()
+					&& group.is_none()
+				{
+					if let Some(crate::expr::limit::Limit(crate::expr::Expr::Literal(
+						crate::expr::Literal::Integer(n),
+					))) = &limit
+					{
+						let offset = match &start {
+							Some(crate::expr::start::Start(crate::expr::Expr::Literal(
+								crate::expr::Literal::Integer(s),
+							))) => *s as usize,
+							_ => 0,
+						};
+						scan.with_limit(*n as usize + offset)
 					} else {
 						scan
-					};
+					}
+				} else {
+					scan
+				};
+				// Push the compiled predicate into the scan, replacing the
+				// downstream Filter for graph lookups.
+				let scan = if let Some((pred, key_resident)) = &graph_pushdown {
+					scan.with_predicate(Arc::clone(pred), *key_resident)
+				} else {
+					scan
+				};
 				Arc::new(scan)
 			}
 			crate::expr::lookup::LookupKind::Reference => {
@@ -352,14 +393,15 @@ impl<'ctx> Planner<'ctx> {
 				start,
 				omit: vec![],
 				tempfiles: false,
+				topk_pushdown: None,
 			};
 			self.plan_pipeline(base_scan, expr, config).await
 		} else {
-			let filtered: Arc<dyn ExecOperator> = if let Some(cond) = cond {
-				let predicate = self.physical_expr(cond.0).await?;
-				Arc::new(Filter::new(base_scan, predicate))
-			} else {
-				base_scan
+			let filtered: Arc<dyn ExecOperator> = match cond {
+				// Graph lookups pushed the predicate into the scan above.
+				Some(_) if graph_pushdown.is_some() => base_scan,
+				Some(cond) => Arc::new(Filter::new(base_scan, self.physical_expr(cond.0).await?)),
+				None => base_scan,
 			};
 
 			let split_op: Arc<dyn ExecOperator> = if let Some(splits) = split {
@@ -398,6 +440,18 @@ impl<'ctx> Planner<'ctx> {
 
 			Ok(limited)
 		}
+	}
+
+	/// Whether a compiled graph-lookup predicate is "key-resident":
+	/// evaluable from the adjacency key alone (currently only the edge
+	/// `id`), free of subqueries, functions, and side effects. Key-resident
+	/// predicates are applied before fetching the edge record. Conservative
+	/// — anything not provably key-resident is treated as
+	/// record-referencing, which only costs a fetch. Milestone E implements
+	/// the id-only recognizer; until then every predicate is
+	/// record-referencing.
+	fn graph_predicate_is_key_resident(_pred: &Arc<dyn crate::exec::PhysicalExpr>) -> bool {
+		false
 	}
 
 	/// Decide whether a consecutive `(edge_lookup, vertex_lookup)` pair can

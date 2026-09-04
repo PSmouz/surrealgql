@@ -4,15 +4,15 @@
 
 use std::collections::BTreeMap;
 
-use revision::{DeserializeRevisioned, SerializeRevisioned};
+use revision::{DeserializeRevisioned, SerializeRevisioned, WalkRevisioned};
 use surrealdb_strand::Strand;
 
 use super::{
 	Extracted, PathSegment, SlotScanResult, TEST_DEPTH_LIMIT, descend_record_value_path,
-	descend_value_slice_path, extract_field_from_record_bytes,
-	scan_record_object_at_path_with_slots,
+	descend_value_slice_path, extract_field_from_record_bytes, record_data_bytes,
+	rev2_record_data_bytes, scan_record_object_at_path_with_slots,
 };
-use crate::catalog::Record;
+use crate::catalog::{Record, RecordType};
 use crate::val::{Number, Object, Value};
 
 /// Build a `Vec<PathSegment>` from string slices. Mirrors how the planner
@@ -482,4 +482,89 @@ fn scan_record_object_at_path_with_empty_path_resolves_against_root() {
 		}
 		other => panic!("expected Found, got {other:?}"),
 	}
+}
+
+/// Diverse rev-2 records: data-only (small object, indexed-map object,
+/// nested, non-object scalars, empty object) and a metadata-bearing record
+/// (which shifts `data_off` past the `Option::None` case).
+fn equivalence_sample_records() -> Vec<Vec<u8>> {
+	let mut small = Object::default();
+	small.0.insert(Strand::from("a"), Value::Bool(true));
+	small.0.insert(Strand::from("b"), Value::from(7i64));
+
+	// >= 8 keys forces the indexed-map prologue on the inner object.
+	let mut wide = Object::default();
+	for i in 0..12u8 {
+		wide.0.insert(Strand::from(format!("k{i:02}")), Value::from(i as i64));
+	}
+
+	let mut nested_inner = Object::default();
+	nested_inner.0.insert(Strand::from("city"), Value::String(Strand::from("London")));
+	let mut nested = Object::default();
+	nested.0.insert(Strand::from("addr"), Value::Object(nested_inner));
+
+	let encode = |data: Value| {
+		let rec = Record {
+			metadata: None,
+			data,
+		};
+		let mut out = Vec::new();
+		rec.serialize_revisioned(&mut out).unwrap();
+		out
+	};
+
+	// A record carrying metadata: `data_off` is no longer the minimal
+	// `Option::None` (1-byte) case, so the fast path must read it, not assume it.
+	let with_meta = {
+		let mut rec = Record::new(Value::Object(small.clone()));
+		rec.set_record_type(RecordType::Table);
+		assert!(rec.metadata.is_some(), "expected metadata to be set");
+		let mut out = Vec::new();
+		rec.serialize_revisioned(&mut out).unwrap();
+		out
+	};
+
+	vec![
+		encode(Value::Object(small)),
+		encode(Value::Object(wide)),
+		encode(Value::Object(nested)),
+		encode(Value::Object(Object::default())),
+		encode(Value::Bool(true)),
+		encode(Value::from(42i64)),
+		encode(Value::String(Strand::from("hello"))),
+		encode(Value::None),
+		with_meta,
+	]
+}
+
+#[test]
+fn rev2_record_data_bytes_matches_walker_path() {
+	// The slice-direct rev-2 fast path must return byte-for-byte what the
+	// `Record::walk_revisioned(..).into_data_bytes()` walker chain yields.
+	for bytes in equivalence_sample_records() {
+		let fast = rev2_record_data_bytes(&bytes)
+			.expect("serialiser emits rev-2, so the fast path must recognise it");
+		let mut reader: &[u8] = &bytes;
+		let slow = Record::walk_revisioned(&mut reader)
+			.and_then(|w| w.into_data_bytes())
+			.expect("walker chain opens a valid record");
+		assert_eq!(fast, &*slow, "fast-path data bytes diverge from the walker chain");
+		// The unified helper returns the same bytes as both.
+		let via_helper = record_data_bytes(&bytes).expect("helper opens a valid record");
+		assert_eq!(&*via_helper, fast);
+	}
+}
+
+#[test]
+fn record_data_bytes_falls_back_on_non_rev2_prefix() {
+	// A non-rev-2 first byte makes the fast path decline (returns None);
+	// the helper must fall through to the walker chain rather than
+	// mis-slicing. We can't cheaply forge a valid rev-1 record here, so we
+	// assert the two observable properties: the fast path declines, and the
+	// helper does not panic (it returns the walker chain's result — here an
+	// error, since the forged bytes aren't a valid rev-1 record).
+	let mut bytes = equivalence_sample_records().remove(0);
+	bytes[0] = 1; // pretend rev = 1
+	assert!(rev2_record_data_bytes(&bytes).is_none(), "fast path must decline non-rev-2");
+	let _ = record_data_bytes(&bytes); // must not panic
 }

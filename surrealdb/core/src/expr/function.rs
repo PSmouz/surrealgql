@@ -68,7 +68,9 @@ impl Function {
 			| Self::Silo {
 				..
 			} => false,
-			Self::Normal(f) => f != "api::invoke",
+			// `eval::*` can evaluate arbitrary nested queries (including writes),
+			// so they must open a write transaction like `api::invoke`.
+			Self::Normal(f) => f != "api::invoke" && f != "eval::surql" && f != "eval::gql",
 			Self::Model(_) => true,
 		}
 	}
@@ -279,8 +281,8 @@ async fn check_perms(
 			})))
 		}
 		Permission::Specific(e) => {
-			// Disable permissions
-			let opt = &opt.new_with_perms(false);
+			// Disable permission recursion and block side effects
+			let opt = &opt.new_for_permission_predicate();
 			// Process the PERMISSION clause
 			if !stk.run(|stk| e.compute(stk, ctx, opt, doc)).await?.is_truthy() {
 				Err(ControlFlow::from(anyhow::Error::new(Error::FunctionPermissions {

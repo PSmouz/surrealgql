@@ -35,6 +35,7 @@ mod exe;
 mod fmt;
 mod fnc;
 mod key;
+mod lq;
 #[doc(hidden)]
 pub mod str;
 #[cfg(feature = "surrealism")]
@@ -50,17 +51,25 @@ pub mod env;
 pub mod err;
 pub mod exec;
 pub mod expr;
-#[cfg(feature = "graphql")]
+#[cfg(feature = "gql")]
 pub mod gql;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "http")]
 mod http;
 pub mod iam;
 pub mod idx;
 pub mod kvs;
 pub mod mem;
+// Capability-aware networking helpers shared by the outbound HTTP clients
+// (`http` feature) and the JWKS fetch client (`jwks` feature). Not available on
+// WASM, where the clients are built without a custom DNS resolver.
+#[cfg(all(not(target_family = "wasm"), any(feature = "http", feature = "jwks")))]
+mod net;
 pub mod obs;
 pub mod observe;
 pub mod options;
+pub mod rnd;
 pub mod rpc;
 pub mod sql;
 pub mod syn;

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Property projection: missing properties surface as NONE-valued columns (GQL null and SurrealDB NONE/NULL are conflated in v1, a documented deviation)."
+
+[[test.results]]
+value = "[{ age: 30, name: 'A' }, { age: 20, name: 'B' }, { age: NONE, name: 'C' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name, n.age AS age ORDER BY name

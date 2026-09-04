@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "INSERT relates a new edge between two MATCH-bound nodes (RELATE), which a follow-up traversal can then return."
+
+[[test.results]]
+value = "[{ src: 'A', dst: 'C' }]"
+*/
+
+MATCH (a:person WHERE a.name = 'A') MATCH (b:person WHERE b.name = 'C') INSERT (a)-[:likes]->(b) RETURN a.name AS src, b.name AS dst

@@ -27,6 +27,7 @@ mod edges; // Attempts to store the edge data for this document
 mod event; // Processes any table events relevant for this document
 mod field; // Processes any schema-defined fields for this document
 mod index; // Attempts to store the index data for this document
+mod live_events; // Captures live-query events for this document (Router engine)
 mod lives; // Processes any live queries relevant for this document
 mod output; // Builds the projected output for a document
 mod purge; // Deletes this document, and any edges or indexes

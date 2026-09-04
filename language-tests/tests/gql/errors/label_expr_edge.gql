@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: edge label expressions have no table mapping."
+
+[test.results]
+parsing-error = '''
+Label expressions (`!`, `&`, `|`, `%`) are not supported yet
+  --> [15:21]
+   |
+15 | MATCH (a:person)-[k:knows|likes]->(b) RETURN a
+   |                     ^^^^^^^^^^^ use a single label name
+'''
+*/
+
+MATCH (a:person)-[k:knows|likes]->(b) RETURN a

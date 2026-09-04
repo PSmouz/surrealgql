@@ -218,3 +218,102 @@ fn test_parse_kind_depth(#[case] limit: usize, #[case] source: String, #[case] e
 	let result = stack.enter(|stk| parser.parse_query(stk)).finish();
 	assert_eq!(result.is_ok(), expected);
 }
+
+/// `1` followed by `n` ` + 1` terms: a left-associative infix spine `n` levels
+/// deep that consumes neither the query nor object recursion budget.
+fn linear_infix(n: usize) -> String {
+	let mut s = String::with_capacity(n * 4 + 1);
+	s.push('1');
+	for _ in 0..n {
+		s.push_str(" + 1");
+	}
+	s
+}
+
+/// `n` `!` prefix operators applied to `true`.
+fn prefix_chain(n: usize) -> String {
+	let mut s = String::with_capacity(n + 4);
+	for _ in 0..n {
+		s.push('!');
+	}
+	s.push_str("true");
+	s
+}
+
+/// Operator spines (infix) and prefix chains both deepen the `Expr` tree once
+/// per operator while consuming neither the query nor the object recursion
+/// budget, so they are bounded only by `expr_recursion_limit`.
+#[rstest]
+#[case::infix_ok(8, linear_infix(3), true)]
+#[case::infix_fail(8, linear_infix(30), false)]
+#[case::prefix_ok(8, prefix_chain(3), true)]
+#[case::prefix_fail(8, prefix_chain(30), false)]
+fn test_parse_expr_depth(#[case] limit: usize, #[case] source: String, #[case] expected: bool) {
+	let settings = ParserSettings {
+		expr_recursion_limit: limit,
+		..Default::default()
+	};
+	let mut parser = Parser::new_with_settings(source.as_bytes(), settings);
+	let mut stack = Stack::new();
+	let result = stack.enter(|stk| parser.parse_query(stk)).finish();
+	assert_eq!(result.is_ok(), expected);
+}
+
+/// A flat operator spine like `1 + 1 + 1 + ...` consumes neither the query nor
+/// the object recursion budget (it is built iteratively by the pratt loop), so
+/// before the `expr_recursion_limit` guard such a chain would build an
+/// arbitrarily deep `Expr` tree from a small amount of query text. The
+/// resulting tree is walked recursively when it is dropped, formatted, or
+/// lowered, overflowing the call stack — a denial of service reachable from
+/// query text alone. With the guard in place the parser must instead reject the
+/// chain with a syntax error.
+///
+/// Runs on an explicit 2 MiB stack — the conservative default worker-thread
+/// size — so the test is meaningful regardless of `RUST_MIN_STACK`.
+#[test]
+fn expr_depth_rejects_pathological_chain_without_overflow() {
+	std::thread::Builder::new()
+		.stack_size(2 * 1024 * 1024)
+		.spawn(|| {
+			// ~50k operators, ~200 KiB of text: well under any query size limit,
+			// and (before the fix) more than enough to overflow the stack.
+			let src = format!("RETURN 1{}", " + 1".repeat(50_000));
+			let err = crate::syn::parse(&src)
+				.expect_err("a 50k-term operator chain must be rejected, not parsed");
+			assert!(
+				err.to_string().contains("expression recursion depth limit"),
+				"unexpected error: {err}"
+			);
+		})
+		.unwrap()
+		.join()
+		.unwrap();
+}
+
+/// Confirms the default `expr_recursion_limit` is small enough that the deepest
+/// `Expr` tree the parser will accept can still be lowered, formatted, and
+/// dropped — all of which recurse once per node — without overflowing a 2 MiB
+/// stack (the conservative default worker-thread size). If the default limit
+/// were raised past the safe ceiling this test would abort the process,
+/// catching the regression.
+#[test]
+fn expr_depth_default_limit_is_stack_safe() {
+	std::thread::Builder::new()
+		.stack_size(2 * 1024 * 1024)
+		.spawn(|| {
+			// ~110 operators, just under the default limit, so the accepted tree
+			// is close to as deep as the parser allows and exercises every
+			// recursive consumer near the worst-case depth.
+			let expr = crate::syn::expr(&linear_infix(110)).expect("a near-limit chain parses");
+			// `ToSql` recurses once per node.
+			let formatted = surrealdb_types::ToSql::to_sql(&expr);
+			assert!(formatted.contains('+'));
+			// `sql::Expr -> expr::Expr` lowering recurses once per node.
+			let lowered = crate::expr::Expr::from(expr);
+			// Dropping the lowered tree recurses once per node.
+			drop(lowered);
+		})
+		.unwrap()
+		.join()
+		.unwrap();
+}

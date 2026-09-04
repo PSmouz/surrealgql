@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "OPTIONAL ( MATCH … MATCH … ) — the PAREN block form (GQL.g4 optionalOperand) — is one all-or-nothing left-outer unit (R3), exercising the parenthesised parse path. The block is `(a)-[:knows]->(b:city)` then `(b)-[:knows]->(c:person)`. Hand-derived block-unit proof: only person:1/A satisfies clause 1 (a->city:1/London), but clause 2 needs an outgoing knows edge FROM the city — cities are never the source of a knows edge, so the second hop finds nothing and the WHOLE block fails for A. Because the block is planned as a single subplan and left-joined as a unit, A's partial inner match does NOT leak `b`: A nulls BOTH `b` and `c` together. person:2/B and person:3/C fail clause 1 outright and likewise null both. Every mandatory `a` is preserved with the entire block null-filled."
+
+[[test.results]]
+value = "[{ city: NONE, friend: NONE, name: 'A' }, { city: NONE, friend: NONE, name: 'B' }, { city: NONE, friend: NONE, name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL ( MATCH (a)-[:knows]->(b:city) MATCH (b)-[:knows]->(c:person) ) RETURN a.name AS name, b.name AS city, c.name AS friend ORDER BY name

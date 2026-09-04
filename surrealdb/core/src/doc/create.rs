@@ -16,12 +16,14 @@ impl Document {
 	) -> Result<Value, IgnoreError> {
 		// Ensure we can write to the table at all
 		self.check_permissions_quick_create(ctx, opt)?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Ensure any input data is computed
 		self.compute_input_data(stk, ctx, opt, stm).await?;
 		// Set the specified record content
 		self.process_record_data(stk, ctx, opt).await?;
 		// Generate a new record id if necessary
-		self.generate_record_id()?;
+		self.generate_record_id(stk, ctx, opt).await?;
 		// Ensure we can store this type of record
 		self.check_table_type_create()?;
 		// Ensure all special fields are valid

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the v1 function whitelist is empty, so every function call is rejected by name."
+
+[test.results]
+parsing-error = '''
+The function `upper` is not supported yet
+  --> [15:25]
+   |
+15 | MATCH (n:person) RETURN upper(n.name) AS u
+   |                         ^^^^^^^^^^^^^
+'''
+*/
+
+MATCH (n:person) RETURN upper(n.name) AS u

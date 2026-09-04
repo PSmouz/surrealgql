@@ -1,8 +1,7 @@
 use std::{mem, ops};
 
 use super::super::tuple::{Tuple, TupledDistributionsBuilder};
-use super::Percentiles;
-use super::Resamples;
+use super::{Percentiles, Resamples};
 
 /// A collection of data points drawn from a population
 ///

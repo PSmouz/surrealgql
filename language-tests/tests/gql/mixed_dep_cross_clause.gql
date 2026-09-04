@@ -1,0 +1,17 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A second-clause WHERE with MIXED dependencies — `a` from the first clause and `c` from the second — must be deferred to the clause-combine HashJoin, the earliest stage that binds both. Earlier the planner only deferred a predicate when NONE of its deps were introduced by the clause, so a mixed-dep conjunct could neither be placed inside the clause (the earlier-clause dep is unbound there) nor deferred, and surfaced an opaque internal error (V2_DESIGN §6: a cleanly-lowered plan never internal-errors). Over the person-knows graph the b-join pairs are (a=A,c=A),(a=A,c=C),(a=B,c=B),(a=B,c=A),(a=C,c=B); keeping a.name <> c.name leaves three rows."
+
+[[test.results]]
+value = "[{ a: 'A', c: 'C' }, { a: 'B', c: 'A' }, { a: 'C', c: 'B' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person)
+MATCH (b:person)-[:knows]->(c:person)
+WHERE a.name <> c.name
+RETURN a.name AS a, c.name AS c ORDER BY a, c

@@ -188,3 +188,47 @@ async fn auth_limit_alter_api_recomputes() -> Result<()> {
 
 	Ok(())
 }
+
+/// The `id` field's ASSERT is run by the regular field pipeline, which clamps
+/// to the defining field's auth_limit just like any other field's clauses. A
+/// DB-editor defines an `id` ASSERT whose body attempts a database-level DEFINE
+/// USER ROLES OWNER; when a DB-owner creates a record the embedded escalation
+/// must be blocked by the editor-level clamp. (The id field's DEFAULT is
+/// evaluated in `generate_record_id`, which applies the same clamp separately.)
+#[tokio::test]
+async fn auth_limit_id_field_assert() -> Result<()> {
+	let (_, dbs) = new_ds("test", "test", true).await?;
+
+	let ses_owner = Session::owner().with_ns("test").with_db("test");
+	let ses_editor = Session::editor().with_ns("test").with_db("test");
+
+	// DB-editor defines an `id` ASSERT embedding a DEFINE USER ROLES OWNER the
+	// editor itself is not allowed to perform.
+	let sql = "
+		DEFINE FIELD id ON ta ASSERT (DEFINE USER escalate_assert ON DATABASE ROLES OWNER PASSWORD 'pass') OR true;
+	";
+	let res = &mut dbs.execute(sql, &ses_editor, None).await?;
+	skip_ok(res, 1)?;
+
+	// DB-owner triggers the ASSERT via a create; the embedded DEFINE USER must
+	// run clamped to the editor level and fail.
+	let sql = "CREATE ta:foo;";
+	let res = &mut dbs.execute(sql, &ses_owner, None).await?;
+	assert_eq!(res.len(), 1);
+	let tmp = res.remove(0).result;
+	assert!(tmp.is_err(), "id ASSERT escalation was not blocked");
+	assert_eq!(
+		tmp.unwrap_err().to_string(),
+		"IAM error: Not enough permissions to perform this action"
+	);
+
+	// Belt-and-suspenders: the escalated user must not have been created.
+	let info = &mut dbs.execute("INFO FOR DB", &ses_owner, None).await?;
+	let info = info.remove(0).result?.to_sql();
+	assert!(
+		!info.contains("escalate_assert"),
+		"Privilege escalation succeeded: an owner-level user was created"
+	);
+
+	Ok(())
+}

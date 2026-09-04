@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A QUANTIFIED optional — the LeftJoin general path via a PathExpand subplan (V2_DESIGN §6). The optional clause's leading pattern self-roots on its own labelled start `(a:person)` (so it is realisable, unlike a bare bound-var quantified expansion, which the OptionalExpand fast path cannot build — see errors/optional_leading_quantified_bound.gql), building a PathExpand subplan that is then HashJoin{Left}-ed onto the mandatory `a`. The pattern is `-[:knows]->{2,2}(b:city)` (EXACTLY two hops). Hand-derived over the seed graph (knows: A->B, A->London; B->A, B->C; C->A): person:1/A's only 2-hop targets are A->B->A and A->B->C (both persons, no city; A->London is a single hop) -> NO city at depth 2 -> the optional misses -> `b` = Value::Null -> b.name = NONE; person:2/B reaches London via B->A->London (edges k21,k1c, distinct under DIFFERENT EDGES) -> b='London'; person:3/C reaches London via C->A->London (k31,k1c) -> b='London'. Every mandatory `a` is preserved (left-outer)."
+
+[[test.results]]
+value = "[{ a: 'A', b: NONE }, { a: 'B', b: 'London' }, { a: 'C', b: 'London' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a:person)-[:knows]->{2,2}(b:city) RETURN a.name AS a, b.name AS b ORDER BY a, b

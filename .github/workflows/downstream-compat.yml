@@ -1,0 +1,260 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Downstream compatibility — non-blocking signal
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Builds + unit-tests a downstream consumer of `surrealdb-server` against this
+# PR's code, redirecting its dependency to this checkout with a Cargo `[patch]`.
+# Soft signal only — never a required check. One-time setup (secrets) and the
+# full rationale live in the PR that introduced this workflow.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Downstream compatibility
+
+run-name: "Downstream compatibility '${{ github.head_ref || github.ref_name }}'"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "releases/*"
+    # Skip changes that cannot affect the downstream build (docs, images,
+    # license). A push/PR is skipped only when ALL its files match here.
+    paths-ignore:
+      - "**/*.md"
+      - "doc/**"
+      - "docs/**"
+      - "img/**"
+      - "LICENSE"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths-ignore:
+      - "**/*.md"
+      - "doc/**"
+      - "docs/**"
+      - "img/**"
+      - "LICENSE"
+
+concurrency:
+  # Use github.run_id on main branch
+  # Use github.event.pull_request.number on pull requests, so it's unique per pull request
+  # Use github.ref on other branches, so it's unique per branch
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+# sccache → S3 backend, shared with the rest of CI. Set at workflow level so the
+# values are in the environment when the sccache-action daemon starts.
+env:
+  SCCACHE_BUCKET: ${{ secrets.AWS_S3_SCCACHE_BUCKET_NAME }}
+  SCCACHE_REGION: us-east-1
+  SCCACHE_S3_KEY_PREFIX: ${{ github.repository }} # scope cache to this repo
+  SCCACHE_IDLE_TIMEOUT: "0" # don't let the daemon exit mid-compile
+  AWS_ACCESS_KEY_ID: ${{ secrets.AMAZON_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AMAZON_SECRET_KEY }}
+
+jobs:
+  compat:
+    name: Build + test
+    # Never run on the public mirror. Guarding on the public repo name (rather
+    # than this one) keeps this repository unnamed in this mirrored file.
+    if: github.repository != 'surrealdb/surrealdb'
+    # On-demand (not spot): spot preemption shows up as "runner lost
+    # communication" failures, and this is a soft signal we don't want flaking.
+    runs-on: runner-arm-16-cores
+    timeout-minutes: 45
+
+    steps:
+      # Until the downstream App + secrets are provisioned this check should be a
+      # no-op, not a red mark on every PR (it is a soft signal, not a gate). All
+      # the real work below is gated on `configured`, so an unconfigured repo
+      # passes green with a notice instead of failing at the token step.
+      - name: Check whether the downstream check is configured
+        id: preflight
+        env:
+          CLIENT_ID: ${{ secrets.DOWNSTREAM_APP_CLIENT_ID }}
+        run: |
+          if [ -n "${CLIENT_ID}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Downstream compatibility::Not configured (DOWNSTREAM_APP_* secrets absent) — skipping."
+          fi
+
+      # The engine (this PR) is checked out at the workspace root so the local
+      # composite actions below (./.github/actions/...) resolve.
+      - name: Checkout engine (this PR)
+        if: steps.preflight.outputs.configured == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Don't leave this repo's GITHUB_TOKEN in the workspace git config: it
+          # is scoped to this repo, and a later git call to the downstream repo
+          # made from this directory would otherwise pick it up and be denied.
+          persist-credentials: false
+
+      # Mint a short-lived token scoped to the downstream repo only. The owner
+      # defaults to this repository's owner; the repo name comes from a secret so
+      # it is never written into this publicly-mirrored file.
+      - name: Generate a token for the downstream repo
+        id: app-token
+        if: steps.preflight.outputs.configured == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.DOWNSTREAM_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DOWNSTREAM_APP_PRIVATE_KEY }}
+          repositories: ${{ secrets.DOWNSTREAM_REPO }}
+
+      # Pick the downstream branch to validate against, in priority order: the
+      # exact target branch (the matching release branch for a release-targeted
+      # PR), then main as a last resort. The first that exists downstream wins —
+      # so a release PR is checked against the matching release line whenever it
+      # exists, and only against main if it doesn't. A missing counterpart branch
+      # is not itself a compat failure.
+      - name: Resolve downstream branch
+        id: branch
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ secrets.DOWNSTREAM_REPO }}
+          WANT: ${{ github.base_ref || github.ref_name }}
+        run: |
+          set -uo pipefail
+          # Resolve via `git ls-remote` rather than `gh` — git is always on the
+          # runner (the checkout above uses it) whereas gh is not installed here.
+          # The installation token is supplied through the environment
+          # (GIT_CONFIG_*), so it never appears in a process's argv.
+          #
+          # Run from RUNNER_TEMP, NOT the workspace: the engine checkout's repo
+          # config carries an http.https://github.com/.extraheader for this repo's
+          # GITHUB_TOKEN (host-scoped, so it also matches the downstream URL). Run
+          # here and git would send that token — which can't see the private
+          # downstream repo — and GitHub returns "Repository not found". Running
+          # outside any repo means only the installation token below is used.
+          workdir="${RUNNER_TEMP:-/tmp}"
+          url="https://github.com/${OWNER}/${REPO}.git"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.extraHeader
+          GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_VALUE_0
+          ref=""
+          last_err=""
+          for cand in "${WANT}" main; do
+            # --exit-code: 0 = ref found, 2 = connected but no such ref, other =
+            # access/auth error. So a non-empty last_err means we couldn't reach
+            # the repo (likely the App lacks Contents:read), vs the ref just being
+            # absent (empty last_err).
+            if last_err="$(git -C "$workdir" ls-remote --exit-code --heads "$url" "refs/heads/${cand}" 2>&1 >/dev/null)"; then
+              ref="${cand}"
+              break
+            fi
+          done
+          if [ -z "${ref}" ]; then
+            echo "::error title=Downstream compatibility::could not read '${WANT}' or 'main' on ${OWNER}/${REPO}. If git reports an auth/permission error below, the App is missing Contents:read on the repo (ref reads require it; approve the permission on the installation, not just add it to the App). git said: ${last_err:-<no error output: branches simply do not exist>}"
+            exit 1
+          fi
+          if [ "${ref}" != "${WANT}" ]; then
+            echo "::warning title=Downstream compatibility::no matching downstream branch '${WANT}'; validating against '${ref}' instead"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Validating against downstream branch '${ref}'"
+
+      - name: Checkout downstream
+        if: steps.preflight.outputs.configured == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository_owner }}/${{ secrets.DOWNSTREAM_REPO }}
+          ref: ${{ steps.branch.outputs.ref }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: downstream
+          persist-credentials: false
+
+      - name: Setup environment
+        if: steps.preflight.outputs.configured == 'true'
+        uses: ./.github/actions/setup-environment
+        with:
+          workspaces: downstream
+          cache-key: downstream-compat
+          save-cache: ${{ github.event_name == 'push' }}
+
+      - name: Install tools
+        if: steps.preflight.outputs.configured == 'true'
+        uses: ./.github/actions/install-tools
+        with:
+          preset: test
+
+      # Redirect the downstream's `surrealdb-server` git dependency to this
+      # checkout. Its in-repo deps (surrealdb-core/-types/surrealdb) are workspace
+      # path deps, so they follow transitively from the same checkout — only
+      # surrealdb-server needs patching. The git source URL is read from the
+      # downstream manifest so this repo's git URL is not hardcoded here. This
+      # rewrites Cargo.lock, so the cargo steps below intentionally omit --locked.
+      - name: Point downstream at this engine checkout
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          ENGINE: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          src_url="$(grep -E '^[[:space:]]*surrealdb-server[[:space:]]*=' downstream/Cargo.toml \
+            | grep -oE 'git = "[^"]*"' | head -n1 | sed -E 's/.*"([^"]*)".*/\1/')"
+          if [ -z "$src_url" ]; then
+            echo "::error title=Downstream compatibility::could not find the surrealdb-server git source in downstream/Cargo.toml"
+            exit 1
+          fi
+
+          # Cargo records the git source's resolved version as an available
+          # version and selects the newest semver-compatible one. When this
+          # engine is OLDER than the version downstream already locked from git
+          # (e.g. a release branch: 3.2.x here vs 3.3.0-nightly on main), cargo
+          # prefers the original git source over the path [patch] below and tries
+          # to fetch the pinned private rev — which the runner cannot
+          # authenticate, so the build fails before it starts. Stamp this
+          # engine's surrealdb-server crate to the exact version downstream
+          # locked, so the patch is the preferred (equal-version) source and the
+          # original git source is never fetched. Only the server crate's own
+          # version is rewritten; its path deps on -core/-types are unaffected,
+          # and on main (where the versions already match) this is a no-op.
+          want_ver="$(awk '
+            /^\[\[package\]\]/ { name = ""; ver = "" }
+            /^name = / { name = $3; gsub(/"/, "", name) }
+            /^version = / { ver = $3; gsub(/"/, "", ver) }
+            name == "surrealdb-server" && ver != "" { print ver; exit }
+          ' downstream/Cargo.lock)"
+          server_toml="${ENGINE}/surrealdb/server/Cargo.toml"
+          if [ -n "${want_ver}" ] && grep -qE '^version\.workspace = true$' "${server_toml}"; then
+            sed -i -E "s/^version\.workspace = true$/version = \"${want_ver}\"/" "${server_toml}"
+            echo "Stamped engine surrealdb-server version -> ${want_ver} (matches downstream lock)"
+          else
+            echo "::warning title=Downstream compatibility::could not stamp engine surrealdb-server version (want_ver='${want_ver}'); cargo may skip the [patch] if the engine version differs from the downstream lock"
+          fi
+
+          {
+            echo ""
+            echo "# CI-only (downstream-compat): build against this PR's engine checkout."
+            echo "[patch.\"${src_url}\"]"
+            echo "surrealdb-server = { path = \"${ENGINE}/surrealdb/server\" }"
+          } >> downstream/Cargo.toml
+          echo "Patched surrealdb-server (${src_url}) -> ${ENGINE}/surrealdb/server"
+
+      - name: Build downstream (cargo check)
+        if: steps.preflight.outputs.configured == 'true'
+        working-directory: downstream
+        run: cargo check --workspace
+
+      - name: Test downstream (unit suite)
+        if: steps.preflight.outputs.configured == 'true'
+        working-directory: downstream
+        run: cargo nextest run --workspace --exclude surrealdb-integration
+
+      - name: sccache stats
+        if: ${{ always() && steps.preflight.outputs.configured == 'true' }}
+        run: sccache --show-stats || true

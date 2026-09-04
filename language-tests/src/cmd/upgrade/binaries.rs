@@ -119,10 +119,7 @@ fn binary_url(version: &Version) -> String {
 	// for every published version (stable + alpha/beta) and reliably hosts
 	// tags that have not been mirrored to github.com/surrealdb/surrealdb's
 	// public Releases page.
-	format!(
-		"https://download.surrealdb.com/v{version}/surreal-v{version}.{}",
-		platform_name()
-	)
+	format!("https://download.surrealdb.com/v{version}/surreal-v{version}.{}", platform_name())
 }
 
 fn ask_download_permission(url: &str) -> anyhow::Result<()> {
@@ -230,9 +227,7 @@ async fn unzip(version: Version) -> anyhow::Result<()> {
 	tokio::fs::rename(extract_dir.join("surreal"), &final_path)
 		.await
 		.context("Failed to rename extracted binary to versioned name")?;
-	tokio::fs::remove_dir(&extract_dir)
-		.await
-		.context("Failed to clean up extract directory")?;
+	tokio::fs::remove_dir(&extract_dir).await.context("Failed to clean up extract directory")?;
 	tokio::fs::remove_file(download_path(&version))
 		.await
 		.context("Failed to remove downloaded archive after unzipping")?;

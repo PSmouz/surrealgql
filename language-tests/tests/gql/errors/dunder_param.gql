@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the lowering owns the `__` prefix for its internal binding fields."
+
+[test.results]
+parsing-error = '''
+Parameter names starting with `__` are reserved for internal use
+  --> [15:32]
+   |
+15 | MATCH (n:person) WHERE n.age > $__min RETURN n
+   |                                ^^^^^^ rename the parameter
+'''
+*/
+
+MATCH (n:person) WHERE n.age > $__min RETURN n

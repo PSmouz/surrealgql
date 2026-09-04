@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: the `*` quantifier is `{0,}` — zero-or-more hops, one row per path at every depth, terminating via edge-uniqueness within a path (R2). In v1 `*` was a lowering rejection ('The `*` quantifier is not supported yet'); v2 supports it. On the disjoint triangle 4->5->6->4 (D/E/F) each source reaches itself at depth 0 (zero-length path), then one new hub per hop until the third hop returns to the source, after which every edge is used and the DFS terminates. From D the path tips are D(d0),E(d1),F(d2),D(d3) -> names D,E,F,D; symmetric for E and F. 12 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'D' }, { an: 'D', bn: 'E' }, { an: 'D', bn: 'F' }, { an: 'E', bn: 'D' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'F' }, { an: 'F', bn: 'D' }, { an: 'F', bn: 'E' }, { an: 'F', bn: 'F' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->*(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

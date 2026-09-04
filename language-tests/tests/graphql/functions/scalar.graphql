@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Database functions with scalar return types are exposed as query fields"
+
+[[test.results]]
+value = "{ fn_double: 42, fn_greet: 'Hello, World!', fn_num: 42 }"
+*/
+query {
+	fn_num
+	fn_double(x: 21)
+	fn_greet(name: "World")
+}

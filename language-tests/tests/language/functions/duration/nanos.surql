@@ -14,11 +14,10 @@ value = "0"
 value = "0"
 
 [[test.results]]
-value = "-297627638156165120"
+value = "31535999968464000000000000dec"
 
 [[test.results]]
-value = "-1"
-
+value = "18446744073709551615999999999dec"
 */
 duration::nanos(200ns);
 duration::nanos(30ms100ns);

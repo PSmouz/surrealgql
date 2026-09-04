@@ -48,6 +48,9 @@ pub(crate) enum Key {
 	Pas(NamespaceId, DatabaseId),
 	/// A cache key for tables
 	Tbs(NamespaceId, DatabaseId),
+	/// A cache key for the database-wide reference-target summary consumed by
+	/// the DELETE purge gate (which tables any `REFERENCE` field can target).
+	DbReferenceTargets(NamespaceId, DatabaseId),
 	/// A cache key for sequences (on a database)
 	Sqs(NamespaceId, DatabaseId),
 	/// A cache key for events (on a table)
@@ -145,6 +148,7 @@ impl<'a> From<Lookup<'a>> for Key {
 			Lookup::Pas(a, b) => Key::Pas(a, b),
 			Lookup::Sqs(a, b) => Key::Sqs(a, b),
 			Lookup::Tbs(a, b) => Key::Tbs(a, b),
+			Lookup::DbReferenceTargets(a, b) => Key::DbReferenceTargets(a, b),
 			Lookup::Evs(a, b, c) => Key::Evs(a, b, c.to_string()),
 			Lookup::Fds(a, b, c) => Key::Fds(a, b, c.to_string()),
 			Lookup::Fts(a, b, c) => Key::Fts(a, b, c.to_string()),

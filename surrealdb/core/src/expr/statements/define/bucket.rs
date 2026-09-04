@@ -48,6 +48,13 @@ impl DefineBucketStatement {
 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Bucket, Base::Db)?;
 		// Process the name
 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "bucket name").await?;
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "bucket",
+				name: name.clone(),
+			});
+		}
 		// Fetch the transaction
 		let txn = ctx.tx();
 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;

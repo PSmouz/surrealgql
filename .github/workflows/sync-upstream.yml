@@ -1,14 +1,38 @@
-# Sync main from surrealdb/surrealdb into this repo's main.
-# Runs every 30 minutes and can be triggered manually via workflow_dispatch.
+# Keep main in sync with surrealdb/surrealdb.
+#
+# Scheduled and manual runs update main from surrealdb/surrealdb. A manual "push"
+# run sends any missing releases (and their tags) to surrealdb/surrealdb; the
+# variant that includes main also pushes main (which may carry unreleased fixes).
 
-name: Sync from upstream
+name: Sync with upstream
 
-run-name: "Sync surrealdb/surrealdb main → main${{ github.event_name == 'workflow_dispatch' && ' (manual)' || '' }}"
+run-name: >-
+  ${{ inputs.dry_run && '[dry-run] ' || '' }}${{
+      github.event_name == 'workflow_dispatch' && startsWith(inputs.direction, 'push')
+      && (contains(inputs.direction, 'main')
+          && 'Sync releases + main → surrealdb/surrealdb (manual)'
+          || 'Sync releases → surrealdb/surrealdb (manual)')
+      || (github.event_name == 'workflow_dispatch'
+          && 'Pull surrealdb/surrealdb main → main (manual)'
+          || 'Pull surrealdb/surrealdb main → main') }}
 
 on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      direction:
+        description: "Sync direction"
+        type: choice
+        default: pull
+        options:
+          - pull
+          - push (releases)
+          - push (releases + main)
+      dry_run:
+        description: "Dry run (validate but make no changes)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-sync-main
@@ -18,31 +42,56 @@ defaults:
   run:
     shell: bash
 
-permissions:
-  contents: write
-  issues: write
+permissions: {}
 
 jobs:
-  sync:
+  pull:
     name: Sync main from surrealdb/surrealdb
     if: github.repository != 'surrealdb/surrealdb'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
     steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: audit
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
-          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
           fetch-depth: 0
+          persist-credentials: false
+
+      # Defaults to an installation token for this repo (no owner/repositories),
+      # which also keeps this repo's name out of this publicly-synced file.
+      - name: Generate a token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SURREALDB_PULL_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SURREALDB_PULL_APP_PRIVATE_KEY }}
 
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      # A releases-only push must stay read-only with respect to this repo's main,
+      # so the upstream merge is skipped for that variant. Scheduled and pull runs,
+      # and the "+ main" push variant (which needs main current before publishing
+      # it), still merge upstream as before.
       - name: Pull upstream main
         id: pull
+        if: >-
+          github.event_name != 'workflow_dispatch'
+          || !startsWith(inputs.direction, 'push')
+          || contains(inputs.direction, 'main')
         run: |
+          set -euo pipefail
           git remote add upstream https://github.com/surrealdb/surrealdb.git
           git fetch upstream main
           if git merge-base --is-ancestor upstream/main HEAD; then
@@ -53,36 +102,412 @@ jobs:
           git merge upstream/main --no-edit --log
           echo "updated=true" >> "$GITHUB_OUTPUT"
 
+      # Updates this repo's main on a real update (or always in dry-run, so the
+      # permission probe runs even when main is already current). The trailing
+      # clause skips this on a releases-only push so that variant never touches
+      # main; it mirrors the gate on "Pull upstream main" above.
       - name: Push to origin main
-        if: steps.pull.outputs.updated == 'true'
-        run: git push origin main
+        if: >-
+          (steps.pull.outputs.updated == 'true' || inputs.dry_run)
+          && (github.event_name != 'workflow_dispatch'
+              || !startsWith(inputs.direction, 'push')
+              || contains(inputs.direction, 'main'))
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          UPDATED: ${{ steps.pull.outputs.updated }}
+        run: |
+          set -euo pipefail
+          # Authenticate with the app token via a local extra header scoped to the
+          # origin remote only, so the token is never attached to requests to the
+          # upstream remote. printf is a shell builtin, so the token is never
+          # exposed in a process's argv.
+          origin_url="$(git remote get-url origin)"
+          git config --local "http.${origin_url}.extraheader" \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "[dry-run] preflight: push to origin main (no changes will be made)"
+            problems=0
+            # Client-side check: auth works and the update is a fast-forward. It
+            # cannot see branch rules, so the ruleset probe below covers those.
+            if git push --dry-run origin main; then
+              echo "[dry-run] client-side push check: OK"
+            else
+              echo "::error::[dry-run] 'git push --dry-run origin main' failed (auth or non-fast-forward)"
+              problems=$((problems + 1))
+            fi
+            # Confirm the app can bypass any pull_request rule on main. A blocking
+            # rule only fails the run when there are merged updates to push now;
+            # with main already current a real run skips this push, so we warn.
+            ids="$(gh api "repos/$GH_REPO/rules/branches/main" \
+              --jq '[.[] | select(.type == "pull_request") | .ruleset_id] | unique | .[]' 2>/dev/null || true)"
+            if [ -z "$ids" ]; then
+              echo "[dry-run] no pull_request rule applies on main"
+            else
+              for id in $ids; do
+                cb="$(gh api "repos/$GH_REPO/rulesets/$id" --jq '.current_user_can_bypass' 2>/dev/null || echo unknown)"
+                case "$cb" in
+                  always)
+                    echo "[dry-run] ruleset $id: app can bypass pull_request = always (OK)" ;;
+                  unknown)
+                    echo "::warning::[dry-run] ruleset $id: cannot confirm bypass (app may lack ruleset read); a real push may be rejected" ;;
+                  *)
+                    if [ "${UPDATED:-false}" = "true" ]; then
+                      echo "::error::[dry-run] ruleset $id: app can bypass pull_request = $cb (need 'always'); pushing the merged updates would be rejected"
+                      problems=$((problems + 1))
+                    else
+                      echo "::warning::[dry-run] ruleset $id: app can bypass pull_request = $cb (need 'always'); main is current now, but a future update could not be pushed until this is fixed"
+                    fi ;;
+                esac
+              done
+            fi
+            if [ "$problems" -gt 0 ]; then
+              echo "::error::[dry-run] push to origin main would fail in a real run"
+              exit 1
+            fi
+            echo "[dry-run] origin main push preflight passed"
+            exit 0
+          fi
+          git push origin main
 
       - name: Notify on merge failure
         if: failure() && steps.pull.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          if gh issue list --label "upstream-sync" --state open --json number --jq 'length' | grep -qv '^0$'; then
+          set -euo pipefail
+          # A dry run makes no changes, so report instead of filing an issue. The
+          # merge failure has already turned this job red, which is the signal.
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "[dry-run] merge with upstream failed; a real run would open an 'upstream-sync' issue"
+            exit 0
+          fi
+          open_count="$(gh issue list --label "upstream-sync" --state open --json number --jq 'length')"
+          if [ "$open_count" != "0" ]; then
             echo "An open upstream sync failure issue already exists, skipping"
             exit 0
           fi
-          gh issue create \
-            --title "Upstream sync failed: merge conflict with surrealdb/surrealdb main" \
-            --label "upstream-sync" \
-            --body "## Upstream sync failed
+          # Build the body from a static template, then inject trusted values as
+          # plain data so nothing in it is evaluated by the shell.
+          template="$(cat <<'EOF'
+          ## Upstream sync failed
 
-          The automated sync from \`surrealdb/surrealdb\` main failed during [run #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          The automated sync from `surrealdb/surrealdb` main failed during run @@RUN_URL@@.
 
-          This is likely due to a merge conflict between this repository's \`main\` branch and the upstream \`main\` branch.
+          This is likely due to a merge conflict between this repository's `main` branch and the upstream `main` branch.
 
           To resolve this, manually merge the upstream changes:
-          \`\`\`
-          git clone git@github.com:${{ github.repository }}.git
-          cd $(basename ${{ github.repository }})
+          ```
+          git clone git@github.com:@@REPO@@.git
+          cd "$(basename @@REPO@@)"
           git remote add upstream https://github.com/surrealdb/surrealdb.git
           git fetch upstream main
           git merge upstream/main --log
           # resolve conflicts
           git push origin main
-          \`\`\`"
+          ```
+          EOF
+          )"
+          body="${template//@@RUN_URL@@/$RUN_URL}"
+          body="${body//@@REPO@@/$GH_REPO}"
+          gh issue create \
+            --title "Upstream sync failed: merge conflict with surrealdb/surrealdb main" \
+            --label "upstream-sync" \
+            --body "$body"
+
+  push:
+    name: Sync releases and main back to surrealdb/surrealdb
+    needs: [pull]
+    if: >-
+      github.repository != 'surrealdb/surrealdb'
+      && github.event_name == 'workflow_dispatch'
+      && startsWith(inputs.direction, 'push')
+      && needs.pull.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: upstream
+    permissions:
+      contents: read
+    steps:
+      # This job holds a token that can write to the public repo, so egress is
+      # blocked to a known allowlist. Validate this list against the detected
+      # endpoints of an `audit` run before relying on it; expand if a new
+      # GitHub asset host appears.
+      - name: Harden the runner (block egress)
+        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594 # v2.16.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            uploads.github.com:443
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate a token for surrealdb/surrealdb
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SURREALDB_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SURREALDB_SYNC_APP_PRIVATE_KEY }}
+          owner: surrealdb
+          repositories: surrealdb
+
+      - name: Configure git remote for surrealdb/surrealdb
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git remote add public https://github.com/surrealdb/surrealdb.git
+          # Authenticate with the app token via a local extra header. printf is a
+          # shell builtin, so the token is never exposed in a process's argv.
+          git config --local http.https://github.com/surrealdb/surrealdb.git.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+
+      # main can carry unreleased security fixes, so it is only pushed when the
+      # operator explicitly opts in. Tags and releases below sync regardless.
+      - name: Push main to surrealdb/surrealdb
+        if: contains(inputs.direction, 'main')
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git fetch public main
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "[dry-run] preflight: push main to surrealdb/surrealdb (no changes will be made)"
+            problems=0
+            # Assert the push would be a fast-forward; never rewrite history.
+            if git merge-base --is-ancestor public/main HEAD; then
+              echo "[dry-run] fast-forward check: OK"
+            else
+              echo "::error::[dry-run] public/main is not an ancestor of HEAD; a real push would be rejected (non-fast-forward; pull first)"
+              problems=$((problems + 1))
+            fi
+            # Client-side check: auth works and the update is a fast-forward. It
+            # cannot see branch rules, so the ruleset probe below covers those.
+            if git push --dry-run public HEAD:main; then
+              echo "[dry-run] client-side push check: OK"
+            else
+              echo "::error::[dry-run] 'git push --dry-run public HEAD:main' failed (auth or non-fast-forward)"
+              problems=$((problems + 1))
+            fi
+            # Confirm the app can bypass any pull_request rule on main. Unlike the
+            # pull job, this step always pushes when selected, so a blocking rule
+            # always fails the run.
+            ids="$(gh api "repos/surrealdb/surrealdb/rules/branches/main" \
+              --jq '[.[] | select(.type == "pull_request") | .ruleset_id] | unique | .[]' 2>/dev/null || true)"
+            if [ -z "$ids" ]; then
+              echo "[dry-run] no pull_request rule applies on surrealdb/surrealdb@main"
+            else
+              for id in $ids; do
+                cb="$(gh api "repos/surrealdb/surrealdb/rulesets/$id" --jq '.current_user_can_bypass' 2>/dev/null || echo unknown)"
+                case "$cb" in
+                  always)
+                    echo "[dry-run] ruleset $id: app can bypass pull_request = always (OK)" ;;
+                  unknown)
+                    echo "::warning::[dry-run] ruleset $id: cannot confirm bypass (app may lack ruleset read); a real push may be rejected" ;;
+                  *)
+                    echo "::error::[dry-run] ruleset $id: app can bypass pull_request = $cb (need 'always'); a real push would be rejected"
+                    problems=$((problems + 1)) ;;
+                esac
+              done
+            fi
+            if [ "$problems" -gt 0 ]; then
+              echo "::error::[dry-run] main push would fail in a real run ($problems blocking issue(s)); fix before running for real"
+              exit 1
+            fi
+            echo "[dry-run] main push preflight passed"
+            exit 0
+          fi
+          # Assert the push is a fast-forward; never rewrite remote history.
+          if ! git merge-base --is-ancestor public/main HEAD; then
+            echo "::error::public main is not an ancestor of HEAD; re-run after pulling again."
+            exit 1
+          fi
+          git push public HEAD:main
+
+      - name: Sync releases (and their tags) to surrealdb/surrealdb
+        env:
+          SRC_TOKEN: ${{ github.token }}
+          DST_TOKEN: ${{ steps.app-token.outputs.token }}
+          SRC_REPO: ${{ github.repository }}
+          DST_REPO: surrealdb/surrealdb
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # Enumerate every non-draft source release (paginated to the end so
+          # nothing is missed past a fixed limit). Pre-releases are kept.
+          source_releases="$(GH_TOKEN="$SRC_TOKEN" gh api --paginate "repos/$SRC_REPO/releases?per_page=100" \
+            --jq '.[] | select(.draft | not) | .tag_name' | sort -u)"
+
+          if [ -z "$source_releases" ]; then
+            echo "No source releases to sync"
+            exit 0
+          fi
+
+          # The source's "latest" defines the desired latest pointer. When the
+          # source has no "latest" we leave the destination pointer to GitHub's
+          # own heuristic instead of forcing every release non-latest (which would
+          # otherwise unset a valid latest pointer and show as perpetual drift).
+          latest_tag="$(GH_TOKEN="$SRC_TOKEN" gh release view --repo "$SRC_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -n "$latest_tag" ]; then manage_latest=true; else manage_latest=false; fi
+
+          # The destination's current latest tag. `gh release view` has no
+          # isLatest field, so the latest pointer is derived from the destination's
+          # latest release (empty when it has none yet).
+          dst_latest_tag="$(GH_TOKEN="$DST_TOKEN" gh release view --repo "$DST_REPO" --json tagName --jq .tagName 2>/dev/null || true)"
+
+          # Tags are only ever created as part of a release, so the release set is
+          # the complete set of tags we may publish. A release's tag is pushed
+          # (when missing on the destination) only right before its release is
+          # created, so a tag - and the commits it reaches - is never published
+          # without an accompanying release, even on the tags-only push variant.
+          public_tags="$(git ls-remote --tags public \
+            | awk '{print $2}' \
+            | sed -e 's#^refs/tags/##' -e 's/\^{}$//' \
+            | sort -u)"
+
+          # Reconcile every source release against the destination so re-runs
+          # converge: missing releases (and their tags) are created, and drift in
+          # metadata or assets is repaired. Assets present only on the destination
+          # are left alone, so anything added there manually is never deleted.
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            workdir="$(mktemp -d)"
+
+            # Desired state, read from the source. `--` stops flag parsing so a
+            # tag that looks like an option is never misinterpreted by gh.
+            src_meta="$(GH_TOKEN="$SRC_TOKEN" gh release view --repo "$SRC_REPO" \
+              --json name,body,isPrerelease,assets -- "$tag")"
+            title="$(printf '%s' "$src_meta" | jq -r '.name // ""')"
+            [ -z "$title" ] && title="$tag"
+            is_prerelease="$(printf '%s' "$src_meta" | jq -r '.isPrerelease')"
+            printf '%s' "$src_meta" | jq -r '.body // ""' > "$workdir/body.md"
+            body="$(cat "$workdir/body.md")"
+            # name<TAB>size identifies an asset; size also catches a file that was
+            # replaced under the same name. Sorted for an order-independent diff.
+            src_assets="$(printf '%s' "$src_meta" | jq -r '.assets[] | "\(.name)\t\(.size)"' | sort)"
+            if [ "$manage_latest" = "true" ] && [ "$tag" = "$latest_tag" ]; then is_latest=true; else is_latest=false; fi
+
+            # The latest flag is only reconciled when the source has a latest.
+            latest_args=()
+            [ "$manage_latest" = "true" ] && latest_args=(--latest="$is_latest")
+
+            # Current destination state, if the release exists. isLatest is not a
+            # valid `gh release view` field, so it is derived from dst_latest_tag.
+            if dst_meta="$(GH_TOKEN="$DST_TOKEN" gh release view --repo "$DST_REPO" \
+                 --json name,body,isPrerelease,assets -- "$tag" 2>/dev/null)"; then
+              exists=true
+              dst_title="$(printf '%s' "$dst_meta" | jq -r '.name // ""')"
+              dst_body="$(printf '%s' "$dst_meta" | jq -r '.body // ""')"
+              dst_is_prerelease="$(printf '%s' "$dst_meta" | jq -r '.isPrerelease')"
+              if [ "$tag" = "$dst_latest_tag" ]; then dst_is_latest=true; else dst_is_latest=false; fi
+              dst_assets="$(printf '%s' "$dst_meta" | jq -r '.assets[] | "\(.name)\t\(.size)"' | sort)"
+            else
+              exists=false
+            fi
+
+            # Work out what (if anything) is out of sync. The body is compared
+            # CRLF-agnostically: GitHub may re-normalize stored bodies, which
+            # would otherwise look like perpetual drift and edit on every run.
+            meta_drift=false
+            assets_drift=""
+            if [ "$exists" = "true" ]; then
+              if [ "$title" != "$dst_title" ] || [ "${body//$'\r'/}" != "${dst_body//$'\r'/}" ] \
+                 || [ "$is_prerelease" != "$dst_is_prerelease" ] \
+                 || { [ "$manage_latest" = "true" ] && [ "$is_latest" != "$dst_is_latest" ]; }; then
+                meta_drift=true
+              fi
+              # Source assets missing or changed on the destination (one-way).
+              assets_drift="$(comm -23 <(printf '%s\n' "$src_assets") <(printf '%s\n' "$dst_assets"))"
+            else
+              assets_drift="$src_assets"
+            fi
+
+            n_assets=0
+            [ -n "$assets_drift" ] && n_assets="$(printf '%s\n' "$assets_drift" | grep -c .)"
+
+            if [ "$exists" = "true" ] && [ "$meta_drift" = "false" ] && [ "$n_assets" -eq 0 ]; then
+              echo "Release ${tag}: in sync"
+              rm -rf "$workdir"
+              continue
+            fi
+
+            # Whether the tag already exists on the destination.
+            tag_on_dst=false
+            printf '%s\n' "$public_tags" | grep -qxF "$tag" && tag_on_dst=true
+
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+              if [ "$exists" = "true" ]; then
+                echo "[dry-run] would reconcile release ${tag} (metadata drift=${meta_drift}, assets to (re)upload=${n_assets})"
+              else
+                [ "$tag_on_dst" = "false" ] && echo "[dry-run] would push tag: ${tag}"
+                echo "[dry-run] would create release '${title}' for tag ${tag} (prerelease=${is_prerelease}, latest=${is_latest}, assets=${n_assets})"
+              fi
+              rm -rf "$workdir"
+              continue
+            fi
+
+            # Download only the assets that need (re)uploading, fetched by their
+            # API URL (i.e. by asset id) so there is no glob/pattern matching and
+            # special characters in asset names are handled literally.
+            upload=()
+            if [ "$n_assets" -gt 0 ]; then
+              mkdir -p "$workdir/assets"
+              while IFS=$'\t' read -r name _size; do
+                [ -z "$name" ] && continue
+                api_url="$(printf '%s' "$src_meta" \
+                  | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .apiUrl')"
+                GH_TOKEN="$SRC_TOKEN" gh api -H "Accept: application/octet-stream" \
+                  "$api_url" > "$workdir/assets/$name"
+              done <<< "$assets_drift"
+              while IFS= read -r -d '' f; do upload+=("$f"); done \
+                < <(find "$workdir/assets" -type f -print0)
+            fi
+
+            if [ "$exists" = "false" ]; then
+              # Publish the tag first (idempotent: only when missing, never forced)
+              # so the release can attach to it. This is the only place tags are
+              # pushed, keeping published tags and releases in lockstep.
+              if [ "$tag_on_dst" = "false" ]; then
+                echo "Pushing tag: $tag"
+                git push public "refs/tags/$tag:refs/tags/$tag"
+              fi
+              echo "Creating release ${tag}"
+              # --verify-tag attaches to the existing tag rather than creating one.
+              # ${arr[@]+...} expands to nothing (not an unbound-variable error
+              # under set -u) when the array is empty.
+              GH_TOKEN="$DST_TOKEN" gh release create --repo "$DST_REPO" --verify-tag \
+                --title "$title" --notes-file "$workdir/body.md" \
+                --prerelease="$is_prerelease" ${latest_args[@]+"${latest_args[@]}"} \
+                -- "$tag" ${upload[@]+"${upload[@]}"}
+            else
+              if [ "$meta_drift" = "true" ]; then
+                echo "Updating metadata for release ${tag}"
+                GH_TOKEN="$DST_TOKEN" gh release edit "$tag" --repo "$DST_REPO" \
+                  --title "$title" --notes-file "$workdir/body.md" \
+                  --prerelease="$is_prerelease" ${latest_args[@]+"${latest_args[@]}"}
+              fi
+              if [ "${#upload[@]}" -gt 0 ]; then
+                echo "Uploading ${#upload[@]} asset(s) for release ${tag}"
+                GH_TOKEN="$DST_TOKEN" gh release upload --repo "$DST_REPO" \
+                  --clobber -- "$tag" "${upload[@]}"
+              fi
+            fi
+
+            rm -rf "$workdir"
+          done <<< "$source_releases"

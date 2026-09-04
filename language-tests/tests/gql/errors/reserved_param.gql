@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: $parent is bound by the engine inside lookup conditions, where the lowering pushes predicates."
+
+[test.results]
+parsing-error = '''
+The parameter name `$parent` is reserved by the engine
+  --> [15:32]
+   |
+15 | MATCH (n:person) WHERE n.age > $parent RETURN n
+   |                                ^^^^^^^ rename the parameter
+'''
+*/
+
+MATCH (n:person) WHERE n.age > $parent RETURN n

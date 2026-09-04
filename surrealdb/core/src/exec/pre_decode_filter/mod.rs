@@ -44,18 +44,20 @@ pub(crate) mod wire_literal;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub(crate) use compile::{pre_decode_filter_for_execute, pre_decode_filter_status_at_plan_time};
+pub(crate) use compile::{
+	field_state_blocks_raw_read, pre_decode_filter_for_execute,
+	pre_decode_filter_status_at_plan_time,
+};
 use revision::WalkRevisioned;
 pub(crate) use streaming::StreamingLeafEvaluator;
 use wire_literal::{LiteralSet, LiteralWire};
 
-use crate::catalog::Record;
 use crate::expr::operator::BinaryOperator;
 use crate::fnc::operate;
 use crate::key::record::RecordKey;
 use crate::val::object_extract::{
-	DescendResult, Extracted, PathSegment, SlotScanResult, WalkLeafErr,
-	descend_to_value_walker_parts, extract_field_from_record_bytes,
+	DescendResult, Extracted, NeedleKey, PathSegment, SlotScanResult, WalkLeafErr,
+	descend_to_value_walker_parts, extract_field_from_record_bytes, record_data_bytes,
 	scan_record_object_at_path_with_slots,
 };
 use crate::val::{RecordId, Value};
@@ -98,10 +100,30 @@ pub(crate) struct FlatClauseOp {
 #[derive(Debug, Clone)]
 pub(crate) struct FusedFlatClause {
 	pub(crate) key_utf8: Vec<u8>,
+	/// Plan-time pre-encoded `Strand` wire (`<usize varint len || utf8>`) of
+	/// `key_utf8`, built once at construction. The fused object scan's
+	/// needle-driven branch uses it as the `find_value_bytes` needle so the
+	/// per-row hot loop never re-serialises the key. Mirrors
+	/// [`PathSegment`](crate::val::object_extract::PathSegment)'s pre-encoded
+	/// `wire`.
+	pub(crate) key_wire: Box<[u8]>,
 	pub(crate) ops: Vec<FlatClauseOp>,
 }
 
 impl FusedFlatClause {
+	/// Build a clause from its key and ops, pre-encoding the `key_wire`
+	/// once. Used by both the production compile path
+	/// (`flat_clauses_from_specs`) and the test single-clause constructor.
+	pub(crate) fn new(key_utf8: Vec<u8>, ops: Vec<FlatClauseOp>) -> Self {
+		let key_wire =
+			crate::val::object_extract::strand_wire_bytes_from_utf8(&key_utf8).into_boxed_slice();
+		Self {
+			key_utf8,
+			key_wire,
+			ops,
+		}
+	}
+
 	/// Single-clause convenience constructor — the common case for
 	/// non-range predicates that touch a key exactly once. Used only by
 	/// test fixtures today; production compile paths build the
@@ -116,25 +138,33 @@ impl FusedFlatClause {
 		literal_wire: Arc<LiteralWire>,
 		reversed: bool,
 	) -> Self {
-		Self {
+		Self::new(
 			key_utf8,
-			ops: vec![FlatClauseOp {
+			vec![FlatClauseOp {
 				op,
 				literal,
 				literal_wire,
 				reversed,
 			}],
-		}
+		)
 	}
 }
 
-/// Lookup-key view used by
-/// [`scan_record_root_object_for_keys_sorted`]: returns the clause's
-/// `key_utf8` bytes. Lets fused-map evaluation pass `&[FusedFlatClause]`
-/// directly without projecting into a `Vec<&[u8]>` per row.
-impl AsRef<[u8]> for FusedFlatClause {
-	fn as_ref(&self) -> &[u8] {
+/// Needle-key view for the fused object scan
+/// ([`scan_record_object_at_path_with_slots`]): the clause's `key_utf8`
+/// plus its plan-time pre-encoded `key_wire`, so evaluation can pass
+/// `&[FusedFlatClause]` directly with no per-row projection or re-encoding.
+///
+/// [`scan_record_object_at_path_with_slots`]: crate::val::object_extract::scan_record_object_at_path_with_slots
+impl NeedleKey for FusedFlatClause {
+	#[inline]
+	fn key_utf8(&self) -> &[u8] {
 		&self.key_utf8
+	}
+
+	#[inline]
+	fn key_wire(&self) -> Option<&[u8]> {
+		Some(&self.key_wire)
 	}
 }
 
@@ -425,13 +455,9 @@ impl PreDecodeFilter {
 			if prefix.is_empty() && path.is_empty() {
 				return Err(WalkLeafErr::Bail);
 			}
-			// Open the record walker, take the `data` field's wire bytes via
-			// the macro-emitted accessor (O(1) on rev-2 `indexed_struct`
-			// records; sequential `metadata` skip on rev-1).
-			let mut record_reader: &[u8] = record_bytes;
-			let data_bytes = Record::walk_revisioned(&mut record_reader)
-				.and_then(|w| w.into_data_bytes())
-				.map_err(|_| WalkLeafErr::Bail)?;
+			// Open the record's `data` field wire bytes: slice-direct on
+			// rev-2 `indexed_struct` records, walker-chain fallback otherwise.
+			let data_bytes = record_data_bytes(record_bytes).map_err(|_| WalkLeafErr::Bail)?;
 			let mut reader: &[u8] = &data_bytes;
 			let value_walker =
 				Value::walk_revisioned(&mut reader).map_err(|_| WalkLeafErr::Bail)?;
@@ -687,13 +713,9 @@ impl PreDecodeFilter {
 	where
 		F: FnOnce(&[u8]) -> T,
 	{
-		// Open the record walker, take the `data` field's wire bytes via the
-		// macro-emitted accessor (O(1) on rev-2 `indexed_struct` records;
-		// sequential `metadata` skip on rev-1).
-		let mut record_reader: &[u8] = record_bytes;
-		let Ok(data_bytes) =
-			Record::walk_revisioned(&mut record_reader).and_then(|w| w.into_data_bytes())
-		else {
+		// Open the record's `data` field wire bytes: slice-direct on rev-2
+		// `indexed_struct` records, walker-chain fallback otherwise.
+		let Ok(data_bytes) = record_data_bytes(record_bytes) else {
 			return DescendResult::Bail;
 		};
 		let mut reader: &[u8] = &data_bytes;
@@ -1212,6 +1234,32 @@ mod tests {
 			fused_clause(b"a".to_vec(), BinaryOperator::Equal, Value::None, false),
 		];
 		assert!(FusedFlatClauses::try_new(dup).is_none());
+	}
+
+	/// The plan-time pre-encoded `key_wire` must be byte-for-byte identical
+	/// to the on-demand `strand_wire_bytes_from_utf8` encoding and to
+	/// `PathSegment::wire()` — the fused scan's needle-driven branch relies
+	/// on it as the `find_value_bytes` needle, so any divergence would
+	/// mis-resolve keys. This is the whole correctness basis for pre-encoding:
+	/// only the *source* of the bytes changes, never the bytes.
+	#[test]
+	fn fused_clause_key_wire_matches_on_demand_encoding() {
+		use crate::val::object_extract::{NeedleKey, strand_wire_bytes_from_utf8};
+		for key in [b"a".as_slice(), b"number", b"geography", b"a_longer_field_name_here"] {
+			let clause = fused_clause(key.to_vec(), BinaryOperator::Equal, Value::None, false);
+			assert_eq!(
+				&*clause.key_wire,
+				strand_wire_bytes_from_utf8(key).as_slice(),
+				"key_wire must equal the on-demand Strand wire encoding",
+			);
+			// And equal to the PathSegment needle used on the leaf path, so
+			// both descent entry points feed `find_value_bytes` identical bytes.
+			let seg = PathSegment::from(std::str::from_utf8(key).unwrap());
+			assert_eq!(&*clause.key_wire, seg.wire(), "key_wire must equal PathSegment::wire()");
+			// NeedleKey exposes both views consistently.
+			assert_eq!(clause.key_utf8(), key);
+			assert_eq!(clause.key_wire(), Some(&*clause.key_wire));
+		}
 	}
 
 	#[test]

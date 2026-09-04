@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-C): an OPTIONAL block's leading clause whose only anchor is the bound `a` is realised off the outer accumulator by the single-hop OptionalExpand only. A MULTI-hop bound-variable expansion has no operator (not a self-rootable subplan, not the single-hop fast path), so it is rejected cleanly at lowering (V2_DESIGN §5/§6)."
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [15:33]
+   |
+15 | MATCH (a:person) OPTIONAL MATCH (a)-[k1]->(x)-[k2]->(b) RETURN a.name AS name
+   |                                 ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[k1]->(x)-[k2]->(b) RETURN a.name AS name

@@ -7,6 +7,7 @@ use std::pin::Pin;
 
 use anyhow::bail;
 
+use super::cursor::{DefaultKeysCursor, DefaultValsCursor};
 use super::direction::Direction;
 use super::err::{Error, Result};
 use super::util;
@@ -32,21 +33,17 @@ pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Specifies the limit for scan operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanLimit {
-	/// Fetch up to the specified number of entries
-	Count(u32),
-	/// Fetch at least the specified number of bytes
-	Bytes(u32),
-	/// Fetch at least the specified number of bytes, limited by the specified number of entries
-	BytesOrCount(u32, u32),
-}
-
-impl From<u32> for ScanLimit {
-	fn from(count: u32) -> Self {
-		ScanLimit::Count(count)
-	}
+/// The result of a [`Transactable::keys`] or [`Transactable::keysr`] operation.
+///
+/// Contains the fetched keys together with the total number of key bytes in
+/// the result, accumulated by the backend during the same iteration that
+/// produced the keys.
+#[derive(Debug, Default)]
+pub struct KeysResult {
+	/// The fetched keys.
+	pub keys: Vec<Key>,
+	/// The total number of key bytes in the result.
+	pub key_bytes: u64,
 }
 
 /// The result of a [`Transactable::scan`] or [`Transactable::scanr`] operation.
@@ -59,26 +56,29 @@ impl From<u32> for ScanLimit {
 pub struct ScanResult {
 	/// The fetched key-value pairs.
 	pub values: Vec<(Key, Val)>,
-
 	/// The total number of key bytes in the result.
 	pub key_bytes: u64,
-
 	/// The total number of value bytes in the result.
 	pub value_bytes: u64,
 }
 
-/// The result of a [`Transactable::keys`] or [`Transactable::keysr`] operation.
+/// Per-chunk statistics returned by [`ScanCursorVals::for_each`] /
+/// [`ScanCursorKeys::for_each`].
 ///
-/// Contains the fetched keys together with the total number of key bytes in
-/// the result, accumulated by the backend during the same iteration that
-/// produced the keys.
-#[derive(Debug, Default)]
-pub struct KeysResult {
-	/// The fetched keys.
-	pub keys: Vec<Key>,
-
-	/// The total number of key bytes in the result.
+/// Accumulated by the backend while driving the visitor, so the caller can
+/// update scan metrics and limit accounting without a second pass. `rows`
+/// counts every row the cursor advanced over and handed to the visitor —
+/// including rows the visitor ignored (e.g. pre-decode-filter rejects) — so it
+/// matches the `len()` of an equivalent [`ScanCursorVals::next_batch`] batch.
+/// For the keys variant `value_bytes` is always `0`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanChunkStats {
+	/// Number of `(key, value)` pairs (or keys) visited in this chunk.
+	pub rows: u64,
+	/// Sum of every visited key's length in bytes.
 	pub key_bytes: u64,
+	/// Sum of every visited value's length in bytes (`0` for keys scans).
+	pub value_bytes: u64,
 }
 
 /// The result of a [`Transactable::getm`] operation.
@@ -91,10 +91,8 @@ pub struct GetMultiResult {
 	/// One entry per input key, preserving input order. `None` indicates a
 	/// miss.
 	pub values: Vec<Option<Val>>,
-
 	/// The number of input keys that were found (count of `Some` entries).
 	pub records: u64,
-
 	/// The total number of value bytes across the `Some` entries.
 	pub value_bytes: u64,
 }
@@ -366,18 +364,59 @@ impl<'a> Iterator for ValsIter<'a> {
 
 impl ExactSizeIterator for ValsIter<'_> {}
 
+/// Per-`(key, value)` visitor for [`ScanCursorVals::for_each`].
+///
+/// Invoked once per row with slices borrowed directly from the cursor's
+/// engine-native handle (no per-row allocation). Return
+/// `ControlFlow::Break(())` to stop the scan early (e.g. a consumer-side
+/// `LIMIT`) — this does **not** mark the range exhausted, so the cursor stays
+/// resumable. The closure must be synchronous (no `.await`).
+///
+/// `Send` is required only on non-WASM targets, mirroring [`BoxFut`]: a
+/// `for_each` future is `Send` there and captures the `&mut dyn ValVisitor`.
+#[cfg(not(target_family = "wasm"))]
+pub trait ValVisitor: FnMut(&[u8], &[u8]) -> Result<std::ops::ControlFlow<()>> + Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: FnMut(&[u8], &[u8]) -> Result<std::ops::ControlFlow<()>> + Send> ValVisitor for T {}
+/// Per-`(key, value)` visitor for [`ScanCursorVals::for_each`]. See the
+/// non-WASM definition for the contract.
+#[cfg(target_family = "wasm")]
+pub trait ValVisitor: FnMut(&[u8], &[u8]) -> Result<std::ops::ControlFlow<()>> {}
+#[cfg(target_family = "wasm")]
+impl<T: FnMut(&[u8], &[u8]) -> Result<std::ops::ControlFlow<()>>> ValVisitor for T {}
+
+/// Per-key visitor for [`ScanCursorKeys::for_each`]. See [`ValVisitor`] for the
+/// contract (this variant receives only the key).
+#[cfg(not(target_family = "wasm"))]
+pub trait KeyVisitor: FnMut(&[u8]) -> Result<std::ops::ControlFlow<()>> + Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: FnMut(&[u8]) -> Result<std::ops::ControlFlow<()>> + Send> KeyVisitor for T {}
+/// Per-key visitor for [`ScanCursorKeys::for_each`].
+#[cfg(target_family = "wasm")]
+pub trait KeyVisitor: FnMut(&[u8]) -> Result<std::ops::ControlFlow<()>> {}
+#[cfg(target_family = "wasm")]
+impl<T: FnMut(&[u8]) -> Result<std::ops::ControlFlow<()>>> KeyVisitor for T {}
+
 /// A stateful keys-only scan cursor. Returned by [`Transactable::open_keys_cursor`].
 ///
 /// A cursor represents one logical scan operation (e.g. an outer table walk,
-/// or one prefix of a graph-edge traversal). It is opened once and pumped via
-/// repeated [`Self::next_batch`] calls until it returns an empty batch (range
-/// exhausted) or the caller drops the handle. The direction and range bounds
-/// are fixed at open time.
+/// or one prefix of a graph-edge traversal). It is opened once and pumped
+/// until the range is exhausted or the caller drops the handle, via either of
+/// two driving methods (the direction and range bounds are fixed at open
+/// time):
 ///
-/// The returned [`KeysBatch`] borrows from the cursor for the duration of
-/// the call's `&mut self` lifetime — there is no per-item allocation on
-/// the hot path; only one `Vec<&[u8]>` allocation per batch. Backends
-/// that can keep an underlying iterator alive across batches (e.g.
+/// - [`Self::next_batch`] materialises a [`KeysBatch`] borrowed from the cursor for the duration of
+///   the call's `&mut self` lifetime — no per-item allocation on the hot path; only one `Vec<_>`
+///   allocation per batch. An empty batch signals end of range.
+/// - [`Self::for_each`] is the zero-copy streaming alternative: it drives a visitor directly over
+///   the same borrowed keys, skipping even the per-batch `Vec`.
+///
+/// Pick **one** driving method per cursor: interleaving `next_batch` and
+/// `for_each` on the same cursor is unsupported (an implementation may buffer
+/// rows for one path that the other does not see) and is debug-asserted
+/// against by the default cursor.
+///
+/// Backends that can keep an underlying iterator alive across batches (e.g.
 /// RocksDB's `DBRawIterator`) hold it inside the cursor — the caller's
 /// `Drop` is what frees the iterator, **not** an LRU. This avoids the
 /// thrashing failure mode of a bounded cache when there are more concurrent
@@ -388,292 +427,67 @@ pub trait ScanCursorKeys: requirements::TransactionRequirements {
 	/// from the cursor's internal buffer. An empty batch signals end of
 	/// range. The cursor remains valid after an empty batch and may be
 	/// dropped at any time.
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<KeysBatch<'s>>>;
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<KeysBatch<'s>>>;
+
+	/// Drive the cursor, invoking `f` for up to `limit` keys borrowed directly
+	/// from the cursor — the zero-copy streaming path. `f` returns
+	/// `ControlFlow::Break(())` to stop early without exhausting the range.
+	/// Returns this chunk's row/byte stats (`value_bytes` is always `0`); rows
+	/// are counted only after the visitor accepts them, and pre-decode-filter
+	/// rejects (visitor returns `Continue`) count as scanned. After a visitor
+	/// error the cursor's resume position is implementation-defined — treat
+	/// the error as terminal and do not reuse the cursor.
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn KeyVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>>;
 }
 
 /// A stateful key+value scan cursor. Returned by [`Transactable::open_vals_cursor`].
 ///
-/// See [`ScanCursorKeys`] for the semantics — this variant yields
-/// `(key, value)` pairs instead of keys alone.
+/// A cursor represents one logical scan operation (e.g. an outer table walk,
+/// or one prefix of a graph-edge traversal). It is opened once and pumped
+/// until the range is exhausted or the caller drops the handle, via either of
+/// two driving methods (the direction and range bounds are fixed at open
+/// time):
+///
+/// - [`Self::next_batch`] materialises a [`ValsBatch`] borrowed from the cursor for the duration of
+///   the call's `&mut self` lifetime — no per-item allocation on the hot path; only one `Vec<_>`
+///   allocation per batch. An empty batch signals end of range.
+/// - [`Self::for_each`] is the zero-copy streaming alternative: it drives a visitor directly over
+///   the same borrowed `(key, value)` pairs, skipping even the per-batch `Vec`.
+///
+/// Pick **one** driving method per cursor: interleaving `next_batch` and
+/// `for_each` on the same cursor is unsupported (an implementation may buffer
+/// rows for one path that the other does not see) and is debug-asserted
+/// against by the default cursor.
+///
+/// Backends that can keep an underlying iterator alive across batches (e.g.
+/// RocksDB's `DBRawIterator`) hold it inside the cursor — the caller's
+/// `Drop` is what frees the iterator, **not** an LRU. This avoids the
+/// thrashing failure mode of a bounded cache when there are more concurrent
+/// prefixes than cache slots (e.g. `SELECT ->knows FROM person` with many
+/// outer rows).
 pub trait ScanCursorVals: requirements::TransactionRequirements {
 	/// Advance the cursor and return up to `limit` more `(key, value)`
 	/// pairs, borrowed from the cursor's internal buffer. An empty batch
 	/// signals end of range.
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<ValsBatch<'s>>>;
-}
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<ValsBatch<'s>>>;
 
-/// Default keys-cursor implementation: wraps the existing single-shot
-/// [`Transactable::keys`]/[`Transactable::keysr`], copies each returned
-/// key into a cursor-owned buffer, and hands out borrowed slices into
-/// that buffer. Backends without a stateful iterator (mem, surrealkv,
-/// tikv, indxdb) inherit this. RocksDB overrides with a path that drives
-/// `DBRawIterator` directly without re-seeking.
-///
-/// # Re-seek cost (default impl only)
-///
-/// Each `next_batch` call here issues a fresh `keys()` round-trip:
-/// every batch pays a re-seek against the underlying storage. For local
-/// engines (mem, surrealkv) this is a B-tree lookup; for tikv it is a
-/// network round-trip. Backends that can do better should override the
-/// `open_keys_cursor` method on `Transactable` to return a stateful
-/// cursor (as rocksdb does), keeping the iterator pinned across batches.
-///
-/// # Exhaustion heuristic
-///
-/// A count-limited batch returning fewer than `c` items terminates the
-/// cursor without an extra round-trip, while byte-limited batches always
-/// require one trailing empty call to confirm exhaustion.
-///
-/// **Backend-specific overrides must implement an equivalent termination
-/// signal.** The rocksdb cursor uses iterator exhaustion (`iter.valid()
-/// == false`) directly rather than the short-batch heuristic, which is
-/// safe because the iterator is pinned across batches. Any new override
-/// must either preserve the short-batch heuristic (when wrapping a
-/// single-shot scan) or substitute an equivalent — never both, never
-/// neither, since `exhausted` is the only thing that prevents an
-/// infinite loop on a stale post-range cursor.
-struct DefaultKeysCursor<'a, T: ?Sized> {
-	/// The backing transaction. Borrowed for the cursor's lifetime so it
-	/// cannot outlive the transaction.
-	tx: &'a T,
-	/// Remaining range to scan. Updated after each batch.
-	rng: Range<Key>,
-	/// Iteration direction, fixed at open time.
-	dir: Direction,
-	/// Optional version timestamp for versioned reads.
-	version: Option<u64>,
-	/// Number of leading items to skip on the first batch. Cleared once
-	/// the first batch has been issued.
-	skip: u32,
-	/// Once true, all subsequent calls return an empty batch without
-	/// hitting the backend.
-	exhausted: bool,
-	/// Concatenated key bytes for the most recent batch. Reused across
-	/// batches — capacity persists, contents are replaced.
-	key_buf: Vec<u8>,
-	/// One `KeySpan` per key in `key_buf` for the most recent batch.
-	/// Reused across batches.
-	key_spans: Vec<KeySpan>,
-}
-
-impl<'a, T: ?Sized> DefaultKeysCursor<'a, T> {
-	/// Construct a fresh default cursor. The backing key buffer starts
-	/// empty; its capacity grows on the first `next_batch` call and
-	/// persists across subsequent batches.
-	fn new(tx: &'a T, rng: Range<Key>, dir: Direction, version: Option<u64>, skip: u32) -> Self {
-		Self {
-			tx,
-			rng,
-			dir,
-			version,
-			skip,
-			exhausted: false,
-			key_buf: Vec::new(),
-			key_spans: Vec::new(),
-		}
-	}
-}
-
-impl<T> ScanCursorKeys for DefaultKeysCursor<'_, T>
-where
-	T: Transactable + ?Sized,
-{
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<KeysBatch<'s>>> {
-		Box::pin(async move {
-			self.key_buf.clear();
-			self.key_spans.clear();
-			if self.exhausted || self.rng.start >= self.rng.end {
-				return Ok(KeysBatch::from_parts(&self.key_buf, &self.key_spans, 0));
-			}
-			let skip = std::mem::take(&mut self.skip);
-			let res = match self.dir {
-				Direction::Forward => {
-					self.tx.keys(self.rng.clone(), limit, skip, self.version).await?
-				}
-				Direction::Backward => {
-					self.tx.keysr(self.rng.clone(), limit, skip, self.version).await?
-				}
-			};
-			// Pre-allocate the backing arena once: one capacity request, then
-			// `extend_from_slice` for each key never reallocates because we
-			// reserved the total up-front.
-			let total_bytes: usize = res.keys.iter().map(|k| k.len()).sum();
-			self.key_buf.reserve(total_bytes);
-			self.key_spans.reserve(res.keys.len());
-			for k in &res.keys {
-				let offset = self.key_buf.len();
-				let len = k.len();
-				self.key_buf.extend_from_slice(k);
-				self.key_spans.push(KeySpan {
-					offset,
-					len,
-				});
-			}
-			match res.keys.last() {
-				Some(last) => {
-					// Advance the unbounded edge past the last key seen so
-					// the next call resumes after this batch.
-					//
-					// Forward: the minimal key strictly greater than
-					// `last` is `last || [\x00]`. We append `\x00` to make
-					// the next range `[last\0, end)`, which excludes
-					// `last` (already returned) and keeps every key
-					// strictly greater — including any key that has
-					// `last` as a strict prefix (e.g. `a\0`, `ab`, ...
-					// after `a`).
-					//
-					// We deliberately do NOT use `push(0xff)` (would skip
-					// `(last, last\xff)`) nor a byte-level increment
-					// like `util::advance_key` (would skip every key
-					// that has `last` as a strict prefix — e.g. `a` →
-					// `b` jumps past `a\0`, `ab`, ...). Both are wrong
-					// for a cursor consumed batch-by-batch over an
-					// arbitrary byte range.
-					//
-					// Backward: the range is `[start, end)`, so clipping
-					// `end` to `last` already excludes `last` and keeps
-					// every key strictly less than it.
-					match self.dir {
-						Direction::Forward => {
-							self.rng.start.clone_from(last);
-							self.rng.start.push(0x00);
-						}
-						Direction::Backward => {
-							self.rng.end.clone_from(last);
-						}
-					}
-					// Count-limited short batch ⇒ definitively exhausted.
-					if let ScanLimit::Count(c) = limit
-						&& res.keys.len() < c as usize
-					{
-						self.exhausted = true;
-					}
-				}
-				None => {
-					self.exhausted = true;
-				}
-			}
-			Ok(KeysBatch::from_parts(&self.key_buf, &self.key_spans, res.key_bytes))
-		})
-	}
-}
-
-/// Default vals-cursor implementation: see [`DefaultKeysCursor`].
-struct DefaultValsCursor<'a, T: ?Sized> {
-	/// The backing transaction. Borrowed for the cursor's lifetime.
-	tx: &'a T,
-	/// Remaining range to scan. Updated after each batch.
-	rng: Range<Key>,
-	/// Iteration direction, fixed at open time.
-	dir: Direction,
-	/// Optional version timestamp for versioned reads.
-	version: Option<u64>,
-	/// Number of leading items to skip on the first batch.
-	skip: u32,
-	/// Once true, all subsequent calls return an empty batch without
-	/// hitting the backend.
-	exhausted: bool,
-	/// Concatenated key bytes for the most recent batch. Reused.
-	key_buf: Vec<u8>,
-	/// Concatenated value bytes for the most recent batch. Reused.
-	val_buf: Vec<u8>,
-	/// One `KeyValSpan` per pair. Reused.
-	spans: Vec<KeyValSpan>,
-}
-
-impl<'a, T: ?Sized> DefaultValsCursor<'a, T> {
-	/// Construct a fresh default cursor. The backing key/value buffers
-	/// start empty; their capacity grows on the first `next_batch` call
-	/// and persists across subsequent batches.
-	fn new(tx: &'a T, rng: Range<Key>, dir: Direction, version: Option<u64>, skip: u32) -> Self {
-		Self {
-			tx,
-			rng,
-			dir,
-			version,
-			skip,
-			exhausted: false,
-			key_buf: Vec::new(),
-			val_buf: Vec::new(),
-			spans: Vec::new(),
-		}
-	}
-}
-
-impl<T> ScanCursorVals for DefaultValsCursor<'_, T>
-where
-	T: Transactable + ?Sized,
-{
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<ValsBatch<'s>>> {
-		Box::pin(async move {
-			self.key_buf.clear();
-			self.val_buf.clear();
-			self.spans.clear();
-			if self.exhausted || self.rng.start >= self.rng.end {
-				return Ok(ValsBatch::from_parts(&self.key_buf, &self.val_buf, &self.spans, 0, 0));
-			}
-			let skip = std::mem::take(&mut self.skip);
-			let res = match self.dir {
-				Direction::Forward => {
-					self.tx.scan(self.rng.clone(), limit, skip, self.version).await?
-				}
-				Direction::Backward => {
-					self.tx.scanr(self.rng.clone(), limit, skip, self.version).await?
-				}
-			};
-			let (kb, vb): (usize, usize) =
-				res.values.iter().fold((0, 0), |(ka, va), (k, v)| (ka + k.len(), va + v.len()));
-			self.key_buf.reserve(kb);
-			self.val_buf.reserve(vb);
-			self.spans.reserve(res.values.len());
-			for (k, v) in &res.values {
-				let key_offset = self.key_buf.len();
-				let key_len = k.len();
-				self.key_buf.extend_from_slice(k);
-				let val_offset = self.val_buf.len();
-				let val_len = v.len();
-				self.val_buf.extend_from_slice(v);
-				self.spans.push(KeyValSpan {
-					key_offset,
-					key_len,
-					val_offset,
-					val_len,
-				});
-			}
-			match res.values.last() {
-				Some((last, _)) => {
-					// See `DefaultKeysCursor` for the successor-logic
-					// rationale: `push(0x00)` gives the minimal key
-					// strictly greater than `last`, so no key in
-					// `(last, ...]` is skipped at the batch boundary.
-					match self.dir {
-						Direction::Forward => {
-							self.rng.start.clone_from(last);
-							self.rng.start.push(0x00);
-						}
-						Direction::Backward => {
-							self.rng.end.clone_from(last);
-						}
-					}
-					if let ScanLimit::Count(c) = limit
-						&& res.values.len() < c as usize
-					{
-						self.exhausted = true;
-					}
-				}
-				None => {
-					self.exhausted = true;
-				}
-			}
-			Ok(ValsBatch::from_parts(
-				&self.key_buf,
-				&self.val_buf,
-				&self.spans,
-				res.key_bytes,
-				res.value_bytes,
-			))
-		})
-	}
+	/// Drive the cursor, invoking `f` for up to `limit` `(key, value)` pairs
+	/// borrowed directly from the cursor — the zero-copy streaming path. `f`
+	/// returns `ControlFlow::Break(())` to stop early without exhausting the
+	/// range. Returns this chunk's row/byte stats; rows are counted only after
+	/// the visitor accepts them, and pre-decode-filter rejects (visitor returns
+	/// `Continue`) count as scanned. After a visitor error the cursor's resume
+	/// position is implementation-defined — treat the error as terminal and do
+	/// not reuse the cursor.
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn ValVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>>;
 }
 
 /// This trait defines the API for a transaction in a key-value store.
@@ -744,7 +558,7 @@ pub trait Transactable: requirements::TransactionRequirements {
 	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>>;
@@ -759,7 +573,7 @@ pub trait Transactable: requirements::TransactionRequirements {
 	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>>;
@@ -774,7 +588,7 @@ pub trait Transactable: requirements::TransactionRequirements {
 	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>>;
@@ -789,7 +603,7 @@ pub trait Transactable: requirements::TransactionRequirements {
 	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>>;
@@ -815,9 +629,13 @@ pub trait Transactable: requirements::TransactionRequirements {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<Box<dyn ScanCursorKeys + 'a>>> {
 		Box::pin(async move {
+			// Check to see if transaction is closed
 			if self.closed() {
 				return Err(Error::TransactionFinished);
 			}
+			// Fall back to the generic cursor that wraps `keys`/`keysr` and
+			// advances `rng.start` between batches. Backends that can keep a
+			// native iterator alive across batches override this method.
 			Ok(Box::new(DefaultKeysCursor::new(self, rng, dir, version, skip))
 				as Box<dyn ScanCursorKeys + 'a>)
 		})
@@ -833,9 +651,13 @@ pub trait Transactable: requirements::TransactionRequirements {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<Box<dyn ScanCursorVals + 'a>>> {
 		Box::pin(async move {
+			// Check to see if transaction is closed
 			if self.closed() {
 				return Err(Error::TransactionFinished);
 			}
+			// Fall back to the generic cursor that wraps `scan`/`scanr` and
+			// advances `rng.start` between batches. Backends that can keep a
+			// native iterator alive across batches override this method.
 			Ok(Box::new(DefaultValsCursor::new(self, rng, dir, version, skip))
 				as Box<dyn ScanCursorVals + 'a>)
 		})
@@ -1093,11 +915,23 @@ pub trait Transactable: requirements::TransactionRequirements {
 			let end = rng.end.clone();
 			// Scan for the next batch (we only need the keys here; the byte
 			// total is intended for metrics consumers higher up the stack)
-			let res = self.keys(rng, ScanLimit::Count(batch), 0, version).await?.keys;
-			// Check if range is consumed
+			let res = self.keys(rng, batch, 0, version).await?.keys;
+			// Short page ⇒ the range is fully consumed; no continuation needed.
 			if res.len() < batch as usize && batch > 0 {
 				Ok(Batch::<Key>::new(None, res))
 			} else {
+				// Full page ⇒ produce a continuation range starting after the
+				// last returned key.
+				//
+				// NOTE: this uses `util::advance_key` (byte-level increment),
+				// which is **not** the same successor as the per-batch cursor
+				// in `DefaultKeysCursor::next_batch` (`push(0x00)`). The
+				// increment would skip every key that has `last` as a strict
+				// byte-prefix (e.g. `a` → `b` jumps past `a\0`, `ab`, ...).
+				// This is safe here only because every current caller passes a
+				// storekey-encoded range, and the storekey escape format is
+				// prefix-free across distinct stored keys. Callers that pass
+				// arbitrary byte ranges should use the cursor API instead.
 				match res.last() {
 					Some(k) => {
 						let mut k = k.clone();
@@ -1110,9 +944,9 @@ pub trait Transactable: requirements::TransactionRequirements {
 							res,
 						))
 					}
-					// We have checked the length above, so
-					// there should be a last item in the
-					// vector, so we shouldn't arrive here
+					// Unreachable: the `len < batch` branch above already
+					// handles the empty-result case, so a full page must
+					// have at least one element.
 					None => Ok(Batch::<Key>::new(None, res)),
 				}
 			}
@@ -1139,11 +973,15 @@ pub trait Transactable: requirements::TransactionRequirements {
 			let end = rng.end.clone();
 			// Scan for the next batch (we only need the values here; the byte
 			// total is intended for metrics consumers higher up the stack)
-			let res = self.scan(rng, ScanLimit::Count(batch), 0, version).await?.values;
-			// Check if range is consumed
+			let res = self.scan(rng, batch, 0, version).await?.values;
+			// Short page ⇒ the range is fully consumed; no continuation needed.
 			if res.len() < batch as usize && batch > 0 {
 				Ok(Batch::<(Key, Val)>::new(None, res))
 			} else {
+				// Full page ⇒ produce a continuation range starting after the
+				// last returned key. See `batch_keys` for why `advance_key`
+				// (used here) differs from the cursor's `push(0x00)`
+				// successor, and why it is safe under the storekey invariant.
 				match res.last() {
 					Some((k, _)) => {
 						let mut k = k.clone();
@@ -1156,9 +994,8 @@ pub trait Transactable: requirements::TransactionRequirements {
 							res,
 						))
 					}
-					// We have checked the length above, so
-					// there should be a last item in the
-					// vector, so we shouldn't arrive here
+					// Unreachable: the `len < batch` branch above already
+					// handles the empty-result case.
 					None => Ok(Batch::<(Key, Val)>::new(None, res)),
 				}
 			}
@@ -1182,7 +1019,12 @@ pub trait Transactable: requirements::TransactionRequirements {
 	// Timestamp functions
 	// --------------------------------------------------
 
-	/// Get the current monotonic timestamp
+	/// Get the current monotonic timestamp.
+	///
+	/// Under `cfg(test)` this returns a deterministic incrementing counter
+	/// (`IncTimeStamp`) so tests are reproducible; in production it returns
+	/// an HLC timestamp (`HlcTimeStamp`) that combines wall-clock time with
+	/// a logical counter for cluster-wide ordering.
 	fn timestamp(&self) -> BoxFut<'_, Result<BoxTimeStamp>> {
 		Box::pin(async move {
 			if cfg!(test) {
@@ -1193,6 +1035,31 @@ pub trait Transactable: requirements::TransactionRequirements {
 		})
 	}
 
+	/// Get the current *safe* (closed) watermark timestamp: a versionstamp at or
+	/// below which every committed transaction is final **and** visible on this
+	/// node.
+	///
+	/// The live-query router uses this as the upper bound of what it delivers in
+	/// a pass, and as the bound it advances its cursor to, so it never advances
+	/// past a commit that could still become visible later with a lower
+	/// versionstamp (which would silently drop that notification).
+	///
+	/// The default returns [`Self::timestamp`], which is correct for any backend
+	/// with a single monotonic oracle and synchronous local visibility (mem,
+	/// rocksdb, surrealkv): everything below a freshly minted stamp is already
+	/// committed and visible. A distributed backend whose commit log is
+	/// non-linear (e.g. SurrealDS, where the highest committed timestamp can
+	/// float above an unapplied lower one) MUST override this to return a genuine
+	/// closed/safe watermark, or the router can miss notifications.
+	fn safe_timestamp(&self) -> BoxFut<'_, Result<BoxTimeStamp>> {
+		self.timestamp()
+	}
+
+	/// Get a handle to the timestamp implementation used by [`Self::timestamp`].
+	///
+	/// Mirrors the same `cfg(test)` swap: deterministic incrementing counter
+	/// in tests, HLC in production. Callers that need to mint many
+	/// timestamps in a row can hold the impl and avoid re-dispatching.
 	fn timestamp_impl(&self) -> BoxTimeStampImpl {
 		if cfg!(test) {
 			Box::new(IncTimeStampImpl)
@@ -1201,6 +1068,14 @@ pub trait Transactable: requirements::TransactionRequirements {
 		}
 	}
 
+	/// Hint the backend to compact the given range (or the whole keyspace if
+	/// `None`).
+	///
+	/// Default impl returns [`Error::CompactionNotSupported`]; backends
+	/// whose storage engine exposes a compaction primitive (e.g. RocksDB)
+	/// override this. The call is advisory — callers must not rely on it
+	/// for correctness, only for reclaiming space / improving read
+	/// performance.
 	fn compact(&self, _range: Option<Range<Key>>) -> BoxFut<'_, anyhow::Result<()>> {
 		Box::pin(async move { bail!(Error::CompactionNotSupported) })
 	}

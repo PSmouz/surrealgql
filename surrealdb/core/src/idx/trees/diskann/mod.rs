@@ -7,8 +7,9 @@
 //!
 //! The persisted graph uses the `!d*` index key families: graph state (`!ds`), element payloads
 //! (`!de`), adjacency nodes (`!dn`), record/document mappings (`!di`/`!dd`), vector/document
-//! mappings (`!dq`/`!dh`), pending operations (`!dr`), compaction generation (`!dg`), and the
-//! distributed-safe pending-state guard (`!dp`).
+//! mappings (`!dq`/`!dh`), sharded pending operations (`!dw`) with their per-shard guard (`!dy`),
+//! compaction generation (`!dg`), and — for the dual-read migration off the pre-sharding layout —
+//! the legacy unsharded pending operations (`!dr`) and their legacy guard (`!dp`).
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod cache;

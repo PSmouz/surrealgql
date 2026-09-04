@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "SET updates a matched node's property; RETURN projects the post-mutation (AFTER) value."
+
+[[test.results]]
+value = "[{ age: 99 }]"
+*/
+
+MATCH (n:person WHERE n.name = 'A') SET n.age = 99 RETURN n.age AS age

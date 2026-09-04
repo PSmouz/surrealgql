@@ -46,8 +46,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use web_time::Instant;
 
 use super::api::{
-	BoxFut, GetMultiResult, KeySpan, KeyValSpan, KeysBatch, KeysResult, ScanCursorKeys,
-	ScanCursorVals, ScanLimit, ScanResult, ValsBatch,
+	BoxFut, GetMultiResult, KeySpan, KeyValSpan, KeyVisitor, KeysBatch, KeysResult, ScanChunkStats,
+	ScanCursorKeys, ScanCursorVals, ScanResult, ValVisitor, ValsBatch,
 };
 use super::config::SyncMode;
 use super::err::{Error, Result};
@@ -1137,7 +1137,7 @@ impl Transaction {
 	fn keys_blocking(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 		dir: Direction,
@@ -1192,7 +1192,7 @@ impl Transaction {
 	fn scan_blocking(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 		dir: Direction,
@@ -1419,42 +1419,68 @@ async fn drain_cursors(tx: &Transaction) {
 /// truly stuck cursor produces a loud, single-line signal in logs.
 const DRAIN_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
+/// First-call seek + leading-skip shared by the keys/vals `fill`/`visit`
+/// drivers. Seeks the iterator to the range's near edge (forward → `start`,
+/// backward → `end`), then burns the pending `skip` directly against the
+/// iterator without materialising anything. Returns `Ok(false)` if the skip
+/// walked past the end of the range (the caller returns an empty result),
+/// `Ok(true)` otherwise. A no-op once `started` is set.
+fn seek_and_skip(
+	iter: &mut ScanIter,
+	dir: Direction,
+	started: &mut bool,
+	skip: &mut u32,
+	start: &Key,
+	end: &Key,
+) -> Result<bool> {
+	if *started {
+		return Ok(true);
+	}
+	match (&mut *iter, dir) {
+		(ScanIter::Db(it), Direction::Forward) => it.seek(start),
+		(ScanIter::Db(it), Direction::Backward) => it.seek_for_prev(end),
+		(ScanIter::Tx(it), Direction::Forward) => it.seek(start),
+		(ScanIter::Tx(it), Direction::Backward) => it.seek_for_prev(end),
+	}
+	*started = true;
+	let n = std::mem::take(skip);
+	for _ in 0..n {
+		let still_valid = match &mut *iter {
+			ScanIter::Db(it) => it.valid().then(|| match dir {
+				Direction::Forward => it.next(),
+				Direction::Backward => it.prev(),
+			}),
+			ScanIter::Tx(it) => it.valid().then(|| match dir {
+				Direction::Forward => it.next(),
+				Direction::Backward => it.prev(),
+			}),
+		};
+		if still_valid.is_none() {
+			match &*iter {
+				ScanIter::Db(it) => it.status()?,
+				ScanIter::Tx(it) => it.status()?,
+			}
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
 /// Perform the first-time seek (if not yet done), then iterate the
 /// underlying `DBRawIterator`, copying each key into `state.key_buf` and
 /// recording its `(offset, len)` in `state.key_spans`. Returns the total
 /// key bytes for the batch. Both buffers are reused across calls — the
 /// caller is responsible for clearing them before invoking this helper.
-fn fill_keys_into_state(state: &mut ScanStateKeys, limit: ScanLimit) -> Result<u64> {
-	if !state.started {
-		match (&mut state.iter, state.dir) {
-			(ScanIter::Db(iter), Direction::Forward) => iter.seek(&state.start),
-			(ScanIter::Db(iter), Direction::Backward) => iter.seek_for_prev(&state.end),
-			(ScanIter::Tx(iter), Direction::Forward) => iter.seek(&state.start),
-			(ScanIter::Tx(iter), Direction::Backward) => iter.seek_for_prev(&state.end),
-		}
-		state.started = true;
-		// Burn the pending skip directly against the iterator without
-		// materialising or copying anything.
-		let skip = std::mem::take(&mut state.skip);
-		for _ in 0..skip {
-			let still_valid = match &mut state.iter {
-				ScanIter::Db(iter) => iter.valid().then(|| match state.dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				}),
-				ScanIter::Tx(iter) => iter.valid().then(|| match state.dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				}),
-			};
-			if still_valid.is_none() {
-				match &state.iter {
-					ScanIter::Db(iter) => iter.status()?,
-					ScanIter::Tx(iter) => iter.status()?,
-				}
-				return Ok(0);
-			}
-		}
+fn fill_keys_into_state(state: &mut ScanStateKeys, limit: u32) -> Result<u64> {
+	if !seek_and_skip(
+		&mut state.iter,
+		state.dir,
+		&mut state.started,
+		&mut state.skip,
+		&state.start,
+		&state.end,
+	)? {
+		return Ok(0);
 	}
 	match &mut state.iter {
 		ScanIter::Db(iter) => {
@@ -1469,35 +1495,16 @@ fn fill_keys_into_state(state: &mut ScanStateKeys, limit: ScanLimit) -> Result<u
 /// Same as [`fill_keys_into_state`], for key+value pairs. Fills
 /// `state.key_buf`, `state.val_buf`, and `state.spans`. Returns
 /// `(key_bytes, value_bytes)` for the batch.
-fn fill_vals_into_state(state: &mut ScanStateVals, limit: ScanLimit) -> Result<(u64, u64)> {
-	if !state.started {
-		match (&mut state.iter, state.dir) {
-			(ScanIter::Db(iter), Direction::Forward) => iter.seek(&state.start),
-			(ScanIter::Db(iter), Direction::Backward) => iter.seek_for_prev(&state.end),
-			(ScanIter::Tx(iter), Direction::Forward) => iter.seek(&state.start),
-			(ScanIter::Tx(iter), Direction::Backward) => iter.seek_for_prev(&state.end),
-		}
-		state.started = true;
-		let skip = std::mem::take(&mut state.skip);
-		for _ in 0..skip {
-			let still_valid = match &mut state.iter {
-				ScanIter::Db(iter) => iter.valid().then(|| match state.dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				}),
-				ScanIter::Tx(iter) => iter.valid().then(|| match state.dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				}),
-			};
-			if still_valid.is_none() {
-				match &state.iter {
-					ScanIter::Db(iter) => iter.status()?,
-					ScanIter::Tx(iter) => iter.status()?,
-				}
-				return Ok((0, 0));
-			}
-		}
+fn fill_vals_into_state(state: &mut ScanStateVals, limit: u32) -> Result<(u64, u64)> {
+	if !seek_and_skip(
+		&mut state.iter,
+		state.dir,
+		&mut state.started,
+		&mut state.skip,
+		&state.start,
+		&state.end,
+	)? {
+		return Ok((0, 0));
 	}
 	match &mut state.iter {
 		ScanIter::Db(iter) => fill_vals_inner(
@@ -1524,18 +1531,9 @@ fn fill_vals_into_state(state: &mut ScanStateVals, limit: ScanLimit) -> Result<(
 /// `Vec::extend_from_slice` reallocations on the first batch of a fresh
 /// cursor; subsequent batches already have capacity from peak usage.
 #[inline]
-fn reserve_for_keys(limit: ScanLimit, key_buf: &mut Vec<u8>, key_spans: &mut Vec<KeySpan>) {
-	let (bytes, count) = match limit {
-		ScanLimit::Count(c) => {
-			let c = c as usize;
-			(c.saturating_mul(ESTIMATED_BYTES_PER_KEY as usize), c)
-		}
-		ScanLimit::Bytes(b) => (b as usize, b as usize / ESTIMATED_BYTES_PER_KEY as usize),
-		ScanLimit::BytesOrCount(b, c) => {
-			let c = c as usize;
-			((b as usize).min(c.saturating_mul(ESTIMATED_BYTES_PER_KEY as usize)), c)
-		}
-	};
+fn reserve_for_keys(limit: u32, key_buf: &mut Vec<u8>, key_spans: &mut Vec<KeySpan>) {
+	let count = limit as usize;
+	let bytes = count.saturating_mul(ESTIMATED_BYTES_PER_KEY as usize);
 	let need_buf = bytes.saturating_sub(key_buf.capacity());
 	if need_buf > 0 {
 		key_buf.reserve(need_buf);
@@ -1549,22 +1547,13 @@ fn reserve_for_keys(limit: ScanLimit, key_buf: &mut Vec<u8>, key_spans: &mut Vec
 /// Reserve capacity for a key+value batch. See [`reserve_for_keys`].
 #[inline]
 fn reserve_for_vals(
-	limit: ScanLimit,
+	limit: u32,
 	key_buf: &mut Vec<u8>,
 	val_buf: &mut Vec<u8>,
 	spans: &mut Vec<KeyValSpan>,
 ) {
-	let (bytes, count) = match limit {
-		ScanLimit::Count(c) => {
-			let c = c as usize;
-			(c.saturating_mul(ESTIMATED_BYTES_PER_KV as usize), c)
-		}
-		ScanLimit::Bytes(b) => (b as usize, b as usize / ESTIMATED_BYTES_PER_KV as usize),
-		ScanLimit::BytesOrCount(b, c) => {
-			let c = c as usize;
-			((b as usize).min(c.saturating_mul(ESTIMATED_BYTES_PER_KV as usize)), c)
-		}
-	};
+	let count = limit as usize;
+	let bytes = count.saturating_mul(ESTIMATED_BYTES_PER_KV as usize);
 	// Split the byte budget across key and value buffers roughly evenly;
 	// the exact split is an estimate, growth past it is one extra
 	// reallocation per buffer per batch in the worst case.
@@ -1599,7 +1588,7 @@ fn reserve_for_vals(
 /// persists).
 fn fill_keys_inner<D: rocksdb::DBAccess>(
 	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
-	limit: ScanLimit,
+	limit: u32,
 	dir: Direction,
 	key_buf: &mut Vec<u8>,
 	key_spans: &mut Vec<KeySpan>,
@@ -1618,54 +1607,18 @@ fn fill_keys_inner<D: rocksdb::DBAccess>(
 			len,
 		});
 	};
-	match limit {
-		ScanLimit::Count(c) => {
-			let c = c as u64;
-			let mut count = 0u64;
-			while count < c {
-				let Some(k) = iter.key() else {
-					break;
-				};
-				push_key(k, key_buf, key_spans);
-				key_bytes += k.len() as u64;
-				count += 1;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
-		ScanLimit::Bytes(b) => {
-			let b = b as u64;
-			while key_bytes < b {
-				let Some(k) = iter.key() else {
-					break;
-				};
-				push_key(k, key_buf, key_spans);
-				key_bytes += k.len() as u64;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			let b = b as u64;
-			let c = c as u64;
-			let mut count = 0u64;
-			while count < c && key_bytes < b {
-				let Some(k) = iter.key() else {
-					break;
-				};
-				push_key(k, key_buf, key_spans);
-				key_bytes += k.len() as u64;
-				count += 1;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
+	let mut count = 0u64;
+	while count < limit as u64 {
+		let Some(k) = iter.key() else {
+			break;
+		};
+		push_key(k, key_buf, key_spans);
+		key_bytes += k.len() as u64;
+		count += 1;
+		match dir {
+			Direction::Forward => iter.next(),
+			Direction::Backward => iter.prev(),
+		};
 	}
 	iter.status()?;
 	Ok(key_bytes)
@@ -1675,7 +1628,7 @@ fn fill_keys_inner<D: rocksdb::DBAccess>(
 /// [`fill_keys_inner`].
 fn fill_vals_inner<D: rocksdb::DBAccess>(
 	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
-	limit: ScanLimit,
+	limit: u32,
 	dir: Direction,
 	key_buf: &mut Vec<u8>,
 	val_buf: &mut Vec<u8>,
@@ -1703,65 +1656,19 @@ fn fill_vals_inner<D: rocksdb::DBAccess>(
 			val_len,
 		});
 	};
-	match limit {
-		ScanLimit::Count(c) => {
-			let c = c as u64;
-			let mut count = 0u64;
-			while count < c {
-				let Some((k, v)) = iter.item() else {
-					break;
-				};
-				push_pair(k, v, key_buf, val_buf, spans);
-				key_bytes += k.len() as u64;
-				value_bytes += v.len() as u64;
-				count += 1;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
-		ScanLimit::Bytes(b) => {
-			let b = b as u64;
-			let mut bytes_fetched = 0u64;
-			while bytes_fetched < b {
-				let Some((k, v)) = iter.item() else {
-					break;
-				};
-				let kl = k.len() as u64;
-				let vl = v.len() as u64;
-				push_pair(k, v, key_buf, val_buf, spans);
-				bytes_fetched += kl + vl;
-				key_bytes += kl;
-				value_bytes += vl;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			let b = b as u64;
-			let c = c as u64;
-			let mut count = 0u64;
-			let mut bytes_fetched = 0u64;
-			while count < c && bytes_fetched < b {
-				let Some((k, v)) = iter.item() else {
-					break;
-				};
-				let kl = k.len() as u64;
-				let vl = v.len() as u64;
-				push_pair(k, v, key_buf, val_buf, spans);
-				bytes_fetched += kl + vl;
-				key_bytes += kl;
-				value_bytes += vl;
-				count += 1;
-				match dir {
-					Direction::Forward => iter.next(),
-					Direction::Backward => iter.prev(),
-				};
-			}
-		}
+	let mut count = 0u64;
+	while count < limit as u64 {
+		let Some((k, v)) = iter.item() else {
+			break;
+		};
+		push_pair(k, v, key_buf, val_buf, spans);
+		key_bytes += k.len() as u64;
+		value_bytes += v.len() as u64;
+		count += 1;
+		match dir {
+			Direction::Forward => iter.next(),
+			Direction::Backward => iter.prev(),
+		};
 	}
 	iter.status()?;
 	Ok((key_bytes, value_bytes))
@@ -1784,7 +1691,7 @@ fn fill_vals_inner<D: rocksdb::DBAccess>(
 /// only `limit`.
 pub(in crate::kvs::rocksdb) async fn cursor_next_keys<'s>(
 	cursor: &'s mut RocksDbKeysCursor<'_>,
-	limit: ScanLimit,
+	limit: u32,
 ) -> Result<KeysBatch<'s>> {
 	// Best-effort early-exit on a stale handle. Cursor-vs-commit safety
 	// is already guaranteed by the `cursors_alive` drain + the borrow
@@ -1813,7 +1720,7 @@ pub(in crate::kvs::rocksdb) async fn cursor_next_keys<'s>(
 /// [`cursor_next_keys`].
 pub(in crate::kvs::rocksdb) async fn cursor_next_vals<'s>(
 	cursor: &'s mut RocksDbValsCursor<'_>,
-	limit: ScanLimit,
+	limit: u32,
 ) -> Result<ValsBatch<'s>> {
 	// Best-effort early-exit on a stale handle. Cursor-vs-commit safety
 	// is already guaranteed by the `cursors_alive` drain + the borrow
@@ -1840,6 +1747,161 @@ pub(in crate::kvs::rocksdb) async fn cursor_next_vals<'s>(
 		key_bytes,
 		value_bytes,
 	))
+}
+
+/// Drive `f` over up to `limit` `(key, value)` pairs read directly from the
+/// iterator — zero-copy: the engine's borrowed slices go straight to the
+/// visitor with no intermediate buffer. Advances after each row so the borrow
+/// ends before the next read. `f` returning `Break` stops the chunk.
+fn visit_vals_inner<D: rocksdb::DBAccess>(
+	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
+	limit: u32,
+	dir: Direction,
+	f: &mut dyn ValVisitor,
+) -> Result<ScanChunkStats> {
+	let mut stats = ScanChunkStats::default();
+	while stats.rows < limit as u64 {
+		let Some((k, v)) = iter.item() else {
+			break;
+		};
+		// Count only after the visitor accepts the row: a visitor error
+		// (`?`) returns before the advance below, so an uncounted-but-
+		// unadvanced row never lands in `stats`.
+		let flow = f(k, v)?;
+		stats.rows += 1;
+		stats.key_bytes += k.len() as u64;
+		stats.value_bytes += v.len() as u64;
+		match dir {
+			Direction::Forward => iter.next(),
+			Direction::Backward => iter.prev(),
+		};
+		if let std::ops::ControlFlow::Break(()) = flow {
+			break;
+		}
+	}
+	iter.status()?;
+	Ok(stats)
+}
+
+/// First-call seek + skip (identical to [`fill_vals_into_state`]), then drive
+/// the visitor via [`visit_vals_inner`]. The pinned iterator advances across
+/// calls, so there is no successor-key bookkeeping — exhaustion is
+/// `iter.item() == None`.
+fn visit_vals_into_state(
+	state: &mut ScanStateVals,
+	limit: u32,
+	f: &mut dyn ValVisitor,
+) -> Result<ScanChunkStats> {
+	if !seek_and_skip(
+		&mut state.iter,
+		state.dir,
+		&mut state.started,
+		&mut state.skip,
+		&state.start,
+		&state.end,
+	)? {
+		return Ok(ScanChunkStats::default());
+	}
+	match &mut state.iter {
+		ScanIter::Db(iter) => visit_vals_inner(iter, limit, state.dir, f),
+		ScanIter::Tx(iter) => visit_vals_inner(iter, limit, state.dir, f),
+	}
+}
+
+/// Drive the visitor over the next chunk of `(key, value)` pairs. Like
+/// [`cursor_next_vals`], this dispatches through `try_inline_or_offload`: the
+/// whole chunk (seek + iterate + visit) runs inline on the calling tokio worker
+/// when a permit is free, otherwise on `affinitypool` — keeping the
+/// potentially-disk-blocking RocksDB iterator work off the async runtime under
+/// contention. Offloading the chunk as one unit (rather than per row) keeps it
+/// zero-copy and pays at most one hop per chunk. `try_inline_or_offload` takes a
+/// borrowing closure, so the visitor needn't be `'static`; the `ValVisitor`
+/// bound guarantees the required `Send` (rocksdb is native-only, so it always
+/// holds). The visitor — including record decode — therefore runs on the pool
+/// thread when offloaded, which is the right place for that CPU work.
+pub(in crate::kvs::rocksdb) async fn cursor_for_each_vals(
+	cursor: &mut RocksDbValsCursor<'_>,
+	limit: u32,
+	f: &mut dyn ValVisitor,
+) -> Result<ScanChunkStats> {
+	if cursor.tx.done.load(Ordering::Relaxed) {
+		return Err(Error::TransactionFinished);
+	}
+	let state: &mut ScanStateVals = &mut cursor.state;
+	cursor
+		.tx
+		.inline_guard
+		.try_inline_or_offload(move || visit_vals_into_state(state, limit, f))
+		.await
+}
+
+/// Keys-only zero-copy visitor over the iterator. See [`visit_vals_inner`].
+fn visit_keys_inner<D: rocksdb::DBAccess>(
+	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
+	limit: u32,
+	dir: Direction,
+	f: &mut dyn KeyVisitor,
+) -> Result<ScanChunkStats> {
+	let mut stats = ScanChunkStats::default();
+	while stats.rows < limit as u64 {
+		let Some(k) = iter.key() else {
+			break;
+		};
+		// Count only after the visitor accepts the row (see `visit_vals_inner`).
+		let flow = f(k)?;
+		stats.rows += 1;
+		stats.key_bytes += k.len() as u64;
+		match dir {
+			Direction::Forward => iter.next(),
+			Direction::Backward => iter.prev(),
+		};
+		if let std::ops::ControlFlow::Break(()) = flow {
+			break;
+		}
+	}
+	iter.status()?;
+	Ok(stats)
+}
+
+/// First-call seek + skip (see [`fill_keys_into_state`]), then drive the keys
+/// visitor via [`visit_keys_inner`].
+fn visit_keys_into_state(
+	state: &mut ScanStateKeys,
+	limit: u32,
+	f: &mut dyn KeyVisitor,
+) -> Result<ScanChunkStats> {
+	if !seek_and_skip(
+		&mut state.iter,
+		state.dir,
+		&mut state.started,
+		&mut state.skip,
+		&state.start,
+		&state.end,
+	)? {
+		return Ok(ScanChunkStats::default());
+	}
+	match &mut state.iter {
+		ScanIter::Db(iter) => visit_keys_inner(iter, limit, state.dir, f),
+		ScanIter::Tx(iter) => visit_keys_inner(iter, limit, state.dir, f),
+	}
+}
+
+/// Drive the keys visitor over the next chunk. Dispatched through
+/// `try_inline_or_offload` like [`cursor_for_each_vals`].
+pub(in crate::kvs::rocksdb) async fn cursor_for_each_keys(
+	cursor: &mut RocksDbKeysCursor<'_>,
+	limit: u32,
+	f: &mut dyn KeyVisitor,
+) -> Result<ScanChunkStats> {
+	if cursor.tx.done.load(Ordering::Relaxed) {
+		return Err(Error::TransactionFinished);
+	}
+	let state: &mut ScanStateKeys = &mut cursor.state;
+	cursor
+		.tx
+		.inline_guard
+		.try_inline_or_offload(move || visit_keys_into_state(state, limit, f))
+		.await
 }
 
 impl Transactable for Transaction {
@@ -2202,7 +2264,7 @@ impl Transactable for Transaction {
 
 	/// Count the total number of keys within a range.
 	///
-	/// `count()` has no `ScanLimit` parameter, so it always iterates the
+	/// `count()` has no limit parameter, so it always iterates the
 	/// entire provided key range without an early-exit limit. It is therefore
 	/// always offloaded to the blocking threadpool to avoid stalling the
 	/// async executor during the full range scan.
@@ -2327,7 +2389,7 @@ impl Transactable for Transaction {
 	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -2368,7 +2430,7 @@ impl Transactable for Transaction {
 	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -2409,7 +2471,7 @@ impl Transactable for Transaction {
 	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -2450,7 +2512,7 @@ impl Transactable for Transaction {
 	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -2662,7 +2724,7 @@ impl Transactable for Transaction {
 // Consume and iterate over only keys
 fn consume_keys<D: rocksdb::DBAccess>(
 	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
-	limit: ScanLimit,
+	limit: u32,
 	skip: u32,
 	dir: Direction,
 ) -> Result<KeysResult> {
@@ -2681,65 +2743,22 @@ fn consume_keys<D: rocksdb::DBAccess>(
 		}
 	}
 	let mut key_bytes = 0u64;
-	let keys = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key
-				if let Some(k) = iter.key() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut keys = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while keys.len() < limit as usize {
+		// Check the key
+		if let Some(k) = iter.key() {
+			key_bytes += k.len() as u64;
+			keys.push(k.to_vec());
+			match dir {
+				Direction::Forward => iter.next(),
+				Direction::Backward => iter.prev(),
+			};
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KEY).min(4096) as usize);
-			// Check that we don't exceed the byte limit
-			while key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.key() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.key() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	// Catch any iterator errors
 	iter.status()?;
 	// Return the result
@@ -2752,7 +2771,7 @@ fn consume_keys<D: rocksdb::DBAccess>(
 // Consume and iterate over keys and values
 fn consume_vals<D: rocksdb::DBAccess>(
 	iter: &mut rocksdb::DBRawIteratorWithThreadMode<'_, D>,
-	limit: ScanLimit,
+	limit: u32,
 	skip: u32,
 	dir: Direction,
 ) -> Result<ScanResult> {
@@ -2770,89 +2789,26 @@ fn consume_vals<D: rocksdb::DBAccess>(
 			return Ok(ScanResult::default());
 		}
 	}
-	// Track the cumulative bytes for the metric. The byte-bounded limit
-	// branches still rely on `bytes_fetched` (key + value bytes) to decide
-	// when to stop, so the two counters are kept separate.
+	// Track the cumulative key/value bytes for the scan metrics.
 	let mut key_bytes = 0u64;
 	let mut value_bytes = 0u64;
-	let values = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key and value
-				if let Some((k, v)) = iter.item() {
-					key_bytes += k.len() as u64;
-					value_bytes += v.len() as u64;
-					res.push((k.to_vec(), v.to_vec()));
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut values = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while values.len() < limit as usize {
+		// Check the key and value
+		if let Some((k, v)) = iter.item() {
+			key_bytes += k.len() as u64;
+			value_bytes += v.len() as u64;
+			values.push((k.to_vec(), v.to_vec()));
+			match dir {
+				Direction::Forward => iter.next(),
+				Direction::Backward => iter.prev(),
+			};
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KV).min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the byte limit
-			while bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some((k, v)) = iter.item() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((k.to_vec(), v.to_vec()));
-
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some((k, v)) = iter.item() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((k.to_vec(), v.to_vec()));
-
-					match dir {
-						Direction::Forward => iter.next(),
-						Direction::Backward => iter.prev(),
-					};
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	// Catch any iterator errors
 	iter.status()?;
 	// Return the result

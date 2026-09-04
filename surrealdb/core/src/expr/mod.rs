@@ -30,6 +30,8 @@ pub(crate) mod language;
 pub(crate) mod limit;
 pub(crate) mod literal;
 pub(crate) mod lookup;
+#[cfg(feature = "gql")]
+pub(crate) mod match_plan;
 pub(crate) mod mock;
 pub(crate) mod model;
 pub(crate) mod operation;
@@ -81,6 +83,11 @@ pub(crate) use self::kind::{Kind, KindLiteral};
 pub(crate) use self::limit::Limit;
 pub(crate) use self::literal::{Literal, ObjectEntry};
 pub(crate) use self::lookup::Lookup;
+// Re-exported for the GQL lowering and the streaming planner (PR-A landing
+// piecemeal); not yet referenced through this alias in this crate.
+#[cfg(feature = "gql")]
+#[allow(unused_imports)]
+pub(crate) use self::match_plan::MatchPlan;
 pub(crate) use self::mock::Mock;
 pub(crate) use self::model::Model;
 pub(crate) use self::module::{ModuleExecutable, SiloExecutable, SurrealismExecutable};

@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "R2 DIFFERENT-EDGES PIN with the dropped row made witnessable. One MATCH statement, two edge positions k1 and k2 that share the start node `a`; both edges can range over a's outgoing knows edges, so the SAME edge record can land in both positions. Anchoring on a = B (the only person with two outgoing person edges: k21->A, k23->C) gives 4 raw (k1,k2) combinations; R2 requires k1 != k2 as edge RECORDS, dropping the two diagonal combos (k21,k21) and (k23,k23) and keeping the two off-diagonal ones. Returning the edge ids alongside the target names witnesses exactly which rows survive: (k1=k21->A, k2=k23->C) and (k1=k23->C, k2=k21->A)."
+
+[[test.results]]
+value = "[{ b: 'A', c: 'C', e1: knows:k21, e2: knows:k23 }, { b: 'C', c: 'A', e1: knows:k23, e2: knows:k21 }]"
+*/
+
+MATCH (a:person)-[k1:knows]->(b:person), (a)-[k2:knows]->(c:person)
+WHERE a.name = 'B'
+RETURN b.name AS b, c.name AS c, k1.id AS e1, k2.id AS e2 ORDER BY b, c

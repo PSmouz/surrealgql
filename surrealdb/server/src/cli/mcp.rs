@@ -81,11 +81,6 @@ pub async fn init<
 	}: McpCommandArguments,
 	runtime: ObservabilityRuntime,
 ) -> Result<()> {
-	// Install the rustls process-default crypto provider before any TLS
-	// operations occur. Under `feature = "fips"` this asserts FIPS mode is
-	// active and aborts startup otherwise.
-	crate::tls::install_default_crypto_provider()?;
-
 	C::path_valid(&path)?;
 
 	let endpoint = any::__into_endpoint(path)?;
@@ -123,8 +118,11 @@ pub async fn init<
 	);
 
 	let canceller = CancellationToken::new();
-	let (datastore, _recv, _router_state) =
+	let (datastore, _recv, _router_state, pending_startup) =
 		dbs::init::<C>(composer, &config, canceller.clone(), observer, dbs_opts).await?;
+	// The MCP server has no HTTP listener to bind, so run the deferred startup
+	// work (import then credentials) inline before serving any tool requests.
+	dbs::finish_startup(&datastore, &pending_startup).await?;
 	let datastore = Arc::new(datastore);
 
 	// The STDIO transport is a locally-trusted, in-process connection: the

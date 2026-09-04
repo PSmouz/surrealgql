@@ -1,0 +1,15 @@
+/**
+[bench]
+reason = "GQL variable-length MATCH `-[:link]->{1,4}(b)` (per-path) over a 2000-node ring lattice (out-degree 2). Exercises PathExpand: from every node, walk distinct-edge paths of length 1..4 and emit one row per path. 30 paths per start -> 60000 result paths. Bounds (depth 4, degree 2) chosen to stress per-path bookkeeping without combinatorial blow-up."
+run = true
+rebuild = false
+imports = ["bench/gql/util/lattice-2000.surql"]
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+MATCH (a:node)-[:link]->{1,4}(b:node)
+RETURN a.name AS a, b.name AS b

@@ -1,0 +1,32 @@
+//! GQL (ISO/IEC 39075) query execution.
+
+use rmcp::ErrorData;
+use rmcp::model::CallToolResult;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use super::{json_to_variables, multi_statement_result};
+use crate::session::McpSession;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GqlParams {
+	/// The GQL (ISO/IEC 39075) query to execute, e.g.
+	/// `MATCH (p:person) RETURN p.name AS name ORDER BY name`.
+	pub query: String,
+	/// Optional JSON object of parameter bindings (e.g. {"name": "John"}).
+	/// Values are bound with their native types -- numbers stay numbers,
+	/// objects stay objects. Use `{"$ql": "<surrealql expr>"}` to embed typed
+	/// SurrealDB values such as decimals, datetimes, durations, record ids, or
+	/// uuids.
+	pub parameters: Option<serde_json::Value>,
+}
+
+pub async fn execute(session: &McpSession, params: GqlParams) -> Result<CallToolResult, ErrorData> {
+	let core = session.datastore().config();
+	let vars = match params.parameters {
+		Some(ref json) => Some(json_to_variables(json, session.config(), core.as_ref())?),
+		None => None,
+	};
+	let results = session.execute_gql(&params.query, vars).await?;
+	Ok(multi_statement_result(results, session.config().max_result_bytes))
+}

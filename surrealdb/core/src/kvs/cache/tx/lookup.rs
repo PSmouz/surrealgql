@@ -51,6 +51,9 @@ pub(crate) enum Lookup<'a> {
 	Sqs(NamespaceId, DatabaseId),
 	/// A cache key for tables
 	Tbs(NamespaceId, DatabaseId),
+	/// A cache key for the database-wide reference-target summary consumed by
+	/// the DELETE purge gate (which tables any `REFERENCE` field can target).
+	DbReferenceTargets(NamespaceId, DatabaseId),
 	/// A cache key for events (on a table)
 	Evs(NamespaceId, DatabaseId, &'a str),
 	/// A cache key for fields (on a table)
@@ -146,6 +149,7 @@ impl Equivalent<Key> for Lookup<'_> {
 			(Self::Pas(la, lb), Key::Pas(ka, kb)) => la == ka && lb == kb,
 			(Self::Sqs(la, lb), Key::Sqs(ka, kb)) => la == ka && lb == kb,
 			(Self::Tbs(la, lb), Key::Tbs(ka, kb)) => la == ka && lb == kb,
+			(Self::DbReferenceTargets(la, lb), Key::DbReferenceTargets(ka, kb)) => la == ka && lb == kb,
 			(Self::Evs(la, lb, lc), Key::Evs(ka, kb, kc)) => la == ka && lb == kb && lc == kc,
 			(Self::Fds(la, lb, lc), Key::Fds(ka, kb, kc)) => la == ka && lb == kb && lc == kc,
 			(Self::Fts(la, lb, lc), Key::Fts(ka, kb, kc)) => la == ka && lb == kb && lc == kc,
@@ -251,6 +255,11 @@ mod tests {
 	#[case(
 		Lookup::Tbs(NamespaceId(1), DatabaseId(1)),
 		Key::Tbs(NamespaceId(1), DatabaseId(1)),
+		true
+	)]
+	#[case(
+		Lookup::DbReferenceTargets(NamespaceId(1), DatabaseId(1)),
+		Key::DbReferenceTargets(NamespaceId(1), DatabaseId(1)),
 		true
 	)]
 	#[case(Lookup::Evs(NamespaceId(1), DatabaseId(1), "test"), Key::Evs(NamespaceId(1), DatabaseId(1), "test".to_string()), true)]

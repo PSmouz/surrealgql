@@ -16,6 +16,8 @@ use crate::val::{Duration, RecordId, RecordIdKey, TableName};
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct RelateStatement {
 	pub only: bool,
+	/// When true, update an existing edge record with the same explicit id.
+	pub or_update: bool,
 	/// The expression resulting in the table through which we create a relation
 	pub through: Expr,
 	/// The expression the relation is from

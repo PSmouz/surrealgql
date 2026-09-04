@@ -7,6 +7,8 @@ use crate::sql::{Data, Expr, Literal, Output, RecordIdKeyLit, RecordIdLit};
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub(crate) struct RelateStatement {
 	pub only: bool,
+	/// When true, update an existing edge record with the same explicit id.
+	pub or_update: bool,
 	/// The expression through which we create a relation
 	pub through: Expr,
 	/// The expression the relation is from
@@ -26,6 +28,9 @@ impl ToSql for RelateStatement {
 		write_sql!(f, fmt, "RELATE");
 		if self.only {
 			write_sql!(f, fmt, " ONLY");
+		}
+		if self.or_update {
+			write_sql!(f, fmt, " OR UPDATE");
 		}
 		write_sql!(f, fmt, " ");
 
@@ -104,6 +109,7 @@ impl From<RelateStatement> for crate::expr::statements::RelateStatement {
 	fn from(v: RelateStatement) -> Self {
 		crate::expr::statements::RelateStatement {
 			only: v.only,
+			or_update: v.or_update,
 			through: v.through.into(),
 			from: v.from.into(),
 			to: v.to.into(),
@@ -118,6 +124,7 @@ impl From<crate::expr::statements::RelateStatement> for RelateStatement {
 	fn from(v: crate::expr::statements::RelateStatement) -> Self {
 		RelateStatement {
 			only: v.only,
+			or_update: v.or_update,
 			through: v.through.into(),
 			from: v.from.into(),
 			to: v.to.into(),

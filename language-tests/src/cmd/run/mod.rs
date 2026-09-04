@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::io::IsTerminal;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,14 +14,16 @@ use surrealdb_core::dbs::Session;
 use surrealdb_core::dbs::capabilities::ExperimentalTarget;
 use surrealdb_core::env::VERSION;
 use surrealdb_core::kvs::Datastore;
-use surrealdb_core::syn;
+use surrealdb_core::{gql, syn};
+use surrealdb_types::Value as SurValue;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::cli::{Backend, ColorMode, ResultsMode};
 use crate::cmd::run::provisioner::CanReuse;
-use crate::cmd::util;
+use crate::cmd::{graphql, util};
 use crate::format::{IndentFormatter, Progress, ansi};
 use crate::runner::Schedular;
+use crate::tests::case::Dialect;
 use crate::tests::report::{TestGrade, TestReport, TestTaskResult};
 use crate::tests::run::{CaseImports, RunConfig};
 use crate::tests::schema::{ENV_DEFAULT_TIMEOUT, NewPlannerStrategyConfig};
@@ -341,7 +344,10 @@ pub async fn schedule_run(
 
 /// Checks for keys retained in the datastore after clean up which should not be there.
 async fn check_retained_keys(dbs: &Datastore) -> Result<Vec<Vec<u8>>> {
-	const ALLOWED_KEY_PREFIXES: &[&[u8]] = &[b"/!ni", b"/!nh", b"/!nd", b"/!ic"];
+	// `/!tl` are task-lease keys (e.g. written when the tombstone-reclaim task
+	// acquires its lease during cleanup); like `/!ic` they are background-task
+	// infrastructure that legitimately persists, not leaked test data.
+	const ALLOWED_KEY_PREFIXES: &[&[u8]] = &[b"/!ni", b"/!nh", b"/!nd", b"/!ic", b"/!tl"];
 
 	let txn = dbs
 		.transaction(
@@ -357,16 +363,84 @@ async fn check_retained_keys(dbs: &Datastore) -> Result<Vec<Vec<u8>>> {
 		.collect())
 }
 
+/// The outcome of running a test body via [`run_test_body`], before the
+/// datastore is cleaned up.
+enum BodyOutcome {
+	/// The body exited before the query executed (failed import / signup /
+	/// signin / parse / lower). This is the final result for the test — the query
+	/// never ran, so no retained-key check is performed.
+	Early(TestTaskResult),
+	/// The query executed. The result still needs the post-run retained-key check
+	/// before it is finalised into a [`TestTaskResult`].
+	Executed {
+		did_timeout: bool,
+		result: Result<Vec<Result<SurValue, String>>, anyhow::Error>,
+	},
+}
+
 async fn run_test_with_dbs(
 	run: &TestRun<TestRunConfig>,
-	dbs: &Datastore,
+	dbs: &Arc<Datastore>,
 ) -> Result<TestTaskResult> {
 	let config = &run.case.test.config.parsed;
 
 	let mut session = util::session_from_test_config(config, run.config.planner_config.into());
 
+	// Run the test body, capturing any early-exit result. The cleanup below must
+	// run on *every* exit path — otherwise seed data from an importing test that
+	// fails before the query runs (e.g. a rejection test that also declares
+	// `[env] imports`, or a failed signin) is left behind on the reused base
+	// datastore and breaks every later test that imports the same schema.
+	let outcome = run_test_body(run, dbs, &mut session).await;
+
+	// Always clean up, then surface a body error (if any) ahead of a cleanup error.
+	let cleanup = cleanup_environment(dbs, &session).await;
+	let outcome = outcome?;
+	cleanup?;
+
+	let (did_timeout, result) = match outcome {
+		BodyOutcome::Early(result) => return Ok(result),
+		BodyOutcome::Executed {
+			did_timeout,
+			result,
+		} => (did_timeout, result),
+	};
+
+	// If the test was not a clean test it should ensure that the datastore is reset for the next
+	// test.
+	if !config.env.clean {
+		let keys = check_retained_keys(dbs).await?;
+		if !keys.is_empty() {
+			return Ok(TestTaskResult::BadCleanup(keys));
+		}
+	}
+
+	match result {
+		Ok(res) => Ok(TestTaskResult::Results {
+			did_timeout,
+			res,
+		}),
+		Err(e) => Ok(TestTaskResult::RunningError(e)),
+	}
+}
+
+/// Runs a single test's body — imports, optional signup/signin, then the query
+/// under test — without touching datastore cleanup.
+///
+/// Any failure that happens before the query executes is returned as
+/// [`BodyOutcome::Early`]; that result is the test's outcome. Once the query has
+/// run the outcome is [`BodyOutcome::Executed`]. Cleanup is intentionally left to
+/// the caller ([`run_test_with_dbs`]) so it can run on every exit path, including
+/// these early returns.
+async fn run_test_body(
+	run: &TestRun<TestRunConfig>,
+	dbs: &Arc<Datastore>,
+	session: &mut Session,
+) -> Result<BodyOutcome> {
+	let config = &run.case.test.config.parsed;
+
 	if let Some(x) = util::run_imports(run, session.clone(), dbs).await? {
-		return Ok(TestTaskResult::Import(x.path, x.message));
+		return Ok(BodyOutcome::Early(TestTaskResult::Import(x.path, x.message)));
 	}
 
 	let timeout_duration =
@@ -374,46 +448,120 @@ async fn run_test_with_dbs(
 
 	if let Some(signup_vars) = config.env.signup.as_ref()
 		&& let Err(e) =
-			surrealdb_core::iam::signup::signup(dbs, &mut session, signup_vars.0.clone().into())
-				.await
+			surrealdb_core::iam::signup::signup(dbs, session, signup_vars.0.clone().into()).await
 	{
-		return Ok(TestTaskResult::SignupError(e));
+		return Ok(BodyOutcome::Early(TestTaskResult::SignupError(e)));
 	}
 
 	if let Some(signin_vars) = config.env.signin.as_ref()
 		&& let Err(e) =
-			surrealdb_core::iam::signin::signin(dbs, &mut session, signin_vars.0.clone().into())
-				.await
+			surrealdb_core::iam::signin::signin(dbs, session, signin_vars.0.clone().into()).await
 	{
-		return Ok(TestTaskResult::SigninError(e));
+		return Ok(BodyOutcome::Early(TestTaskResult::SigninError(e)));
 	}
 
-	let settings = syn::parser::ParserSettings {
-		files_enabled: dbs.get_capabilities().allows_experimental(&ExperimentalTarget::Files),
-		surrealism_enabled: dbs
-			.get_capabilities()
-			.allows_experimental(&ExperimentalTarget::Surrealism),
-		..Default::default()
-	};
+	let (did_timeout, result) = match run.case.test.dialect {
+		Dialect::SurrealQl => {
+			let settings = syn::parser::ParserSettings {
+				files_enabled: dbs
+					.get_capabilities()
+					.allows_experimental(&ExperimentalTarget::Files),
+				surrealism_enabled: dbs
+					.get_capabilities()
+					.allows_experimental(&ExperimentalTarget::Surrealism),
+				..Default::default()
+			};
 
-	let source = &run.case.test.source.as_bytes();
-	let mut parser = syn::parser::Parser::new_with_settings(source, settings);
-	let mut stack = reblessive::Stack::new();
+			let source = &run.case.test.source.as_bytes();
+			let mut parser = syn::parser::Parser::new_with_settings(source, settings);
+			let mut stack = reblessive::Stack::new();
 
-	let query = match stack.enter(|stk| parser.parse_query(stk)).finish() {
-		Ok(x) => {
-			if let Err(e) = parser.assert_finished() {
-				return Ok(TestTaskResult::ParserError(e.render_on_bytes(source)));
-			}
-			x
+			let query = match stack.enter(|stk| parser.parse_query(stk)).finish() {
+				Ok(x) => {
+					if let Err(e) = parser.assert_finished() {
+						return Ok(BodyOutcome::Early(TestTaskResult::ParserError(
+							e.render_on_bytes(source),
+						)));
+					}
+					x
+				}
+				Err(e) => {
+					return Ok(BodyOutcome::Early(TestTaskResult::ParserError(
+						e.render_on_bytes(source),
+					)));
+				}
+			};
+
+			let start = Instant::now();
+			let result = dbs.process(query, &*session, None).await;
+			let did_timeout = start.elapsed() > timeout_duration;
+			let result = result
+				.map(|x| x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect())
+				.map_err(|e| anyhow::anyhow!(e));
+			(did_timeout, result)
 		}
-		Err(e) => return Ok(TestTaskResult::ParserError(e.render_on_bytes(source))),
+		Dialect::Gql => {
+			// GQL has no capability-gated syntax; the default recursion
+			// limit matches `syn::parser::ParserSettings::default()` above.
+			// Lowering produces a `PreparedGqlQuery` (a `MatchPlan` embedded
+			// in a logical plan); it executes through the streaming engine via
+			// `process_gql`, so `.gql` cases default away from the
+			// compute-only strategy (see `Dialect::Gql` default in the
+			// schema's planner-strategy seam).
+			let settings = gql::GqlParserSettings::default();
+			let source = &run.case.test.source.as_bytes();
+			let query = match gql::parse_to_plan_with_settings(&run.case.test.source, settings)
+			{
+				Ok(x) => x,
+				Err(e) => {
+					return Ok(BodyOutcome::Early(TestTaskResult::ParserError(
+						e.render_on_bytes(source),
+					)));
+				}
+			};
+
+			let start = Instant::now();
+			let result = dbs.process_gql(query, &*session, None).await;
+			let did_timeout = start.elapsed() > timeout_duration;
+			let result = result
+				.map(|x| x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect())
+				.map_err(|e| anyhow::anyhow!(e));
+			(did_timeout, result)
+		}
+		Dialect::GraphQl => {
+			// Schema generation reads the catalog like the server does on a
+			// cache miss; it is setup, not the query under test, so it stays
+			// outside the timed window. Failures (e.g. GraphQL not configured)
+			// are part of the testable surface and become the single result.
+			match graphql::generate_schema(dbs, &*session).await {
+				Ok(schema) => {
+					let request = graphql::build_request(&run.case.test, dbs, &*session)?;
+					let start = Instant::now();
+					let response = schema.execute(request).await;
+					let did_timeout = start.elapsed() > timeout_duration;
+					(did_timeout, Ok(vec![graphql::response_to_result(response)]))
+				}
+				Err(e) => (false, Ok(vec![Err(e)])),
+			}
+		}
 	};
 
-	let start = Instant::now();
-	let result = dbs.process(query, &session, None).await;
-	let did_timeout = start.elapsed() > timeout_duration;
+	Ok(BodyOutcome::Executed {
+		did_timeout,
+		result,
+	})
+}
 
+/// Removes the namespace, database, and root configs a test (or its imports) may
+/// have created, returning the reused base datastore to a clean state for the
+/// next test.
+///
+/// Every statement is `IF EXISTS`, so this is safe to call on any exit path —
+/// including early failures where the query never ran. It must run regardless of
+/// how the body exited: skipping it (as the old early-return paths did) leaks
+/// seed data from importing tests that fail before execution onto the shared
+/// datastore, breaking later tests.
+async fn cleanup_environment(dbs: &Arc<Datastore>, session: &Session) -> Result<()> {
 	if let Some(ref ns) = session.ns {
 		if let Some(ref db) = session.db {
 			let session = Session::owner().with_ns(ns);
@@ -429,34 +577,175 @@ async fn run_test_with_dbs(
 	}
 
 	// Clean up configs that may have been created during the test.
-	{
-		let session = Session::owner();
-		dbs.execute(
-			"REMOVE CONFIG IF EXISTS GRAPHQL; REMOVE CONFIG IF EXISTS API; REMOVE CONFIG IF EXISTS DEFAULT;",
-			&session,
-			None,
-		)
+	let session = Session::owner();
+	dbs.execute(
+		"REMOVE CONFIG IF EXISTS GRAPHQL; REMOVE CONFIG IF EXISTS API; REMOVE CONFIG IF EXISTS DEFAULT;",
+		&session,
+		None,
+	)
+	.await
+	.context("failed to remove root config")?;
+
+	// Remove any root-level users and accesses the test (or its imports) defined.
+	// Unlike namespaces and configs, these carry test-chosen names, so enumerate
+	// them via `INFO FOR ROOT` and remove each. This matters on shared physical
+	// backends (e.g. TiKV) where every datastore aliases one cluster: a `clean`
+	// test that runs `DEFINE USER ... ON ROOT` would otherwise leave the key
+	// behind for the next test, which the retained-key check then flags.
+	let mut info = dbs
+		.execute("INFO FOR ROOT;", &session, None)
 		.await
-		.context("failed to remove root config")?;
-	}
-
-	// If the test was not a clean test it should ensure that the datastore is reset for the next
-	// test.
-	if !run.case.test.config.parsed.env.clean {
-		let keys = check_retained_keys(dbs).await?;
-		if !keys.is_empty() {
-			return Ok(TestTaskResult::BadCleanup(keys));
+		.context("failed to read root info during cleanup")?;
+	if let Some(SurValue::Object(info)) = info.pop().and_then(|r| r.result.ok()) {
+		for (field, kind) in [("users", "USER"), ("accesses", "ACCESS")] {
+			if let Some(SurValue::Object(entries)) = info.get(field) {
+				for name in entries.keys() {
+					dbs.execute(
+						&format!("REMOVE {kind} IF EXISTS `{name}` ON ROOT;"),
+						&session,
+						None,
+					)
+					.await
+					.with_context(|| format!("failed to remove root {field} during cleanup"))?;
+				}
+			}
 		}
 	}
 
-	match result {
-		Ok(x) => {
-			let x = x.into_iter().map(|x| x.result.map_err(|e| e.to_string())).collect();
-			Ok(TestTaskResult::Results {
-				did_timeout,
-				res: x,
-			})
+	// `REMOVE NAMESPACE`/`REMOVE DATABASE`/`REMOVE INDEX` defer their data
+	// deletion to a background reclaim task, which is not otherwise running inside the
+	// test harness. Drain it last (after every REMOVE above) so deferred removals
+	// actually reclaim their data and queue entries, leaving the reused datastore
+	// clean for the retained-key check and the next test.
+	// Grace `ZERO`: drain immediately. The harness is single-threaded per
+	// datastore with no concurrent readers, so the snapshot-safety grace that
+	// production uses is unnecessary here and would leave residue for the
+	// retained-key check.
+	Datastore::reclaim_tombstones(
+		Arc::clone(dbs),
+		std::time::Duration::from_secs(1),
+		std::time::Duration::ZERO,
+		tokio_util::sync::CancellationToken::new(),
+	)
+	.await
+	.context("failed to drain tombstone reclaim queue")?;
+
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Arc;
+	use std::time::SystemTime;
+
+	use surrealdb_core::dbs::Capabilities;
+	use surrealdb_core::dbs::capabilities::Targets;
+	use surrealdb_core::kvs::Datastore;
+
+	use super::*;
+	use crate::tests::case::{CaseId, Dialect, Origin, TestCase};
+	use crate::tests::run::{CaseImports, TestRunId};
+	use crate::tests::schema::NewPlannerStrategyConfig;
+
+	/// Builds a datastore equivalent to the reused base-environment datastore the
+	/// provisioner hands out (all capabilities + experimental targets, auth on).
+	async fn base_datastore() -> Arc<Datastore> {
+		let ds = Datastore::builder()
+			.with_capabilities(Capabilities::all().with_experimental(Targets::All))
+			.with_auth(true)
+			.build_with_path("memory")
+			.await
+			.unwrap();
+		ds.bootstrap().await.unwrap();
+		Arc::new(ds)
+	}
+
+	fn case_from_source(id: usize, path: &str, source: &str) -> Arc<TestCase> {
+		let origin = Arc::new(Origin {
+			path: path.to_string(),
+			modified: SystemTime::UNIX_EPOCH,
+			subset: None,
+			line_offset: None,
+		});
+		Arc::new(
+			TestCase::from_source_origin_id(
+				CaseId::new(id),
+				origin,
+				source.to_string(),
+				Dialect::SurrealQl,
+			)
+			.unwrap(),
+		)
+	}
+
+	fn make_run(test: Arc<TestCase>, imports: Vec<Arc<TestCase>>) -> TestRun<TestRunConfig> {
+		TestRun {
+			id: TestRunId::new(0),
+			case: Arc::new(CaseImports {
+				test,
+				imports,
+			}),
+			config: TestRunConfig {
+				planner_config: NewPlannerStrategyConfig::ComputeOnly,
+				backend: Backend::Memory,
+			},
 		}
-		Err(e) => Ok(TestTaskResult::RunningError(anyhow::anyhow!(e))),
+	}
+
+	/// Regression test for the harness control-flow bug where an early return from
+	/// `run_test_with_dbs` (parse/lower/signin failure) skipped datastore cleanup.
+	///
+	/// An importing test that fails to parse used to leave its seed data on the
+	/// reused base datastore; the next test importing the same schema then failed
+	/// with "Database record person:1 already exists". With cleanup hoisted onto
+	/// every exit path, the first test cleans up after itself and the second runs
+	/// cleanly — both pass even when sharing a single datastore (i.e. `--jobs 1`).
+	#[tokio::test]
+	async fn importing_test_failing_to_parse_cleans_up_for_next_test() {
+		let dbs = base_datastore().await;
+
+		// Seed data both tests pull in via `[env] imports`.
+		let import = case_from_source(0, "import_seed", "CREATE person:1 SET name = 'a';");
+
+		// Test A: a base-environment test that imports the seed data and then fails
+		// to parse. This is the historical leak: imports ran, the early return
+		// skipped cleanup, and `person:1` was left behind.
+		let case_a = case_from_source(
+			1,
+			"reject_with_import",
+			"/**\n[env]\nnamespace = true\ndatabase = true\nauth = { level = \"owner\" }\n*/\nCREATE person:2 SET name = ;",
+		);
+		let run_a = make_run(case_a, vec![import.clone()]);
+		let result_a = run_test_with_dbs(&run_a, &dbs).await.unwrap();
+		assert!(
+			matches!(result_a, TestTaskResult::ParserError(_)),
+			"test A should fail to parse, got {result_a:?}",
+		);
+
+		// The fix: cleanup ran on the early-return path, so nothing is left behind
+		// on the reused datastore.
+		let retained = check_retained_keys(&dbs).await.unwrap();
+		assert!(
+			retained.is_empty(),
+			"importing test that failed to parse leaked keys onto the reused datastore: {retained:?}",
+		);
+
+		// Test B: imports the same schema on the same datastore. Before the fix this
+		// failed because `person:1` already existed.
+		let case_b = case_from_source(
+			2,
+			"accept_with_import",
+			"/**\n[env]\nnamespace = true\ndatabase = true\nauth = { level = \"owner\" }\n*/\nSELECT name FROM person;",
+		);
+		let run_b = make_run(case_b, vec![import]);
+		let result_b = run_test_with_dbs(&run_b, &dbs).await.unwrap();
+		assert!(
+			!matches!(result_b, TestTaskResult::Import(..)),
+			"test B's import should succeed after A cleaned up, got {result_b:?}",
+		);
+		assert!(
+			matches!(result_b, TestTaskResult::Results { .. }),
+			"test B should produce query results, got {result_b:?}",
+		);
 	}
 }

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "IS NULL matches a missing property (NONE/NULL conflated in v1, documented deviation)."
+
+[[test.results]]
+value = "[{ name: 'C' }]"
+*/
+
+MATCH (n:person) WHERE n.age IS NULL RETURN n.name AS name ORDER BY name

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: rows are objects keyed by column name, so duplicate columns would silently collapse."
+
+[test.results]
+parsing-error = '''
+Duplicate column name `x`
+  --> [15:47]
+   |
+15 | MATCH (n:person) RETURN n.name AS x, n.age AS x
+   |                                               ^ use `AS` to give the items distinct column names
+'''
+*/
+
+MATCH (n:person) RETURN n.name AS x, n.age AS x

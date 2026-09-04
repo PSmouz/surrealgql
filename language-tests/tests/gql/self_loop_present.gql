@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_self_loop_schema.surql"]
+
+[test]
+reason = "Positive self-loop: ring:1 (P) has a self-edge selfedge:s1 (in==out==ring:1); ring:2 (Q) only has an outgoing edge to ring:1. The within-pattern repeated `a` enforces source==target via the lowered `a.id = __v.id` equality, so only P is returned. Without the equality the second `ring` (Q->P edge) would also surface."
+
+[[test.results]]
+value = "[{ a: 'P' }]"
+*/
+
+MATCH (a:ring)-[:selfedge]->(a) RETURN a.name AS a ORDER BY a

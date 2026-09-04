@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Cross-variable predicate (b vs a) pushed into edge scope via $parent, with guards on both sides: rows where either age is missing are excluded."
+
+[[test.results]]
+value = "[{ an: 'A', bn: 'B' }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) WHERE b.age < a.age RETURN a.name AS an, b.name AS bn ORDER BY an

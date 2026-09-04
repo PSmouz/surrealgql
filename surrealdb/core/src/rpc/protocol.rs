@@ -95,6 +95,12 @@ const fn method_to_auth_action(method: Method) -> Option<AuthAction> {
 pub trait RpcProtocol {
 	/// The datastore for this RPC interface
 	fn kvs(&self) -> &Datastore;
+	/// The datastore for this RPC interface as a shared handle.
+	///
+	/// Needed by machinery that captures the datastore beyond the borrow of a
+	/// single call -- notably GraphQL schema generation, whose resolvers hold
+	/// the datastore in the `async_graphql` request context.
+	fn kvs_arc(&self) -> Arc<Datastore>;
 	/// The version information for this RPC context
 	fn version_data(&self) -> DbResult;
 
@@ -287,6 +293,8 @@ pub trait RpcProtocol {
 				Method::Set => self.set(session, params).await,
 				Method::Unset => self.unset(session, params).await,
 				Method::Query => self.query(txn, session, params).await,
+				Method::Gql => self.gql(txn, session, params).await,
+				Method::Graphql => self.graphql(txn, session, params).await,
 				Method::Version => self.version(txn, params).await,
 				Method::Begin => self.begin(txn, session).await,
 				Method::Commit => self.commit(txn, session, params).await,
@@ -1463,6 +1471,7 @@ pub trait RpcProtocol {
 		// Specify the SQL query string
 		let expr = Expr::Relate(Box::new(RelateStatement {
 			only,
+			or_update: false,
 			from: Expr::from_public_value(from),
 			through: value_to_table(kind),
 			to: Expr::from_public_value(with),
@@ -1580,6 +1589,144 @@ pub trait RpcProtocol {
 				.await
 				.map_err(types_error_from_anyhow)?,
 		))
+	}
+
+	async fn gql(
+		&self,
+		txn: Option<Uuid>,
+		session_id: Uuid,
+		params: PublicArray,
+	) -> Result<DbResult, surrealdb_types::Error> {
+		#[cfg(not(feature = "gql"))]
+		{
+			let _ = (txn, session_id, params);
+			Err(method_not_found(Method::Gql.to_string()))
+		}
+		#[cfg(feature = "gql")]
+		{
+			let session_lock = self.get_session(&session_id)?;
+			let session = session_lock.read().await;
+			// Check if the user is allowed to query
+			if !self.kvs().allows_query_by_subject(session.au.as_ref()) {
+				return Err(method_not_allowed(Method::Gql.to_string()));
+			}
+			// Process the method arguments
+			let (query, vars) =
+				extract_args::<(PublicValue, Option<PublicValue>)>(params.into_vec())
+					.ok_or(invalid_params("Expected (query:string, vars:object)".to_string()))?;
+
+			let PublicValue::String(query) = query else {
+				return Err(invalid_params("Expected query to be string".to_string()));
+			};
+
+			// Specify the query variables
+			let vars = match vars {
+				Some(PublicValue::Object(v)) => {
+					let mut merged = session.variables.clone();
+					merged.extend(v.into());
+					Some(merged)
+				}
+				None | Some(PublicValue::None | PublicValue::Null) => {
+					Some(session.variables.clone())
+				}
+				unexpected => {
+					return Err(invalid_params(format!(
+						"Expected vars to be object, got {unexpected:?}"
+					)));
+				}
+			};
+
+			// Parse and lower the GQL query into a prepared plan
+			let plan = self.kvs().parse_gql(&query)?;
+
+			Ok(DbResult::Query(
+				run_query(self, txn, session_id, QueryForm::Plan(plan), vars)
+					.await
+					.map_err(types_error_from_anyhow)?,
+			))
+		}
+	}
+
+	/// Execute a GraphQL request against the namespace and database selected on
+	/// the session, returning the spec response envelope (`{ data, errors }`)
+	/// as a value. GraphQL manages its own per-resolver transactions, so this
+	/// method does not participate in the RPC explicit-transaction system.
+	async fn graphql(
+		&self,
+		txn: Option<Uuid>,
+		session_id: Uuid,
+		params: PublicArray,
+	) -> Result<DbResult, surrealdb_types::Error> {
+		#[cfg(not(all(feature = "graphql", not(target_family = "wasm"))))]
+		{
+			let _ = (txn, session_id, params);
+			Err(method_not_found(Method::Graphql.to_string()))
+		}
+		#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+		{
+			// GraphQL manages its own per-resolver transactions and cannot join a
+			// client's explicit `begin`/`commit` block, so reject an explicit
+			// transaction id rather than silently running outside it.
+			if txn.is_some() {
+				return Err(invalid_params(
+					"GraphQL does not support explicit transactions; run it outside begin/commit"
+						.to_string(),
+				));
+			}
+			// Resolve the session and check the user is allowed to query. There
+			// is no HTTP route in play here, so -- as agreed -- access is gated
+			// purely on the query capability for the subject, exactly like the
+			// `query` and `gql` RPC methods.
+			let session_lock = self.get_session(&session_id)?;
+			let session = session_lock.read().await;
+			if !self.kvs().allows_query_by_subject(session.au.as_ref()) {
+				return Err(method_not_allowed(Method::Graphql.to_string()));
+			}
+			// Process the method arguments: (query, variables?, operationName?)
+			let (query, variables, operation) =
+				extract_args::<(PublicValue, Option<PublicValue>, Option<PublicValue>)>(
+					params.into_vec(),
+				)
+				.ok_or(invalid_params(
+					"Expected (query:string, variables:object, operation:string)".to_string(),
+				))?;
+
+			let PublicValue::String(query) = query else {
+				return Err(invalid_params("Expected query to be a string".to_string()));
+			};
+
+			// GraphQL variables are plain JSON; convert from the public value.
+			let variables = match variables {
+				Some(v @ PublicValue::Object(_)) => v.into_json_value(),
+				None | Some(PublicValue::None | PublicValue::Null) => serde_json::Value::Null,
+				Some(unexpected) => {
+					return Err(invalid_params(format!(
+						"Expected variables to be an object, got {unexpected:?}"
+					)));
+				}
+			};
+
+			let operation = match operation {
+				Some(PublicValue::String(s)) => Some(s),
+				None | Some(PublicValue::None | PublicValue::Null) => None,
+				Some(unexpected) => {
+					return Err(invalid_params(format!(
+						"Expected operation to be a string, got {unexpected:?}"
+					)));
+				}
+			};
+
+			// The datastore owns and caches the generated schema; the shared
+			// `execute_request` helper builds the request exactly as the HTTP
+			// `/graphql` transport does. Schema/config failures map to errors;
+			// GraphQL execution errors ride back in the response envelope.
+			let ds = self.kvs_arc();
+			let json = crate::graphql::execute_request(&ds, &session, query, variables, operation)
+				.await
+				.map_err(|e| surrealdb_types::Error::query(e.to_string(), None))?;
+
+			Ok(DbResult::Other(crate::rpc::format::json::json_to_value(json)))
+		}
 	}
 
 	// ------------------------------
@@ -1779,6 +1926,10 @@ pub trait RpcProtocol {
 enum QueryForm<'a> {
 	Text(&'a str),
 	Parsed(Ast),
+	/// A pre-lowered GQL query. Only constructed by the `gql` handler, which
+	/// is itself gated behind the `gql` feature.
+	#[cfg(feature = "gql")]
+	Plan(crate::gql::PreparedGqlQuery),
 }
 
 async fn run_query<T>(
@@ -1820,6 +1971,16 @@ where
 			(QueryForm::Parsed(ast), None) => {
 				this.kvs().process_with_transaction(ast, &session, vars, tx).await?
 			}
+			#[cfg(feature = "gql")]
+			(QueryForm::Plan(plan), Some(cancel)) => {
+				this.kvs()
+					.process_gql_with_transaction_and_cancel(plan, &session, vars, tx, cancel)
+					.await?
+			}
+			#[cfg(feature = "gql")]
+			(QueryForm::Plan(plan), None) => {
+				this.kvs().process_gql_with_transaction(plan, &session, vars, tx).await?
+			}
 		}
 	} else {
 		// No transaction - execute normally
@@ -1832,6 +1993,12 @@ where
 				this.kvs().process_with_cancel(ast, &session, vars, cancel).await?
 			}
 			(QueryForm::Parsed(ast), None) => this.kvs().process(ast, &session, vars).await?,
+			#[cfg(feature = "gql")]
+			(QueryForm::Plan(plan), Some(cancel)) => {
+				this.kvs().process_gql_with_cancel(plan, &session, vars, cancel).await?
+			}
+			#[cfg(feature = "gql")]
+			(QueryForm::Plan(plan), None) => this.kvs().process_gql(plan, &session, vars).await?,
 		}
 	};
 

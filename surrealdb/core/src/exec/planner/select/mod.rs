@@ -19,8 +19,8 @@ mod projection;
 use std::sync::Arc;
 
 pub(crate) use pipeline::{
-	FilterAction, PlannedSource, SelectPipelineConfig, WhereClauseState,
-	filter_action_for_predicate,
+	FilterAction, PlannedSource, SelectPipelineConfig, TopKPushdownRequest, WhereClauseState,
+	compute_topk_pushdown_request, filter_action_for_predicate,
 };
 
 use super::Planner;
@@ -1049,6 +1049,25 @@ impl<'ctx> Planner<'ctx> {
 			self.ctx.config.max_order_limit_priority_queue_size as usize,
 		);
 
+		// TopK threshold pushdown analysis: when the downstream sort will be
+		// a bounded heap on a raw first key, a table scan can reject rows
+		// against the heap's worst entry before record decode. SPLIT, GROUP
+		// BY, and brute-force KNN duplicate, regroup, or rank rows between
+		// scan and sort, so they disqualify the request outright.
+		let topk_request = if self.ctx.config.topk_threshold_pushdown_enabled {
+			compute_topk_pushdown_request(
+				order.as_ref(),
+				&start,
+				&limit,
+				&fields,
+				tempfiles,
+				split.is_some() || group.is_some() || brute_force_knn.is_some(),
+				self.ctx.config.max_order_limit_priority_queue_size as usize,
+			)
+		} else {
+			TopKPushdownRequest::NotApplicable
+		};
+
 		// Source resolution with plan-time index analysis.
 		// The result tracks whether the predicate and limit/start were
 		// consumed by the source operator, so we can avoid duplicating
@@ -1065,12 +1084,17 @@ impl<'ctx> Planner<'ctx> {
 				scan_limit,
 				scan_start,
 				downstream_topk,
+				&topk_request,
 			)
 			.await?;
 
 		if can_soft_push_limit {
 			planned.limit_pushed = false;
 		}
+
+		// Detach the TopK pushdown handle before `planned.operator` moves into
+		// the pipeline below; `plan_pipeline` hands it to sort planning.
+		let topk_handle = planned.topk_pushdown.take();
 
 		// Resolve the pipeline's WHERE state from the source's filter action.
 		// - FullyConsumed: source handles the entire predicate, no Filter.
@@ -1139,6 +1163,7 @@ impl<'ctx> Planner<'ctx> {
 			},
 			omit,
 			tempfiles,
+			topk_pushdown: topk_handle,
 		};
 
 		let projected = pp.plan_pipeline(source, Some(fields), config).await?;
@@ -1160,12 +1185,23 @@ impl<'ctx> Planner<'ctx> {
 		scan_limit: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		scan_start: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		downstream_topk: bool,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
 		if what.is_empty() {
 			return Err(Error::Query {
 				message: "SELECT requires at least one source".to_string(),
 			});
 		}
+		// Multi-source FROM combines via Union: rows from one scan compete in
+		// the sort heap with rows from the others, so a per-scan threshold
+		// probe would be misleading in EXPLAIN (its cell can never be
+		// installed — sort planning receives a single handle). Drop the
+		// request before fanning out.
+		let topk_request = if what.len() > 1 {
+			&TopKPushdownRequest::NotApplicable
+		} else {
+			topk_request
+		};
 		let mut plans = Vec::with_capacity(what.len());
 		for expr in what {
 			let p = self
@@ -1180,6 +1216,7 @@ impl<'ctx> Planner<'ctx> {
 					scan_limit.clone(),
 					scan_start.clone(),
 					downstream_topk,
+					topk_request,
 				)
 				.await?;
 			plans.push(p);
@@ -1195,6 +1232,7 @@ impl<'ctx> Planner<'ctx> {
 				operator: Arc::new(Union::new(operators)),
 				filter_action: FilterAction::UseOriginal,
 				limit_pushed: false,
+				topk_pushdown: None,
 			})
 		}
 	}
@@ -1222,6 +1260,7 @@ impl<'ctx> Planner<'ctx> {
 		scan_limit: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		scan_start: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		downstream_topk: bool,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
 		// Optimisation: WHERE id = <RecordId> -> point lookup.
 		// Detects `id = <RecordId literal>` in the top-level AND chain and
@@ -1233,8 +1272,16 @@ impl<'ctx> Planner<'ctx> {
 		// resolve_access_path() to populate KnnContext correctly.
 		if let Expr::Table(ref table_name) = expr
 			&& !cond.is_some_and(|c| has_knn_operator(&c.0))
-			&& let Some(rid_expr) = cond.and_then(|c| extract_record_id_point_lookup(c, table_name))
-		{
+			&& let Some(rid_expr) = cond.and_then(|c| {
+				// Normalize projection-function field references like
+				// `type::field("id")` to plain idioms so the record-id point
+				// lookup recognizes them, mirroring the index-analyzer rewrite
+				// in `resolve_access_path`. Done on a clone so the residual
+				// `scan_predicate` retains the original expression.
+				let mut normalized = c.clone();
+				resolve_projection_field_idioms(&mut normalized, self.function_registry());
+				extract_record_id_point_lookup(&normalized, table_name)
+			}) {
 			let filter_action = filter_action_for_predicate(&scan_predicate);
 			let record_id_expr = self.physical_expr(rid_expr).await?;
 			let resolved_table_ctx: Option<ResolvedTableContext> =
@@ -1254,6 +1301,7 @@ impl<'ctx> Planner<'ctx> {
 				operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 				filter_action,
 				limit_pushed: false,
+				topk_pushdown: None,
 			});
 		}
 
@@ -1266,6 +1314,36 @@ impl<'ctx> Planner<'ctx> {
 			// This eliminates runtime KV lookups in the operator's execute().
 			let table_ctx: Option<ResolvedTableContext> =
 				self.try_resolve_table_ctx(table_name).await;
+
+			// SECURITY (value-ordering oracle): resolve once which field paths
+			// on this table carry a non-`Full` SELECT permission for the
+			// current actor. The result is reused by both the ORDER BY guard
+			// just below and the `UnionIndexScan` WHERE guard, so a query with
+			// a restricted WHERE *and* a restricted ORDER BY performs a single
+			// `all_tb_fields` lookup instead of two.
+			let restricted_select = self.resolve_restricted_select_prefixes(table_name).await;
+
+			// If any ORDER BY idiom is governed by a non-`Full` field-level
+			// SELECT permission, withhold the ORDER BY from access-path
+			// selection. Otherwise the planner would pick an index that walks
+			// the restricted field in true value order; the value is later
+			// reduced to NULL, but the emitted row order — preserved through
+			// the stable post-reduce Sort — would leak the hidden values'
+			// relative ordering across other users' records. Withholding it
+			// keeps the source in record-id order and forces an explicit Sort
+			// over the reduced (NULL) keys.
+			//
+			// This guards only the plan-time access path. The runtime-resolved
+			// `DynamicScan` fallback — reached when planning is txn-less, or
+			// when `resolve_access_path` returns `Ok(None)`/`Err` — applies the
+			// equivalent guard at execute time in `operators/scan/dynamic.rs`,
+			// where the actor's real field permissions are known (so it cannot
+			// over-apply to privileged users the way a conservative plan-time
+			// `AssumeRestricted` would).
+			let order = match order {
+				Some(o) if restricted_select.order_touches(o) => None,
+				other => other,
+			};
 
 			let resolved =
 				self.resolve_access_path(txn, ns, db, table_name, cond, order, with).await;
@@ -1346,6 +1424,7 @@ impl<'ctx> Planner<'ctx> {
 								needed_fields,
 								version,
 								table_ctx,
+								topk_request,
 							)
 							.await;
 					}
@@ -1366,6 +1445,7 @@ impl<'ctx> Planner<'ctx> {
 								table_ctx,
 								knn_ctx,
 								downstream_topk,
+								&restricted_select,
 							)
 							.await;
 					}
@@ -1393,6 +1473,7 @@ impl<'ctx> Planner<'ctx> {
 					)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			Expr::Select(inner_select) => {
@@ -1407,6 +1488,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: self.plan_select_statement(*inner_select).await?,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			// Params that could be resolved were already rewritten to
@@ -1418,6 +1500,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: Arc::new(SourceExpr::new(phys_expr)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 			Expr::Table(_)
@@ -1445,6 +1528,7 @@ impl<'ctx> Planner<'ctx> {
 					operator: Arc::new(SourceExpr::new(phys_expr)) as Arc<dyn ExecOperator>,
 					filter_action: FilterAction::UseOriginal,
 					limit_pushed: false,
+					topk_pushdown: None,
 				})
 			}
 		}
@@ -1541,6 +1625,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1578,6 +1663,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1620,6 +1706,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action: FilterAction::UseOriginal,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -1634,6 +1721,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(EmptyScan::new()) as Arc<dyn ExecOperator>,
 			filter_action: FilterAction::FullyConsumed,
 			limit_pushed: true,
+			topk_pushdown: None,
 		}
 	}
 
@@ -1653,7 +1741,13 @@ impl<'ctx> Planner<'ctx> {
 		needed_fields: Option<std::collections::HashSet<String>>,
 		version: Option<Arc<dyn crate::exec::PhysicalExpr>>,
 		table_ctx: Option<ResolvedTableContext>,
+		topk_request: &TopKPushdownRequest,
 	) -> Result<PlannedSource, Error> {
+		use crate::exec::topk_pushdown::{
+			TopKPushdownHandle, TopKPushdownReason, TopKPushdownStatus, TopKThresholdCell,
+			TopKThresholdProbe, field_path_wire_segments, topk_pushdown_status_at_plan_time,
+		};
+
 		let filter_action = filter_action_for_predicate(&scan_predicate);
 		let push = scan_limit.is_some() && order_is_scan_compatible(order);
 		let (tbl_limit, tbl_start, limit_pushed) = if push {
@@ -1666,6 +1760,52 @@ impl<'ctx> Planner<'ctx> {
 			scan_predicate.as_ref(),
 			needed_fields.as_ref(),
 		);
+		// TopK threshold pushdown: build the shared cell and the scan-side
+		// probe for an eligible request. The field eligibility check runs
+		// against the FULL plan-time field state (not the projection-filtered
+		// view) so a computed ORDER BY field can't slip through when the
+		// projection drops its definition. The handle travels to
+		// `plan_sort_consolidated`, which installs the publish side only if
+		// the sort plan it builds matches `expected_first_key`.
+		let (topk_status, topk_handle) = match topk_request {
+			TopKPushdownRequest::NotApplicable => (TopKPushdownStatus::NotApplicable, None),
+			TopKPushdownRequest::Ineligible(reason) => {
+				(TopKPushdownStatus::Ineligible(*reason), None)
+			}
+			TopKPushdownRequest::Eligible(spec) => {
+				match field_path_wire_segments(&spec.first_key.path) {
+					// The request analysis already vets the path; this re-check
+					// keeps the probe constructor's invariant local.
+					None => {
+						(TopKPushdownStatus::Ineligible(TopKPushdownReason::UnsupportedOrder), None)
+					}
+					Some(segments) => {
+						let cell = Arc::new(TopKThresholdCell::default());
+						let probe = Arc::new(TopKThresholdProbe::new(
+							segments,
+							spec.first_key.direction,
+							spec.key_count == 1,
+							Arc::clone(&cell),
+							self.ctx.config.idiom_recursion_limit,
+						));
+						let status = topk_pushdown_status_at_plan_time(
+							probe,
+							table_ctx.as_ref().map(|tc| tc.field_state.as_ref()),
+						);
+						let handle = matches!(
+							status,
+							TopKPushdownStatus::Active(_) | TopKPushdownStatus::Deferred(_)
+						)
+						.then(|| TopKPushdownHandle {
+							cell,
+							expected_first_key: spec.first_key.clone(),
+							expected_key_count: spec.key_count,
+						});
+						(status, handle)
+					}
+				}
+			}
+		};
 		let mut scan = TableScan::new(
 			table,
 			direction,
@@ -1679,10 +1819,12 @@ impl<'ctx> Planner<'ctx> {
 			scan = scan.with_resolved(tc);
 		}
 		scan = scan.with_pre_decode_filter(pdf);
+		scan = scan.with_topk_pushdown(topk_status);
 		Ok(PlannedSource {
 			operator: Arc::new(scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: topk_handle,
 		})
 	}
 
@@ -1710,6 +1852,7 @@ impl<'ctx> Planner<'ctx> {
 		table_ctx: Option<ResolvedTableContext>,
 		knn_ctx: Option<Arc<crate::exec::function::KnnContext>>,
 		downstream_topk: bool,
+		restricted_select: &RestrictedPrefixes,
 	) -> Result<PlannedSource, Error> {
 		// Enable merge-sort by record ID when ORDER BY is `id ASC/DESC`
 		// only and every sub-path is an equality B-tree scan (each one
@@ -1801,7 +1944,9 @@ impl<'ctx> Planner<'ctx> {
 		// hidden value. Leaving the leaf in the residual filter forces
 		// the post-permission recheck and closes that channel.
 		let filter_action = if let Some(c) = cond {
-			let strip_safe = !self.cond_touches_restricted_select_field_for_table(&table, c).await;
+			// Reuses the prefixes resolved once in `plan_source` for this same
+			// table, so the union path performs no extra `all_tb_fields` lookup.
+			let strip_safe = !restricted_select.cond_touches(c);
 			let stripped = if strip_safe {
 				strip_union_index_conditions(c, &paths)
 			} else {
@@ -1863,6 +2008,7 @@ impl<'ctx> Planner<'ctx> {
 			operator: Arc::new(union_scan) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed: false,
+			topk_pushdown: None,
 		})
 	}
 
@@ -2027,6 +2173,7 @@ impl<'ctx> Planner<'ctx> {
 			) as Arc<dyn ExecOperator>,
 			filter_action,
 			limit_pushed,
+			topk_pushdown: None,
 		})
 	}
 
@@ -2183,30 +2330,42 @@ impl<'ctx> Planner<'ctx> {
 	}
 
 	/// Core of [`Self::cond_touches_restricted_select_field`] that operates
-	/// on an already-resolved table name and condition. Also used by the
-	/// `UnionIndexScan` planner to decide whether
+	/// on an already-resolved table name and condition. The `UnionIndexScan`
+	/// planner makes the equivalent decision (whether
 	/// `strip_union_index_conditions` is safe — the union sub-operators
 	/// don't re-evaluate the WHERE leaf after field-level permissions, so
 	/// stripping a leaf on a restricted field would turn the index entries
-	/// themselves into a membership oracle.
+	/// themselves into a membership oracle) by calling
+	/// [`RestrictedPrefixes::cond_touches`] directly on prefixes it already
+	/// has on hand, avoiding a redundant catalog lookup.
 	async fn cond_touches_restricted_select_field_for_table(
 		&self,
 		table_name: &TableName,
 		cond: &Cond,
 	) -> bool {
+		self.resolve_restricted_select_prefixes(table_name).await.cond_touches(cond)
+	}
+
+	/// Resolve which field-path prefixes on `table_name` are governed by a
+	/// non-`Full` SELECT permission for the current actor. Shared by the
+	/// WHERE-clause and ORDER BY plan-time guards.
+	async fn resolve_restricted_select_prefixes(
+		&self,
+		table_name: &TableName,
+	) -> RestrictedPrefixes {
 		let (Some(ns_name), Some(db_name)) = (self.ns.as_deref(), self.db.as_deref()) else {
 			// No catalog access at plan time — conservatively assume
 			// permissions could apply.
-			return true;
+			return RestrictedPrefixes::AssumeRestricted;
 		};
 		if !self.should_check_perms_for_view(ns_name, db_name) {
-			return false;
+			return RestrictedPrefixes::None;
 		}
 		let Some(txn) = self.txn.as_ref() else {
-			return true;
+			return RestrictedPrefixes::AssumeRestricted;
 		};
 		let Some((ns_id, db_id)) = self.ns_db_ids().await else {
-			return true;
+			return RestrictedPrefixes::AssumeRestricted;
 		};
 		let fields = match txn.all_tb_fields(ns_id, db_id, table_name, None).await {
 			Ok(fs) => fs,
@@ -2215,10 +2374,10 @@ impl<'ctx> Planner<'ctx> {
 					table = %table_name,
 					error = %e,
 					"plan-time field list failed in \
-					 cond_touches_restricted_select_field_for_table; \
-					 conservatively disabling index-strip fast paths",
+					 resolve_restricted_select_prefixes; \
+					 conservatively disabling index fast paths",
 				);
-				return true;
+				return RestrictedPrefixes::AssumeRestricted;
 			}
 		};
 		// Collect the field paths that are not unconditionally SELECT-able.
@@ -2228,15 +2387,10 @@ impl<'ctx> Planner<'ctx> {
 			.map(|f| f.name.clone())
 			.collect();
 		if restricted_prefixes.is_empty() {
-			return false;
+			RestrictedPrefixes::None
+		} else {
+			RestrictedPrefixes::Some(restricted_prefixes)
 		}
-		let mut checker = RestrictedIdiomChecker {
-			restricted_prefixes: &restricted_prefixes,
-			found: false,
-		};
-		use crate::expr::visit::Visitor;
-		let _ = checker.visit_expr(&cond.0);
-		checker.found
 	}
 
 	/// Resolve a B-tree index access path covering the WHERE condition for
@@ -2434,6 +2588,96 @@ impl<'ctx> Planner<'ctx> {
 		// ORDER BY at all.
 
 		Ok(Some((path, direction)))
+	}
+}
+
+/// Outcome of resolving which fields on a table carry a non-`Full` SELECT
+/// permission for the current actor.
+enum RestrictedPrefixes {
+	/// Plan-time catalog/permission context is unavailable; callers must
+	/// conservatively assume a restricted field could be referenced.
+	AssumeRestricted,
+	/// The actor sees the table with full field permissions, or no field is
+	/// restricted — index fast paths are safe.
+	None,
+	/// These field-path prefixes are governed by a non-`Full` SELECT
+	/// permission.
+	Some(Vec<Idiom>),
+}
+
+impl RestrictedPrefixes {
+	/// Returns `true` when the WHERE `cond` references a field governed by a
+	/// non-`Full` SELECT permission for the current actor (or when restriction
+	/// must be conservatively assumed because plan-time context is missing).
+	///
+	/// Used to keep an index fast path from turning index entries into a
+	/// membership oracle for a value the actor cannot read.
+	fn cond_touches(&self, cond: &Cond) -> bool {
+		let prefixes = match self {
+			RestrictedPrefixes::AssumeRestricted => return true,
+			RestrictedPrefixes::None => return false,
+			RestrictedPrefixes::Some(p) => p,
+		};
+		let mut checker = RestrictedIdiomChecker {
+			restricted_prefixes: prefixes,
+			found: false,
+		};
+		use crate::expr::visit::Visitor;
+		let _ = checker.visit_expr(&cond.0);
+		checker.found
+	}
+
+	/// SECURITY (value-ordering oracle): returns `true` when any top-level
+	/// `ORDER BY` idiom references a field whose SELECT permission is not
+	/// `Full` for the current actor (or when restriction must be conservatively
+	/// assumed because plan-time context is missing).
+	///
+	/// An index scan walks the B-tree in the indexed field's true value order
+	/// and emits records in that order, while field-level reduction nulls the
+	/// restricted value in the projected output. A stable post-reduce `Sort`
+	/// over the (now all-`NULL`) keys preserves the source order, so the row
+	/// order would still encode the hidden values' relative ordering. Callers
+	/// use this to withhold a restricted `ORDER BY` from access-path selection,
+	/// keeping the source in record-id order so no ordering oracle is exposed.
+	///
+	/// The match is intentionally shallow: each `Order.value` is a plain top-
+	/// level `Idiom`, matched via `Idiom::starts_with(prefix)`. An index-
+	/// ordering leak requires the index to cover the field directly, so a
+	/// restricted field referenced only *inside* an idiom filter (e.g.
+	/// `ORDER BY foo[WHERE code = …]`) is not an indexable ordering and cannot
+	/// leak through this vector. This is the same shallow-match property as the
+	/// WHERE guard ([`Self::cond_touches`]).
+	///
+	/// OUT OF SCOPE (parent/child nested-field gap): `starts_with(prefix)`
+	/// catches ordering by a restricted field *or a descendant of it*
+	/// (`ORDER BY meta` when `meta` is restricted, or `ORDER BY meta.sub` when
+	/// `meta` is restricted), but NOT ordering by a *parent* of a restricted
+	/// child (`ORDER BY meta` when only `meta.secret` is restricted). Ordering
+	/// by the parent object can, with a covering index, still encode the
+	/// child's relative ordering. This is a narrower, separate vector — like
+	/// the compound-index caveat in #394 — and is not addressed here.
+	fn order_touches(&self, order: &OrderClause) -> bool {
+		// `ORDER BY RAND()` references no field and cannot leak ordering.
+		let OrderClause::Order(order_list) = order else {
+			return false;
+		};
+		let prefixes = match self {
+			RestrictedPrefixes::AssumeRestricted => return true,
+			RestrictedPrefixes::None => return false,
+			RestrictedPrefixes::Some(p) => p,
+		};
+		let mut checker = RestrictedIdiomChecker {
+			restricted_prefixes: prefixes,
+			found: false,
+		};
+		use crate::expr::visit::Visitor;
+		for order in order_list.iter() {
+			let _ = checker.visit_idiom(&order.value);
+			if checker.found {
+				return true;
+			}
+		}
+		false
 	}
 }
 

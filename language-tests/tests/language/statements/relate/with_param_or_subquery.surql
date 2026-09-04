@@ -1,5 +1,6 @@
 /**
 [test]
+reason = "Note: Some RELATE statemens currently succeed despite being the same edge ID but emits a warning and suggestion to opt in via OR RELATE. Should return a hard error beginning in 4.0"
 
 [[test.results]]
 value = "NONE"

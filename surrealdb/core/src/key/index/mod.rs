@@ -27,7 +27,11 @@ pub mod di;
 pub mod dl;
 #[cfg(diskann)]
 pub mod dn;
+// `!dp` is the legacy pending-state guard; the current sharded layout tracks pending state in
+// `!dy` (see `dy`). New code never constructs `!dp` keys — old nodes wrote them and tests
+// construct them to simulate a pre-change node — so its items read as dead in a non-test build.
 #[cfg(diskann)]
+#[allow(dead_code)]
 pub mod dp;
 #[cfg(diskann)]
 pub mod dq;
@@ -36,6 +40,10 @@ pub mod dr;
 #[cfg(diskann)]
 pub mod ds;
 pub mod dv;
+#[cfg(diskann)]
+pub mod dw;
+#[cfg(diskann)]
+pub mod dy;
 pub mod hd;
 pub mod he;
 pub mod hg;

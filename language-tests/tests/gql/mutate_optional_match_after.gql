@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "An OPTIONAL block after a write takes the general left-join path (the mutating accumulator is the join's probe side); it must still observe the write. After setting C's age to 99, `OPTIONAL MATCH (m:person WHERE m.age = 99)` binds C (just written) rather than null-filling it."
+
+[[test.results]]
+value = "[{ m: 'C' }]"
+*/
+
+MATCH (n:person WHERE n.name = 'C') SET n.age = 99
+OPTIONAL MATCH (m:person WHERE m.age = 99)
+RETURN m.name AS m

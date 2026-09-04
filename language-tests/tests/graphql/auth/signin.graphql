@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["./_auth.surql"]
+
+[test]
+reason = "The signIn mutation authenticates an existing record user and returns a token"
+
+[[test.results]]
+match = "type::is_string($result.signIn) AND string::len($result.signIn) > 50"
+*/
+mutation {
+	signIn(access: "user", variables: { email: "alice@example.com", pass: "alice-secret" })
+}

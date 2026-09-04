@@ -2,10 +2,11 @@
 
 use std::pin::Pin;
 
-use crate::{cli::Backend, cmd::bench::stats::MeasurementData};
-
 use anyhow::Result;
 use clap::ArgMatches;
+
+use crate::cli::Backend;
+use crate::cmd::bench::stats::MeasurementData;
 
 mod local;
 mod remote;
@@ -15,9 +16,13 @@ static SCHEMA: &str = include_str!("./schema.surql");
 pub struct StoreConfig<'a> {
 	path: &'a String,
 	url: Option<&'a String>,
+	#[cfg_attr(not(feature = "bench-remote-store"), allow(dead_code))]
 	user: &'a String,
+	#[cfg_attr(not(feature = "bench-remote-store"), allow(dead_code))]
 	password: &'a String,
+	#[cfg_attr(not(feature = "bench-remote-store"), allow(dead_code))]
 	ns: &'a String,
+	#[cfg_attr(not(feature = "bench-remote-store"), allow(dead_code))]
 	db: &'a String,
 }
 

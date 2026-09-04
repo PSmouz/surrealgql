@@ -134,14 +134,50 @@ pub(crate) fn finalize_pre_decode_filter(
 	let mut refs: BTreeSet<Strand> = BTreeSet::new();
 	collect_referenced_root_segments(root, &mut refs);
 	for name in &refs {
-		if field_state.computed_fields.iter().any(|c| c.field_name() == name.as_str()) {
-			return Err(PreDecodeFilterReason::ComputedFields);
-		}
-		if check_perms && field_permission_covers(field_state, name.as_str()) {
-			return Err(PreDecodeFilterReason::FieldPermissions);
+		if let Some(reason) = field_state_blocks_raw_read(field_state, name.as_str(), check_perms) {
+			return Err(reason);
 		}
 	}
 	Ok(Arc::new(PreDecodeFilter::new(root.clone(), depth_limit)))
+}
+
+/// Why raw KV bytes reached via top-level field `root` may diverge from the
+/// engine-visible value (or bypass authorisation): the field is read-time
+/// computed (`DEFINE FIELD … COMPUTED …`) — directly or anywhere nested
+/// beneath it — or, when `check_perms`, carries a non-`Allow` SELECT
+/// permission. Returns [`None`] when the field is safe to read raw.
+/// (Write-time `VALUE` clauses are materialised into the stored bytes and do
+/// not populate `computed_fields`.)
+///
+/// Nested computed definitions (`DEFINE FIELD a.b … COMPUTED …`,
+/// `DEFINE FIELD a.*.c … COMPUTED …`) are materialised into the value at read
+/// time, so the raw bytes under root `a` diverge from what the engine
+/// returns; any computed name extending `root` with `.` or `[` blocks the
+/// whole root, mirroring the conservative top-level-segment shape of
+/// [`field_permission_covers`].
+///
+/// Shared by the pre-decode WHERE filter and the TopK threshold probe
+/// ([`crate::exec::topk_pushdown`]), which read ORDER BY / predicate fields
+/// straight from revision-encoded bytes.
+pub(crate) fn field_state_blocks_raw_read(
+	field_state: &FieldState,
+	root: &str,
+	check_perms: bool,
+) -> Option<PreDecodeFilterReason> {
+	let computed_under_root = field_state.computed_fields.iter().any(|c| {
+		let name = c.field_name();
+		name == root
+			|| (name.len() > root.len()
+				&& name.starts_with(root)
+				&& matches!(name.as_bytes()[root.len()], b'.' | b'['))
+	});
+	if computed_under_root {
+		return Some(PreDecodeFilterReason::ComputedFields);
+	}
+	if check_perms && field_permission_covers(field_state, root) {
+		return Some(PreDecodeFilterReason::FieldPermissions);
+	}
+	None
 }
 
 /// Returns `true` if any non-`Allow` field permission could affect a value
@@ -929,13 +965,8 @@ fn flat_clauses_from_specs(specs: &[FuseLeaf]) -> Option<FusedFlatClauses> {
 			reversed: s.reversed,
 		});
 	}
-	let inner: Vec<FusedFlatClause> = map
-		.into_iter()
-		.map(|(key_utf8, ops)| FusedFlatClause {
-			key_utf8,
-			ops,
-		})
-		.collect();
+	let inner: Vec<FusedFlatClause> =
+		map.into_iter().map(|(key_utf8, ops)| FusedFlatClause::new(key_utf8, ops)).collect();
 	FusedFlatClauses::try_new(inner)
 }
 
@@ -1121,6 +1152,40 @@ mod tests {
 			literal,
 			reversed: false,
 		})
+	}
+
+	/// Computed-field blocking must cover nested definitions: a computed
+	/// `a.b` / `a[*].b` makes the raw bytes under root `a` diverge from the
+	/// engine-visible (read-time materialised) value, so any raw read through
+	/// `a` is unsafe. Prefix matches that aren't path boundaries (`ab`) must
+	/// not block.
+	#[test]
+	fn field_state_blocks_raw_read_covers_nested_computed() {
+		use super::{PreDecodeFilterReason, field_state_blocks_raw_read};
+		use crate::exec::operators::scan::pipeline::{ComputedFieldDef, FieldState};
+
+		let mut fs = FieldState::empty();
+		fs.computed_fields = vec![
+			ComputedFieldDef::for_test("a.b"),
+			ComputedFieldDef::for_test("c[*].d"),
+			ComputedFieldDef::for_test("plain"),
+		];
+		// Direct and nested matches block.
+		assert_eq!(
+			field_state_blocks_raw_read(&fs, "a", false),
+			Some(PreDecodeFilterReason::ComputedFields)
+		);
+		assert_eq!(
+			field_state_blocks_raw_read(&fs, "c", false),
+			Some(PreDecodeFilterReason::ComputedFields)
+		);
+		assert_eq!(
+			field_state_blocks_raw_read(&fs, "plain", false),
+			Some(PreDecodeFilterReason::ComputedFields)
+		);
+		// Name-prefix without a `.`/`[` boundary is a different field.
+		assert_eq!(field_state_blocks_raw_read(&fs, "pl", false), None);
+		assert_eq!(field_state_blocks_raw_read(&fs, "other", false), None);
 	}
 
 	#[test]
@@ -1515,6 +1580,7 @@ mod tests {
 			name: "array::len".into(),
 			arguments: vec![tags_idiom],
 			func_required_context: ContextLevel::Root,
+			plan_depth: 0,
 		}) as Arc<dyn crate::exec::PhysicalExpr>;
 		let p = Arc::new(BinaryOp {
 			left: array_len,
@@ -1686,6 +1752,7 @@ mod tests {
 			name: "array::len".into(),
 			arguments: vec![tags_idiom],
 			func_required_context: ContextLevel::Root,
+			plan_depth: 0,
 		}) as Arc<dyn crate::exec::PhysicalExpr>;
 		// Literal on the left, function on the right → reversed compile.
 		let p = Arc::new(BinaryOp {

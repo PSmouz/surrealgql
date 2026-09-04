@@ -28,7 +28,7 @@ mod builder;
 mod replay;
 mod state;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kv-mem"))]
 mod tests;
 
 use std::time::Duration;

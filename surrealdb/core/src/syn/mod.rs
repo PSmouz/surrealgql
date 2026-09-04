@@ -70,6 +70,7 @@ pub fn settings_from_capabilities_config(
 	ParserSettings {
 		object_recursion_limit: config.max_object_parsing_depth as usize,
 		query_recursion_limit: config.max_query_parsing_depth as usize,
+		expr_recursion_limit: config.max_expression_parsing_depth as usize,
 		files_enabled: cap.allows_experimental(&ExperimentalTarget::Files),
 		surrealism_enabled: cap.allows_experimental(&ExperimentalTarget::Surrealism),
 		..Default::default()
@@ -270,6 +271,7 @@ pub(crate) fn expr_legacy_strand(input: &str) -> Result<Expr> {
 	let settings = ParserSettings {
 		object_recursion_limit: usize::MAX,
 		query_recursion_limit: usize::MAX,
+		expr_recursion_limit: usize::MAX,
 		legacy_strands: true,
 		..Default::default()
 	};

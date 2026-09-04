@@ -28,6 +28,7 @@ use crate::kvs::{
 	Datastore, TransactionBuilder, TransactionBuilderFactory, TransactionBuilderParts,
 	TransactionFactory,
 };
+use crate::lq::LiveQueryRouter;
 use crate::observe::{ExecutionObserver, NoopObserver};
 #[cfg(feature = "surrealism")]
 use crate::surrealism::cache::SurrealismCache;
@@ -284,7 +285,7 @@ impl Builder {
 				.context("Could not create http client")?,
 		);
 
-		Ok(Datastore {
+		let datastore = Datastore {
 			id,
 			transaction_factory: tf.clone(),
 			auth_enabled: self.authenticate,
@@ -292,6 +293,7 @@ impl Builder {
 			slow_log: self.slow_log,
 			transaction_timeout: self.transaction_timeout,
 			live_query_broker: self.live_query_broker,
+			live_query_router: Arc::new(LiveQueryRouter::new()),
 			http_endpoint: self.http_endpoint,
 			capabilities,
 			index_stores: IndexStores::new(config.hnsw_cache_size, config.diskann_cache_size),
@@ -299,6 +301,8 @@ impl Builder {
 			#[cfg(storage)]
 			temporary_directory: self.temporary_directory,
 			cache: Arc::new(DatastoreCache::new(config.datastore_cache_size)),
+			#[cfg(all(feature = "graphql", not(target_family = "wasm")))]
+			graphql_schema_cache: crate::graphql::cache::GraphQLSchemaCache::default(),
 			function_registry: Arc::new(FunctionRegistry::with_builtins()),
 			buckets,
 			sequences: Sequences::new(tf, id),
@@ -311,7 +315,22 @@ impl Builder {
 			http_client,
 			observer,
 			config,
-		})
+		};
+		// Under the Router live-query engine, establish the router's baseline
+		// cursor now — before the datastore can accept any connection — so that
+		// every subscription (and every write a subscriber expects to see) lands
+		// strictly after the baseline. A lazy baseline on the first router tick
+		// would otherwise discard events captured in the startup window. Inline
+		// mode never runs the router, so it skips this entirely.
+		if datastore.config.live_query_engine == crate::cnf::LiveQueryEngine::Router {
+			let txn = datastore
+				.transaction(crate::kvs::TransactionType::Read, crate::kvs::LockType::Optimistic)
+				.await?;
+			let baseline = txn.safe_timestamp().await?.as_versionstamp();
+			txn.cancel().await?;
+			datastore.live_query_router.set_baseline(baseline);
+		}
+		Ok(datastore)
 	}
 }
 

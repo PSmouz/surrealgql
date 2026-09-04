@@ -44,6 +44,8 @@ pub enum ExperimentalFeature {
 	Files,
 	/// Enable Surrealism feature.
 	Surrealism,
+	/// Enable the GQL query language.
+	Gql,
 }
 
 /// Not public API
@@ -53,6 +55,7 @@ impl From<&ExperimentalFeature> for ExperimentalTarget {
 		match feature {
 			ExperimentalFeature::Files => ExperimentalTarget::Files,
 			ExperimentalFeature::Surrealism => ExperimentalTarget::Surrealism,
+			ExperimentalFeature::Gql => ExperimentalTarget::Gql,
 		}
 	}
 }

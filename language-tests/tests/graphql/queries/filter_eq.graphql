@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL filter argument with an equality operator"
+
+[[test.results]]
+value = "{ persons: [{ name: 'Alice' }], posts: [{ title: 'Hello world' }, { title: 'Intro to GraphQL' }] }"
+*/
+query {
+	persons(filter: {age: {eq: 30}}) {
+		name
+	}
+	posts(filter: {published: {eq: true}}) {
+		title
+	}
+}

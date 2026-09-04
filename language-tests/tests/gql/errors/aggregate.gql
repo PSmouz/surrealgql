@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a DISTINCT/ALL set quantifier inside an aggregate is not supported yet."
+
+[test.results]
+parsing-error = """
+DISTINCT/ALL inside an aggregate is not supported yet
+  --> [15:25]
+   |
+15 | MATCH (n:person) RETURN count(DISTINCT n)
+   |                         ^^^^^^^^^^^^^^^^^ remove the set quantifier
+"""
+*/
+
+MATCH (n:person) RETURN count(DISTINCT n)

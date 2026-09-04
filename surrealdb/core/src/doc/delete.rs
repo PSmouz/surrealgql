@@ -21,6 +21,8 @@ impl Document {
 		// Otherwise a `WHERE THROW ...` could exfiltrate field values
 		// before the permission check rejects the operation.
 		self.check_delete_permissions(stk, ctx, opt, &self.current).await?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Check if the WHERE condition is truthy
 		self.check_where_condition(stk, ctx, opt, stm.cond()).await?;
 		// Clean up any outgoing references this record holds

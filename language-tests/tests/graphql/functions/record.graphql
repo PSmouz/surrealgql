@@ -1,0 +1,17 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Database functions returning records resolve to the full object type"
+
+[[test.results]]
+value = "{ fn_alice: { age: 30, id: 'person:alice', name: 'Alice' } }"
+*/
+query {
+	fn_alice {
+		id
+		name
+		age
+	}
+}

@@ -19,6 +19,12 @@ runs:
   steps:
     - name: Setup environment
       uses: ./.github/actions/setup-environment
+      with:
+        # `cargo publish --workspace` rebuilds the full workspace (rocksdb +
+        # wasm-opt C/C++ builds) in debug to verify each tarball; on the
+        # GitHub-hosted ubuntu-latest runner that exhausts the disk, so reclaim
+        # the pre-installed toolchains first (Linux-only, no-op elsewhere).
+        free-disk-space: 'true'
 
     - name: Install release-plz
       uses: taiki-e/install-action@80e6af7a2ec7f280fffe2d0a9d3a12a9d11d86e9 # (Actions must be pinned by commit hash) v2.75.1

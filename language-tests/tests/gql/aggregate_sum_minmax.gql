@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "sum/avg/min/max map onto math::sum/mean/min/max and fold per group. Grouped by city: London = {person:1 age 30, person:3 no age}, Paris = {person:2 age 20}."
+
+[[test.results]]
+value = "[{ city: 'London', hi: 30, lo: 30, mean: 30f, total: 30 }, { city: 'Paris', hi: 20, lo: 20, mean: 20f, total: 20 }]"
+*/
+
+MATCH (n:person) RETURN n.city AS city, sum(n.age) AS total, avg(n.age) AS mean, min(n.age) AS lo, max(n.age) AS hi GROUP BY n.city ORDER BY city

@@ -33,6 +33,14 @@ pub struct Options {
 	pub(crate) force: Force,
 	/// Should we run permissions checks?
 	pub(crate) perms: bool,
+	/// Are we evaluating a `PERMISSIONS` predicate (WHERE clause)?
+	///
+	/// Permission predicates are computed with `perms` disabled so they don't
+	/// recurse into their own table's gates. While that is in effect, mutating
+	/// statements (CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT and DDL) must be
+	/// rejected so a predicate cannot produce observable side effects
+	/// (see `SECURITY_GUIDE.md`).
+	pub(crate) permission_predicate: bool,
 	/// Should we process field queries?
 	pub(crate) import: bool,
 	/// The data version as a timestamp
@@ -55,6 +63,7 @@ impl Options {
 			db: None,
 			dive: config.max_computation_depth,
 			perms: true,
+			permission_predicate: false,
 			force: Force::None,
 			import: false,
 			auth: Arc::new(Auth::default()),
@@ -81,6 +90,25 @@ impl Options {
 	pub fn with_max_computation_depth(mut self, depth: u32) -> Self {
 		self.dive = depth;
 		self
+	}
+
+	/// Resume the computation-depth count `depth` levels deeper, reducing the
+	/// remaining budget by that much (saturating at 0).
+	///
+	/// The streaming executor tracks nesting depth as a count *up* toward
+	/// `max_computation_depth`; the legacy `compute` path tracks the same limit
+	/// as the count *down* remaining budget held here in [`Self::dive`]. When the
+	/// streaming engine hands a sub-computation to the legacy path (or to
+	/// embedded scripting, which re-enters via `compute`), this carries the depth
+	/// across so one continuous count applies end-to-end. The configured maximum
+	/// is deliberately *not* altered — only the remaining budget shrinks — so the
+	/// limit a query actually hits is always `max_computation_depth`, never an
+	/// arbitrary smaller number derived from how deep the caller already was.
+	pub(crate) fn with_dive_consumed(&self, depth: u32) -> Self {
+		Self {
+			dive: self.dive.saturating_sub(depth),
+			..self.clone()
+		}
 	}
 
 	/// Specify which Namespace should be used for code which
@@ -159,6 +187,21 @@ impl Options {
 	pub fn new_with_perms(&self, perms: bool) -> Self {
 		Self {
 			perms,
+			..self.clone()
+		}
+	}
+
+	/// Create a new Options object for evaluating a `PERMISSIONS` predicate.
+	///
+	/// Disables permission recursion (like `new_with_perms(false)`) and marks
+	/// the frame as a permission-predicate evaluation, so any attempt to run a
+	/// mutating statement within the predicate is rejected by `Expr::compute`.
+	/// Use this instead of `new_with_perms(false)` at every site that computes
+	/// a stored `Permission::Specific(..)` clause.
+	pub fn new_for_permission_predicate(&self) -> Self {
+		Self {
+			perms: false,
+			permission_predicate: true,
 			..self.clone()
 		}
 	}

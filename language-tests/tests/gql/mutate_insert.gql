@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A leading INSERT (no MATCH) creates a new node once and binds it, so a trailing RETURN projects the created record."
+
+[[test.results]]
+value = "[{ name: 'Z' }]"
+*/
+
+INSERT (p:person {name: 'Z', age: 1}) RETURN p.name AS name

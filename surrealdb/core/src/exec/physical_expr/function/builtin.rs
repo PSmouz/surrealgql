@@ -19,6 +19,10 @@ pub struct BuiltinFunctionExec {
 	pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
 	/// The required context level for this function (looked up at planning time).
 	pub(crate) func_required_context: crate::exec::ContextLevel,
+	/// Expression-nesting depth recorded when this node was planned. Only
+	/// meaningful for `eval::*`, which uses it to continue the depth count when
+	/// it re-plans its query string (see `exec/function/builtin/eval.rs`).
+	pub(crate) plan_depth: u32,
 }
 impl PhysicalExpr for BuiltinFunctionExec {
 	fn name(&self) -> &'static str {
@@ -54,14 +58,21 @@ impl PhysicalExpr for BuiltinFunctionExec {
 			if func.is_pure() && !func.is_async() {
 				Ok(func.invoke(args)?)
 			} else {
+				// Surface the plan-time nesting depth so `eval::*` can continue
+				// counting toward `max_computation_depth` when it re-plans its
+				// query string. Harmless for every other builtin (they ignore it).
+				let mut ctx = ctx;
+				ctx.plan_depth = self.plan_depth;
 				Ok(func.invoke_async(&ctx, args).await?)
 			}
 		})
 	}
 
 	fn access_mode(&self) -> AccessMode {
-		// api::invoke is read-write, everything else is read-only
-		let func_mode = if self.name == "api::invoke" {
+		// `api::invoke` and the `eval::*` functions can run nested writes, so they
+		// are read-write; everything else is read-only.
+		let func_mode = if matches!(self.name.as_str(), "api::invoke" | "eval::surql" | "eval::gql")
+		{
 			AccessMode::ReadWrite
 		} else {
 			AccessMode::ReadOnly

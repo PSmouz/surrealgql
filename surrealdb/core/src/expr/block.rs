@@ -71,6 +71,11 @@ impl Block {
 		self.0.iter().all(|x| x.read_only())
 	}
 
+	/// Check if this block directly contains a data-modifying statement.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		self.0.iter().any(|x| x.has_direct_write())
+	}
+
 	/// Process this type returning a computed simple Value
 	#[instrument(level = "trace", name = "Block::compute", skip_all)]
 	pub(crate) async fn compute(

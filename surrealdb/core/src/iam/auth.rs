@@ -65,6 +65,34 @@ impl Auth {
 		matches!(self.level(), Level::Database(n, d) if n.eq(ns) && d.eq(db))
 	}
 
+	/// Check whether the authenticated level is permitted to operate within the
+	/// given namespace and database.
+	///
+	/// This is the tenant-boundary gate for entry points that derive the target
+	/// namespace/database from caller-controlled input — most notably the custom
+	/// API HTTP route `/api/:ns/:db/:endpoint`, whose handlers run with
+	/// permissions disabled. The authenticated [`Level`] is the source of truth;
+	/// the session's *selected* `ns`/`db` are not, because they are overwritten
+	/// from the request before dispatch.
+	///
+	/// - Root principals may act in any namespace/database.
+	/// - Namespace principals are confined to their own namespace (any database).
+	/// - Database and record principals are confined to their exact namespace/database.
+	/// - Anonymous (unauthenticated) sessions carry no tenant identity, so they are left to the
+	///   endpoint's own permission checks.
+	///
+	/// This is purely a namespace/database scope check; it does not replace
+	/// role or `PERMISSIONS` evaluation.
+	pub fn can_access_ns_db(&self, ns: &str, db: &str) -> bool {
+		match self.level() {
+			Level::Root => true,
+			Level::Namespace(n) => n.eq(ns),
+			Level::Database(n, d) => n.eq(ns) && d.eq(db),
+			Level::Record(n, d, _) => n.eq(ns) && d.eq(db),
+			Level::No => true,
+		}
+	}
+
 	/// System Auth helpers
 	///
 	/// These are not stored in the database and are used for internal
@@ -131,5 +159,40 @@ impl Auth {
 	/// Checks if the current actor has a Viewer role
 	pub fn has_viewer_role(&self) -> bool {
 		self.actor.has_viewer_role()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn can_access_ns_db_enforces_tenant_boundary() {
+		// Root may access any namespace/database.
+		let root = Auth::for_root(Role::Viewer);
+		assert!(root.can_access_ns_db("a", "x"));
+		assert!(root.can_access_ns_db("b", "y"));
+
+		// Namespace principals are confined to their namespace (any database).
+		let ns = Auth::for_ns(Role::Viewer, "a");
+		assert!(ns.can_access_ns_db("a", "x"));
+		assert!(ns.can_access_ns_db("a", "y"));
+		assert!(!ns.can_access_ns_db("b", "x"));
+
+		// Database principals are confined to their exact namespace/database.
+		let db = Auth::for_db(Role::Viewer, "a", "x");
+		assert!(db.can_access_ns_db("a", "x"));
+		assert!(!db.can_access_ns_db("a", "y"));
+		assert!(!db.can_access_ns_db("b", "x"));
+
+		// Record principals are confined to their namespace/database.
+		let rec = Auth::for_record("user:1".to_string(), "a", "x", "ac");
+		assert!(rec.can_access_ns_db("a", "x"));
+		assert!(!rec.can_access_ns_db("a", "y"));
+		assert!(!rec.can_access_ns_db("b", "x"));
+
+		// Anonymous sessions carry no tenant identity; the scope test is
+		// permissive and the endpoint's own permission checks remain the gate.
+		assert!(Auth::default().can_access_ns_db("a", "x"));
 	}
 }

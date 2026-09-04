@@ -1,0 +1,14 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL delete mutation removes a single record; it returns true whether or not the record existed (DELETE is idempotent)"
+
+[[test.results]]
+value = "{ deleted: true, missing: true }"
+*/
+mutation {
+	deleted: deleteEvent(id: "launch")
+	missing: deleteEvent(id: "nonexistent")
+}

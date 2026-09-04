@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["./_no_introspection.surql"]
+
+[test]
+reason = "Regular queries still work when introspection is disabled"
+
+[[test.results]]
+value = "{ person: { name: 'Alice' } }"
+*/
+query {
+	person(id: "alice") {
+		name
+	}
+}

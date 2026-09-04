@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["./_complexity_limit.surql"]
+
+[test]
+reason = "Queries exceeding the configured COMPLEXITY limit are rejected"
+
+[[test.results]]
+error = "Query is too complex."
+*/
+query {
+	persons {
+		id
+		name
+		age
+		active
+		score
+	}
+}

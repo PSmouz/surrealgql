@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["./_auth.surql"]
+
+[test]
+reason = "The signUp mutation creates a record user through the access definition and returns a token"
+
+[[test.results]]
+match = "type::is_string($result.signUp) AND string::len($result.signUp) > 50"
+*/
+mutation {
+	signUp(access: "user", variables: { email: "dave@example.com", pass: "dave-secret" })
+}

@@ -1,0 +1,19 @@
+/**
+[env]
+imports = ["./_depth_limit.surql"]
+
+[test]
+reason = "Queries nesting deeper than the configured DEPTH limit are rejected"
+
+[[test.results]]
+error = "Query is nested too deep."
+*/
+query {
+	posts {
+		author {
+			address {
+				city
+			}
+		}
+	}
+}

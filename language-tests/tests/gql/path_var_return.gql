@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R5: a path variable (`MATCH p = ...`) returns the whole path as an alternating array [node, edge, node, ..., node] of FULL records (2k+1 elements for a k-hop path). On the triangle `{1,2}`, the depth-1 paths are 3-element [n,e,n] and the depth-2 paths are 5-element [n,e,n,e,n]; node objects carry their full fields (age/name/id) and edge objects carry id/in/out/since. Hand-derived from D: D->E p=[hub:4,l45,hub:5]; D->F p=[hub:4,l45,hub:5,l56,hub:6]; symmetric for E and F. 6 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'E', pth: [{ age: 40, id: hub:4, name: 'D' }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { age: 50, id: hub:5, name: 'E' }] }, { an: 'D', bn: 'F', pth: [{ age: 40, id: hub:4, name: 'D' }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { age: 50, id: hub:5, name: 'E' }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { age: 60, id: hub:6, name: 'F' }] }, { an: 'E', bn: 'D', pth: [{ age: 50, id: hub:5, name: 'E' }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { age: 60, id: hub:6, name: 'F' }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { age: 40, id: hub:4, name: 'D' }] }, { an: 'E', bn: 'F', pth: [{ age: 50, id: hub:5, name: 'E' }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { age: 60, id: hub:6, name: 'F' }] }, { an: 'F', bn: 'D', pth: [{ age: 60, id: hub:6, name: 'F' }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { age: 40, id: hub:4, name: 'D' }] }, { an: 'F', bn: 'E', pth: [{ age: 60, id: hub:6, name: 'F' }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { age: 40, id: hub:4, name: 'D' }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { age: 50, id: hub:5, name: 'E' }] }]"
+*/
+
+MATCH p = (a:hub)-[:link]->{1,2}(b:hub) RETURN a.name AS an, b.name AS bn, p AS pth ORDER BY an, bn

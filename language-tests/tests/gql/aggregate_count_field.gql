@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "count(x) counts rows where x is not null (GQL semantics), unlike count(*). person:3 has no age, so only two of the three persons are counted."
+
+[[test.results]]
+value = "[{ with_age: 2 }]"
+*/
+
+MATCH (n:person) RETURN count(n.age) AS with_age

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (V2_DESIGN §1 optional-rebind): a node variable first bound INSIDE an OPTIONAL (`b`, depth 1) cannot be re-declared in a later MANDATORY clause (depth 0). On an optional miss `b` is Value::Null (R3), so a mandatory pattern cannot anchor / equi-join on it — re-declaring it outside the optional is rejected cleanly at lowering with a dedicated message, not surfaced as a planner internal error."
+
+[test.results]
+parsing-error = """
+Variable `b` was first bound inside an OPTIONAL and cannot be re-declared outside it
+  --> [15:65]
+   |
+15 | ...n) MATCH (b)-[:knows]->(c:person) RETURN a.name AS name
+   |              ^ a variable an OPTIONAL introduces may be NULL, so a mandatory pattern cannot reuse it; name the mandatory element differently
+"""
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) MATCH (b)-[:knows]->(c:person) RETURN a.name AS name

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A predicate WRITTEN inside the optional evaluates PRE-null (R3): it is compiled inside the optional subplan / OptionalExpand, filtering the match before the left-outer null-fill. `b.age > 25` only keeps knows->person targets older than 25; person:1's only such target (person:2, age 20) is filtered out, so person:1 nulls `b` rather than being dropped (left-outer preserves the mandatory `a`)."
+
+[[test.results]]
+value = "[{ friend: NONE, name: 'A' }, { friend: 'A', name: 'B' }, { friend: 'A', name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b.age > 25 RETURN a.name AS name, b.name AS friend ORDER BY name, friend

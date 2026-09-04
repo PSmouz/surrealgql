@@ -62,6 +62,10 @@
 mod aggregate;
 mod cycle_guard;
 mod idiom;
+// GQL `MATCH` planning (`plan_match`). Gated like the IR it consumes
+// (`expr::Expr::Match` is `#[cfg(feature = "gql")]`).
+#[cfg(feature = "gql")]
+mod match_plan;
 mod row_scope;
 mod select;
 mod source;
@@ -171,6 +175,23 @@ pub struct Planner<'ctx> {
 	/// Cached `new_planner_strategy()` snapshot — the strategy doesn't
 	/// change during a single planning pass.
 	planner_strategy: NewPlannerStrategy,
+	/// Re-entry nesting depth for this planner, the streaming engine's analogue
+	/// of the legacy executor's `Options::dive` (and bounded by the same
+	/// `max_computation_depth`).
+	///
+	/// This is an **immutable** construction parameter — set once via
+	/// [`Planner::with_depth`] and only ever read. A top-level planner starts at
+	/// 0. Whenever execution re-enters the planner to compile a *new* query at
+	/// runtime — an `eval` string, a user-defined-function / closure body, or a
+	/// deferred control-flow operator's branch — the fresh planner is seeded at
+	/// `parent_depth + 1`, so the count continues across the boundary rather than
+	/// resetting. The within-plan expression/statement tree is already bounded by
+	/// the parser's recursion limits, so this only needs to bound the unbounded
+	/// axis: the chain of runtime re-entries. Rejecting once it exceeds
+	/// `max_computation_depth` is what stops `eval`/UDF recursion from growing the
+	/// native stack without limit (the legacy path can't overflow — it runs on a
+	/// heap `TreeStack`).
+	depth: u32,
 }
 
 impl<'ctx> Planner<'ctx> {
@@ -191,6 +212,7 @@ impl<'ctx> Planner<'ctx> {
 			cycle_guard: CycleGuard::default(),
 			ns_db_ids_cache: tokio::sync::OnceCell::new(),
 			planner_strategy: *ctx.new_planner_strategy(),
+			depth: 0,
 		}
 	}
 
@@ -217,6 +239,7 @@ impl<'ctx> Planner<'ctx> {
 			cycle_guard: CycleGuard::default(),
 			ns_db_ids_cache: tokio::sync::OnceCell::new(),
 			planner_strategy: *ctx.new_planner_strategy(),
+			depth: 0,
 		}
 	}
 
@@ -312,6 +335,39 @@ impl<'ctx> Planner<'ctx> {
 	#[inline]
 	pub(crate) fn cycle_guard(&self) -> CycleGuard {
 		self.cycle_guard.clone()
+	}
+
+	/// Seed the re-entry nesting depth (see the `depth` field).
+	///
+	/// Used when a runtime re-entry (`eval` re-planning its query string, a
+	/// user-defined-function / closure body, a deferred control-flow branch)
+	/// starts a fresh planner but must continue counting from the depth of the
+	/// boundary that triggered it (`parent + 1`), so the limit reflects the total
+	/// nesting across the boundary rather than resetting to 0.
+	#[must_use]
+	pub(crate) fn with_depth(mut self, depth: u32) -> Self {
+		self.depth = depth;
+		self
+	}
+
+	/// The re-entry nesting depth recorded onto nodes planned here (see the
+	/// `depth` field). Constant for the planner's lifetime.
+	#[inline]
+	pub(crate) fn current_depth(&self) -> u32 {
+		self.depth
+	}
+
+	/// Reject planning once this planner's re-entry depth has exceeded
+	/// `max_computation_depth`. Checked at the entry of [`Planner::physical_expr`]
+	/// and [`Planner::plan_expr`] — the two points at which a runtime re-entry
+	/// begins compiling a fresh query — so a runaway `eval`/UDF chain stops here
+	/// instead of growing the native stack.
+	#[inline]
+	fn check_depth(&self) -> Result<(), Error> {
+		if self.depth > self.ctx.config.max_computation_depth {
+			return Err(Error::ComputationDepthExceeded);
+		}
+		Ok(())
 	}
 
 	/// Plan-time transaction, when available. Returns `None` for txn-less
@@ -490,6 +546,11 @@ impl<'ctx> Planner<'ctx> {
 		&self,
 		expr: Expr,
 	) -> Result<Arc<dyn crate::exec::PhysicalExpr>, Error> {
+		// Reject if this planner's re-entry depth (carried in from the boundary
+		// that started it) has already exceeded `max_computation_depth`. The depth
+		// recorded onto `eval` / UDF / JS nodes below lets a runtime re-entry
+		// continue the count from here.
+		self.check_depth()?;
 		match expr {
 			// Literals and constant values
 			Expr::Literal(lit) => Box::pin(self.physical_literal(lit)).await,
@@ -582,6 +643,13 @@ impl<'ctx> Planner<'ctx> {
 			| Expr::Relate(_)
 			| Expr::Insert(_) => Err(Error::PlannerUnsupported(
 				"DML subqueries not yet supported in execution plans".to_string(),
+			)),
+
+			// GQL MATCH is only ever planned as a top-level operator tree
+			// (`plan_match`), never as a scalar sub-expression.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => Err(Error::PlannerUnsupported(
+				"GQL MATCH cannot be used as a sub-expression".to_string(),
 			)),
 		}
 	}
@@ -738,12 +806,16 @@ impl<'ctx> Planner<'ctx> {
 		op: crate::expr::operator::PrefixOperator,
 		expr: Expr,
 	) -> Result<Arc<dyn crate::exec::PhysicalExpr>, Error> {
-		// Check for excessively deep prefix/cast chains. The old compute path
-		// enforces a recursion depth limit via TreeStack; the new physical-expr
-		// evaluator does not track depth. Detect deep chains at planning time
-		// and reject with the same error.
+		// Prefix/cast chains (`!!!!x`, repeated casts) build a `UnaryOp` spine that
+		// the streaming evaluator walks recursively at runtime. The parser's
+		// `expr_recursion_limit` can sit above `max_computation_depth`, so a chain
+		// in that window would slip past parsing and overflow at evaluation. Bound
+		// the spine length here, iteratively (no recursion), against the
+		// computation limit — offset by this planner's carried re-entry `depth` so
+		// the bound is continuous across `eval`/UDF boundaries, matching the legacy
+		// `Options::dive` accounting.
 		{
-			let mut d = 0u32;
+			let mut d = self.depth;
 			let mut cur = &expr;
 			while let Expr::Prefix {
 				expr: inner,
@@ -829,6 +901,9 @@ impl<'ctx> Planner<'ctx> {
 						name,
 						arguments,
 						func_required_context: func_ctx,
+						// Recorded so `eval::*` can continue the depth count from
+						// here when it re-plans its query string at runtime.
+						plan_depth: self.current_depth(),
 					}))
 				}
 			}
@@ -837,6 +912,9 @@ impl<'ctx> Planner<'ctx> {
 				Ok(Arc::new(UserDefinedFunctionExec {
 					name,
 					arguments,
+					// Recorded so the function body, planned lazily on call,
+					// continues the depth count from here rather than resetting.
+					plan_depth: self.current_depth(),
 				}))
 			}
 			Function::Script(script) => {
@@ -844,6 +922,9 @@ impl<'ctx> Planner<'ctx> {
 				Ok(Arc::new(JsFunctionExec {
 					script,
 					arguments,
+					// Recorded so a script that re-enters SurrealQL starts from the
+					// remaining budget rather than a full fresh one.
+					plan_depth: self.current_depth(),
 				}))
 			}
 			Function::Model(model) => {
@@ -1105,6 +1186,10 @@ impl<'ctx> Planner<'ctx> {
 		expr: Expr,
 	) -> crate::exec::BoxFut<'_, Result<Arc<dyn ExecOperator>, Error>> {
 		Box::pin(async move {
+			// Bound runtime re-entries that begin at the statement level (a
+			// deferred IF/FOR branch that is itself a statement) — mirrors the
+			// check in `physical_expr`.
+			self.check_depth()?;
 			match expr {
 				Expr::Select(select) => self.plan_select_statement(*select).await,
 				Expr::Block(block) => self.plan_block(*block).await,
@@ -1154,6 +1239,13 @@ impl<'ctx> Planner<'ctx> {
 						"DDL statements not yet supported in execution plans".to_string(),
 					))
 				}
+
+				// GQL MATCH is planned into an operator tree by `plan_match`
+				// (`exec/planner/match_plan.rs`). It never returns
+				// PlannerUnsupported/Unimplemented — a MatchPlan only reaches here
+				// because it lowered cleanly, so any failure is a real error.
+				#[cfg(feature = "gql")]
+				Expr::Match(m) => self.plan_match(*m).await,
 			}
 		})
 	}
@@ -1166,7 +1258,9 @@ impl<'ctx> Planner<'ctx> {
 		} else if block.0.len() == 1 {
 			self.plan_expr(block.0.into_iter().next().expect("block verified non-empty")).await
 		} else {
-			Ok(Arc::new(SequencePlan::new(block)) as Arc<dyn ExecOperator>)
+			// Record the current nesting depth so the deferred per-statement
+			// planning at runtime continues the count toward `max_computation_depth`.
+			Ok(Arc::new(SequencePlan::new(block, self.current_depth())) as Arc<dyn ExecOperator>)
 		}
 	}
 
@@ -1333,7 +1427,10 @@ impl<'ctx> Planner<'ctx> {
 			range,
 			block,
 		} = stmt;
-		Ok(Arc::new(ForeachPlan::new(param, range, block)) as Arc<dyn ExecOperator>)
+		// Record the current nesting depth so the deferred body/range planning at
+		// runtime continues the count toward `max_computation_depth`.
+		Ok(Arc::new(ForeachPlan::new(param, range, block, self.current_depth()))
+			as Arc<dyn ExecOperator>)
 	}
 
 	fn plan_if_else_statement(
@@ -1344,7 +1441,9 @@ impl<'ctx> Planner<'ctx> {
 			exprs,
 			close,
 		} = stmt;
-		Ok(Arc::new(IfElsePlan::new(exprs, close)) as Arc<dyn ExecOperator>)
+		// Record the current nesting depth so the deferred branch planning at
+		// runtime continues the count toward `max_computation_depth`.
+		Ok(Arc::new(IfElsePlan::new(exprs, close, self.current_depth())) as Arc<dyn ExecOperator>)
 	}
 
 	fn plan_sleep_statement(
@@ -1379,7 +1478,12 @@ macro_rules! try_plan_expr {
 	// (typically via `Options` or `ExecutionContext`) and forwards it so
 	// the planner can make plan-time decisions that depend on whether
 	// permissions will actually run at execute time.
-	($expr:expr, $ctx:expr, $txn:expr, $auth:expr) => {{
+	($expr:expr, $ctx:expr, $txn:expr, $auth:expr) => {{ $crate::exec::planner::try_plan_expr!($expr, $ctx, $txn, $auth, 0u32) }};
+	// Five-arg form: as above, plus a seed for the expression-nesting depth
+	// counter. Non-zero only when re-planning a nested query at runtime (an
+	// `eval` string) so the depth limit continues across the re-entry rather
+	// than resetting — see `Planner::with_depth`.
+	($expr:expr, $ctx:expr, $txn:expr, $auth:expr, $depth:expr) => {{
 		let __expr: &$crate::expr::Expr = $expr;
 		if matches!(
 			__expr,
@@ -1398,7 +1502,7 @@ macro_rules! try_plan_expr {
 		} else if *$ctx.new_planner_strategy() == $crate::dbs::NewPlannerStrategy::ComputeOnly {
 			Err($crate::err::Error::PlannerUnsupported(String::new()))
 		} else {
-			$crate::exec::planner::plan_expr_inner(__expr, $ctx, $txn, $auth).await
+			$crate::exec::planner::plan_expr_inner(__expr, $ctx, $txn, $auth, $depth).await
 		}
 	}};
 }
@@ -1422,6 +1526,7 @@ pub(crate) async fn plan_expr_inner(
 	ctx: &FrozenContext,
 	txn: Arc<crate::kvs::Transaction>,
 	auth: Option<Arc<crate::iam::Auth>>,
+	depth: u32,
 ) -> Result<Arc<dyn ExecOperator>, Error> {
 	// Extract ns/db from the context session parameters if available
 	let ns =
@@ -1438,7 +1543,7 @@ pub(crate) async fn plan_expr_inner(
 				_ => None,
 			}
 		});
-	let mut planner = Planner::with_txn(ctx, txn, ns, db);
+	let mut planner = Planner::with_txn(ctx, txn, ns, db).with_depth(depth);
 	if let Some(auth) = auth {
 		planner = planner.with_auth(auth);
 	}
@@ -1491,6 +1596,22 @@ pub(crate) async fn expr_to_physical_expr(
 	ctx: &FrozenContext,
 ) -> Result<Arc<dyn crate::exec::PhysicalExpr>, Error> {
 	Planner::new(ctx).physical_expr(expr).await
+}
+
+/// As [`expr_to_physical_expr`], but seeds the expression-nesting depth counter
+/// (see [`Planner::with_depth`]).
+///
+/// Used when planning a body lazily at runtime that is a *continuation* of an
+/// outer descent — chiefly a user-defined-function body planned in
+/// [`crate::exec::physical_expr::block`], which passes the depth recorded on the
+/// calling node so nested `eval`/UDF recursion stays bounded by the same
+/// `max_computation_depth` the legacy path counts against.
+pub(crate) async fn expr_to_physical_expr_at_depth(
+	expr: Expr,
+	ctx: &FrozenContext,
+	depth: u32,
+) -> Result<Arc<dyn crate::exec::PhysicalExpr>, Error> {
+	Planner::new(ctx).with_depth(depth).physical_expr(expr).await
 }
 
 // ============================================================================

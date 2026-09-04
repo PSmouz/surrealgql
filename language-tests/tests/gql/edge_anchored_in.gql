@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "EDGE-ANCHORED single pattern with an INCOMING edge (`<-`): unlabeled nodes + labeled edge `:knows` force the edge-first plan (Bind + EndpointBind x2), and the `In` direction makes EndpointBind map the edge's `out` field to the near node `a` and `in` to the far node `b` (the role swap vs the `Out` form). One edge position, so R2 is inert. Every knows edge participates (no node label filters the city edge): reading each edge as b -> a, the (a,b) pairs are (B,A) via k12, (A,B) via k21, (C,B) via k23, (London,A) via k1c, (A,C) via k31."
+
+[[test.results]]
+value = "[{ a: 'A', b: 'B' }, { a: 'A', b: 'C' }, { a: 'B', b: 'A' }, { a: 'C', b: 'B' }, { a: 'London', b: 'A' }]"
+*/
+
+MATCH (a)<-[:knows]-(b)
+RETURN a.name AS a, b.name AS b ORDER BY a, b

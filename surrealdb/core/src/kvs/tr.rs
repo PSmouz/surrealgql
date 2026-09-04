@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 
 use super::api::{
-	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanLimit, ScanResult, Transactable,
+	GetMultiResult, KeysResult, ScanCursorKeys, ScanCursorVals, ScanResult, Transactable,
 };
 use super::batch::Batch;
 use super::direction::Direction;
@@ -324,7 +324,7 @@ impl Transactor {
 	pub async fn keys<K>(
 		&self,
 		rng: Range<K>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> Result<KeysResult>
@@ -349,7 +349,7 @@ impl Transactor {
 	pub async fn keysr<K>(
 		&self,
 		rng: Range<K>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> Result<KeysResult>
@@ -374,7 +374,7 @@ impl Transactor {
 	pub async fn scan<K>(
 		&self,
 		rng: Range<K>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> Result<ScanResult>
@@ -399,7 +399,7 @@ impl Transactor {
 	pub async fn scanr<K>(
 		&self,
 		rng: Range<K>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> Result<ScanResult>
@@ -542,6 +542,13 @@ impl Transactor {
 	/// Get the current monotonic timestamp
 	pub async fn timestamp(&self) -> Result<BoxTimeStamp> {
 		self.inner.timestamp().await
+	}
+
+	/// Get the current safe (closed) watermark timestamp — the versionstamp at or
+	/// below which every committed transaction is final and visible. Defaults to
+	/// the monotonic timestamp; distributed backends override it.
+	pub async fn safe_timestamp(&self) -> Result<BoxTimeStamp> {
+		self.inner.safe_timestamp().await
 	}
 
 	/// Returns the implementation of timestamp that this transaction uses.

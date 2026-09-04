@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a path-search prefix attaches to exactly one variable-length segment; a chain of two quantified hops is out of scope."
+
+[test.results]
+parsing-error = """
+A path search prefix requires a single variable-length segment, e.g. `(a)-[:edge]->{1,3}(b)`
+  --> [15:7]
+   |
+15 | MATCH ANY SHORTEST (a:wp)-[:road]->+(b:wp)-[:road]->+(c:wp) RETURN a.name AS an
+   |       ^^^^^^^^^^^^ quantify exactly one edge (`{m,n}`, `+`, `*`)
+"""
+*/
+
+MATCH ANY SHORTEST (a:wp)-[:road]->+(b:wp)-[:road]->+(c:wp) RETURN a.name AS an

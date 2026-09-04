@@ -147,9 +147,13 @@ impl TableMutation {
 				h.insert("define_table", t.structure());
 				h
 			}
-			TableMutation::DelWithOriginal(id, _val) => {
+			TableMutation::DelWithOriginal(id, val) => {
 				let mut inner = Object::default();
 				inner.insert("id", Value::RecordId(id));
+				// Surface the stored pre-image so `INCLUDE ORIGINAL` deletes are
+				// readable via SHOW CHANGES. Additive: plain `Del` is unchanged,
+				// and only `store_diff` deletes carry this `original` field.
+				inner.insert("original", val);
 				h.insert("delete", Value::Object(inner));
 				h
 			}
@@ -171,11 +175,13 @@ impl DatabaseMutation {
 }
 
 impl ChangeSet {
-	pub fn into_value(self) -> Value {
+	pub fn into_value(self) -> anyhow::Result<Value> {
 		let mut m = Object::default();
-		m.insert("versionstamp", Value::from(self.0));
+		// The versionstamp is a u128; convert it losslessly (erroring rather
+		// than truncating if it is ever too large to represent as a Number).
+		m.insert("versionstamp", Value::try_from(self.0)?);
 		m.insert("changes", self.1.into_value());
-		Value::Object(m)
+		Ok(Value::Object(m))
 	}
 }
 
@@ -217,7 +223,7 @@ mod tests {
 				],
 			)]),
 		);
-		let v = convert_value_to_public_value(cs.into_value()).unwrap().into_json_value();
+		let v = convert_value_to_public_value(cs.into_value().unwrap()).unwrap().into_json_value();
 		let s = serde_json::to_string(&v).unwrap();
 		assert_eq!(
 			s,
@@ -270,11 +276,11 @@ mod tests {
 				],
 			)]),
 		);
-		let v = convert_value_to_public_value(cs.into_value()).unwrap().into_json_value();
+		let v = convert_value_to_public_value(cs.into_value().unwrap()).unwrap().into_json_value();
 		let s = serde_json::to_string(&v).unwrap();
 		assert_eq!(
 			s,
-			r#"{"changes":[{"current":{"id":"mytb:tobie","note":"surreal"},"update":[{"op":"add","path":"/note","value":"surreal"}]},{"current":{"id":"mytb:tobie2","note":"surreal"},"update":[{"op":"remove","path":"/temp"}]},{"delete":{"id":"mytb:tobie"}},{"delete":{"id":"mytb:tobie"}},{"define_table":{"drop":false,"id":3,"kind":{"kind":"ANY"},"name":"mytb","permissions":{"create":false,"delete":false,"select":false,"update":false},"schemafull":false}}],"versionstamp":65536}"#
+			r#"{"changes":[{"current":{"id":"mytb:tobie","note":"surreal"},"update":[{"op":"add","path":"/note","value":"surreal"}]},{"current":{"id":"mytb:tobie2","note":"surreal"},"update":[{"op":"remove","path":"/temp"}]},{"delete":{"id":"mytb:tobie"}},{"delete":{"id":"mytb:tobie","original":{"id":"mytb:tobie","note":"surreal"}}},{"define_table":{"drop":false,"id":3,"kind":{"kind":"ANY"},"name":"mytb","permissions":{"create":false,"delete":false,"select":false,"update":false},"schemafull":false}}],"versionstamp":65536}"#
 		);
 	}
 }

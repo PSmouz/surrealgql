@@ -190,6 +190,9 @@ impl StatementType {
 			}
 			| Expr::FunctionCall(_)
 			| Expr::Closure(_) => Self::Other,
+			// GQL MATCH is not a SurrealQL statement-shaped expression.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => Self::Other,
 		}
 	}
 

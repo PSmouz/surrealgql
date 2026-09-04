@@ -128,6 +128,42 @@ impl Document {
 		Ok(())
 	}
 
+	/// Checks that the table for this document is not a view
+	/// (`DEFINE TABLE ... AS SELECT`). View tables are read-only:
+	/// their records are computed from the source query and are
+	/// maintained automatically, so manual CREATE / INSERT / UPSERT /
+	/// UPDATE / DELETE / RELATE statements are rejected.
+	///
+	/// Imports are exempt: a database export emits the stored rows of
+	/// a materialised view as `INSERT` statements, so replaying them
+	/// must be allowed. This mirrors the `opt.import` guard in
+	/// [`Self::process_table_views`], which likewise skips view
+	/// maintenance while importing.
+	///
+	/// Call this *after* the table-level permission check in each write
+	/// path (as the sibling [`Self::check_table_type_create`] is), so an
+	/// actor who lacks permission still gets the normal permission
+	/// outcome (e.g. a silent skip) rather than an error that would
+	/// disclose the table is a view.
+	#[inline]
+	pub(super) fn check_table_not_view(&self, opt: &Options) -> Result<()> {
+		// Allow writes to view tables while replaying an export
+		if opt.import {
+			return Ok(());
+		}
+		// Get the table for this document
+		let tb = self.doc_ctx.tb()?;
+		// Ensure the table is not a computed view
+		ensure!(
+			tb.view.is_none(),
+			Error::TableIsView {
+				table: tb.name.to_string(),
+			}
+		);
+		// Carry on
+		Ok(())
+	}
+
 	/// Quick `PERMISSIONS FOR create` preflight that only short-circuits
 	/// `Permission::None`. Used by the create-side of CREATE / UPSERT /
 	/// INSERT / RELATE to bail before computing the data clause when
@@ -421,8 +457,8 @@ impl Document {
 			Permission::None => Err(IgnoreError::Ignore),
 			Permission::Full => Ok(()),
 			Permission::Specific(e) => {
-				// Disable permissions
-				let opt = &opt.new_with_perms(false);
+				// Disable permission recursion and block side effects
+				let opt = &opt.new_for_permission_predicate();
 				// Process the PERMISSION clause
 				if !stk
 					.run(|stk| e.compute(stk, ctx, opt, Some(doc)))

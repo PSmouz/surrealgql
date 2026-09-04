@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL filters combine multiple field conditions (implicit AND)"
+
+[[test.results]]
+value = "{ persons: [{ name: 'Alice' }], posts: [{ title: 'Hello world' }] }"
+*/
+query {
+	persons(filter: {active: {eq: true}, age: {lt: 32}}) {
+		name
+	}
+	posts(filter: {published: {eq: true}, views: {gt: 50}}) {
+		title
+	}
+}

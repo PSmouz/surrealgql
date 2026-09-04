@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Numeric-only contract (v1): min/max map onto the numeric math::min/math::max accumulators, which silently ignore non-numeric values. Over the string `name` column they accumulate nothing and return the empty-accumulator identity (Infinity/-Infinity) rather than an orderable min/max. Orderable MIN/MAX is a documented follow-up."
+
+[[test.results]]
+value = "[{ hi: -Infinity, lo: Infinity }]"
+*/
+
+MATCH (n:person) RETURN min(n.name) AS lo, max(n.name) AS hi

@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures::stream::FuturesUnordered;
 use surrealdb_core::channel::Receiver;
 #[cfg(feature = "graphql")]
-use surrealdb_core::gql::NotificationRouter;
+use surrealdb_core::graphql::NotificationRouter;
 use surrealdb_core::rpc::{DbResponse, DbResult};
 use surrealdb_types::Notification;
 use tokio::sync::RwLock;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[cfg(feature = "graphql")]
-use crate::cnf::GQL_SUBSCRIPTION_CHANNEL_CAPACITY;
+use crate::cnf::GRAPHQL_SUBSCRIPTION_CHANNEL_CAPACITY;
 use crate::rpc::websocket::Websocket;
 
 static CONN_CLOSED_ERR: &str = "Connection closed normally";
@@ -77,7 +77,7 @@ impl RpcState {
 			metrics_observer,
 			#[cfg(feature = "graphql")]
 			notification_router: Arc::new(NotificationRouter::new(
-				*GQL_SUBSCRIPTION_CHANNEL_CAPACITY,
+				*GRAPHQL_SUBSCRIPTION_CHANNEL_CAPACITY,
 			)),
 		}
 	}

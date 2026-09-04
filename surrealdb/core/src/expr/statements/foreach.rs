@@ -36,6 +36,11 @@ impl ForeachStatement {
 	pub(crate) fn read_only(&self) -> bool {
 		self.range.read_only() && self.block.read_only()
 	}
+
+	/// Check if the range or body directly contains a data-modifying statement.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		self.range.has_direct_write() || self.block.has_direct_write()
+	}
 	/// Process this type returning a computed simple Value
 	#[instrument(level = "trace", name = "ForeachStatement::compute", skip_all)]
 	pub(crate) async fn compute(

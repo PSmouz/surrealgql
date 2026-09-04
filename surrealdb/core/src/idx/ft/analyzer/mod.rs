@@ -12,12 +12,13 @@ use crate::catalog;
 use crate::ctx::FrozenContext;
 use crate::dbs::Options;
 use crate::err::Error;
-use crate::expr::{FlowResultExt as _, Function};
+use crate::expr::FlowResultExt as _;
 use crate::idx::ft::analyzer::filter::FilteringStage;
 use crate::idx::ft::analyzer::tokenizer::{Tokenizer, Tokens};
 use crate::idx::ft::offset::Offset;
 use crate::idx::ft::{DocLength, TermFrequency};
 use crate::idx::trees::store::IndexStores;
+use crate::sql::analyzer_function::{function_from_storage, qualified_name};
 use crate::val::Value;
 
 pub(in crate::idx::ft) mod filter;
@@ -97,7 +98,8 @@ impl Analyzer {
 		input: Strand,
 	) -> Result<Tokens> {
 		let input = if let Some(function_name) = self.az.function.as_ref().map(|i| i.to_string()) {
-			let val = Function::Custom(function_name.clone())
+			let display_name = qualified_name(&function_name);
+			let val = function_from_storage(&function_name)
 				.compute(stk, ctx, opt, None, vec![Value::String(input)])
 				.await
 				.catch_return()?;
@@ -105,7 +107,7 @@ impl Analyzer {
 				val
 			} else {
 				bail!(Error::InvalidFunction {
-					name: function_name,
+					name: display_name,
 					message: "The function should return a string.".to_string(),
 				});
 			}

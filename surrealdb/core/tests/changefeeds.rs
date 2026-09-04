@@ -278,6 +278,61 @@ async fn table_change_feeds() -> Result<()> {
 }
 
 #[tokio::test]
+async fn table_change_feeds_include_original() -> Result<()> {
+	// `INCLUDE ORIGINAL` should surface the deleted record's pre-image under
+	// `delete.original`; a changefeed without it must not include the field.
+	let sql = "
+		DEFINE TABLE original_tb CHANGEFEED 1h INCLUDE ORIGINAL;
+		DEFINE TABLE plain_tb CHANGEFEED 1h;
+		CREATE original_tb:1 SET name = 'Tobie';
+		DELETE original_tb:1;
+		CREATE plain_tb:1 SET name = 'Tobie';
+		DELETE plain_tb:1;
+		SHOW CHANGES FOR TABLE original_tb SINCE 0;
+		SHOW CHANGES FOR TABLE plain_tb SINCE 0;
+	";
+	let (_, dbs) = new_ds("test-tb-cf-orig", "test-tb-cf-orig", false).await?;
+	let ses = Session::owner().with_ns("test-tb-cf-orig").with_db("test-tb-cf-orig");
+	let res = &mut dbs.execute(sql, &ses, None).await?;
+	assert_eq!(res.len(), 8);
+	// Drain the two DEFINEs and the two CREATE/DELETE pairs.
+	for _ in 0..6 {
+		res.remove(0).result?;
+	}
+
+	// SHOW CHANGES for the INCLUDE ORIGINAL table: the delete carries `original`.
+	let tmp = res.remove(0).result?;
+	let Value::Array(changes_array) = tmp else {
+		panic!("Expected array of changes");
+	};
+	let idx = changes_array.len() - 1;
+	let Value::Object(last) = &changes_array[idx] else {
+		panic!("Expected object");
+	};
+	let changes = last.get("changes").expect("changes");
+	let expected = syn::value(
+		"[{ delete: { id: original_tb:1, original: { id: original_tb:1, name: 'Tobie' } } }]",
+	)
+	.unwrap();
+	assert_eq!(changes, &expected, "INCLUDE ORIGINAL delete should carry the pre-image");
+
+	// SHOW CHANGES for the plain table: the delete must not carry `original`.
+	let tmp = res.remove(0).result?;
+	let Value::Array(changes_array) = tmp else {
+		panic!("Expected array of changes");
+	};
+	let idx = changes_array.len() - 1;
+	let Value::Object(last) = &changes_array[idx] else {
+		panic!("Expected object");
+	};
+	let changes = last.get("changes").expect("changes");
+	let expected = syn::value("[{ delete: { id: plain_tb:1 } }]").unwrap();
+	assert_eq!(changes, &expected, "Plain changefeed delete must not carry `original`");
+
+	Ok(())
+}
+
+#[tokio::test]
 async fn changefeed_with_ts() -> Result<()> {
 	let (_, db) = new_ds("test-cf-ts", "test-cf-ts", false).await?;
 	let ses = Session::owner().with_ns("test-cf-ts").with_db("test-cf-ts");

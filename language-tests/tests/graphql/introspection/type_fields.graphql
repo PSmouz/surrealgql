@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Type introspection exposes the fields generated for a table, including relation fields"
+
+[[test.results]]
+value = "{ __type: { fields: [{ name: 'id' }, { name: 'active' }, { name: 'address' }, { name: 'age' }, { name: 'email' }, { name: 'name' }, { name: 'score' }, { name: 'tags' }, { name: 'likes' }], kind: 'OBJECT' } }"
+*/
+query {
+	__type(name: "person") {
+		kind
+		fields {
+			name
+		}
+	}
+}

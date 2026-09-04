@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Explicit DESC ordering on a returned column."
+
+[[test.results]]
+value = "[{ name: 'C' }, { name: 'B' }, { name: 'A' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name ORDER BY name DESC

@@ -165,7 +165,15 @@ impl DefineIndexStatement {
 			return Ok(Value::None);
 		}
 
-		let index_id = if let Some(ix) = existing.as_ref() {
+		// If an index with this name already exists, this is a destructive
+		// replacement: either `Overwrite`, or an import replay whose physical
+		// definition changed (a plain redefine over an existing index has already
+		// bailed at the guard above, and an idempotent import replay returned at
+		// the fast path). Retire the old index's durable state and delete its data
+		// here, synchronously, before the new index is rebuilt — delete-before-
+		// rebuild keeps peak disk roughly flat for an inline rebuild instead of
+		// holding the old and new index data simultaneously.
+		if let Some(ix) = existing.as_ref() {
 			// Clear process-local index wrappers without aborting the current
 			// durable builder here. Durable state and catalog entries are
 			// retired atomically in this schema transaction below, and the
@@ -184,22 +192,14 @@ impl DefineIndexStatement {
 			retire_durable_index(&txn, tb.namespace_id, tb.database_id, &tb.name, ix.index_id)
 				.await?;
 			txn.del_tb_index(tb.namespace_id, tb.database_id, &tb.name, &name).await?;
-			if self.kind == DefineKind::Overwrite || opt.import {
-				// Destructive replacements get a fresh internal id so durable
-				// state and generation-scoped queues for the retired index
-				// cannot be mistaken for the new definition. Import replays only
-				// reach this branch when the physical definition changed.
-				ctx.try_get_sequences()?
-					.next_index_id(Some(ctx), tb.namespace_id, tb.database_id, tb.name.clone())
-					.await?
-			} else {
-				ix.index_id
-			}
-		} else {
-			ctx.try_get_sequences()?
-				.next_index_id(Some(ctx), tb.namespace_id, tb.database_id, tb.name.clone())
-				.await?
-		};
+		}
+		// A (re)defined index always gets a fresh internal id, so the retired
+		// index's durable state and generation-scoped queues can never be mistaken
+		// for the new definition.
+		let index_id = ctx
+			.try_get_sequences()?
+			.next_index_id(Some(ctx), tb.namespace_id, tb.database_id, tb.name.clone())
+			.await?;
 
 		// Process the statement
 		let index_def = IndexDefinition {

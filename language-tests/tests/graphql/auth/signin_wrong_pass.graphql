@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["./_auth.surql"]
+
+[test]
+reason = "The signIn mutation rejects invalid credentials"
+
+[[test.results]]
+error = "Authentication error: There was a problem with authentication"
+*/
+mutation {
+	signIn(access: "user", variables: { email: "alice@example.com", pass: "wrong" })
+}

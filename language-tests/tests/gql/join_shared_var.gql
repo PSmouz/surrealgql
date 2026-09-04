@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Two comma-separated patterns sharing the START node `a` (a different shape from multi_pattern_shared_node, which shares the far node): a fans out to two distinct targets b and c. The planner equi-joins both patterns on `a`. DIFFERENT EDGES (R2) is per MATCH statement, so the two `knows` edges must be distinct records — a row pairing the same edge in both positions (b == c via one edge) is dropped, leaving only the a's that have >=2 distinct outgoing knows-person edges. Over the person->person knows graph (A->B, B->A, B->C, C->A) only B has two outgoing person edges (B->A via k21, B->C via k23); A and C have one each. So the surviving (a; {b,c}) rows are B's two ordered pairs of distinct targets: (b=A,c=C) and (b=C,c=A)."
+
+[[test.results]]
+value = "[{ a: 'B', b: 'A', c: 'C' }, { a: 'B', b: 'C', c: 'A' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (a)-[:knows]->(c:person)
+RETURN a.name AS a, b.name AS b, c.name AS c ORDER BY a, b, c

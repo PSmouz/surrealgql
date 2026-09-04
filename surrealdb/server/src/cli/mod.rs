@@ -4,6 +4,7 @@ pub(crate) mod abstraction;
 mod config;
 mod export;
 mod fix;
+mod fmt;
 mod import;
 mod isready;
 #[cfg(feature = "mcp")]
@@ -32,6 +33,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub use config::{Config, ConfigCheck, ConfigCheckRequirements};
 use export::ExportCommandArguments;
 use fix::FixCommandArguments;
+use fmt::FormatCommandArguments;
 use import::ImportCommandArguments;
 use isready::IsReadyCommandArguments;
 #[cfg(feature = "mcp")]
@@ -196,6 +198,8 @@ enum Commands {
 	Validate(ValidateCommandArguments),
 	#[command(about = "Fix database storage issues")]
 	Fix(FixCommandArguments),
+	#[command(about = "Format SurrealQL query", visible_alias = "fmt")]
+	Format(FormatCommandArguments),
 	#[command(about = "Run commands in version 2 of the database for backwards compatibility")]
 	V2(V2Commands),
 }
@@ -301,6 +305,15 @@ pub async fn init<
 		guards,
 		runtime,
 	} = telemetry.init().expect("Unable to configure logs");
+	// Install the process-wide rustls crypto provider before any command can
+	// open a TLS connection. Both the server and the remote client commands
+	// (sql, import, export, isready, ...) rely on this; without it rustls 0.23
+	// aborts the process on the first handshake.
+	if let Err(e) = crate::tls::install_default_crypto_provider() {
+		error!("{:?}", e);
+		runtime.shutdown();
+		return ExitCode::FAILURE;
+	}
 	// After version warning we can run the respective command
 	let output = match args.command {
 		Commands::Start(args) => start::init::<C>(composer, args, runtime.clone()).await,
@@ -318,6 +331,7 @@ pub async fn init<
 		Commands::IsReady(args) => isready::init(args).await,
 		Commands::Validate(args) => validate::init(args).await,
 		Commands::Fix(args) => fix::init::<C>(args).await,
+		Commands::Format(args) => fmt::init(args).await,
 		Commands::V2(args) => v2::init(args).await,
 	};
 	// Flush every provider's batch processor so audit / slow-query

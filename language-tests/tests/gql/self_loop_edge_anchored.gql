@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "The edge-anchored self-loop `(a)-[:knows]->(a)`: unlabeled endpoints, labeled edge. The two EndpointBinds bind the `in` and `out` endpoints; the repeated `a` is rewritten to a hidden node `__v` plus an `a.id = __v.id` equality the planner enforces as a Filter. No knows edge in the corpus is a self-loop, so the result is empty (without the equality, both endpoints collapse onto `a` and every edge leaks)."
+
+[[test.results]]
+value = "[]"
+*/
+
+MATCH (a)-[:knows]->(a) RETURN a.name AS a ORDER BY a

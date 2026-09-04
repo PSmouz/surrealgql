@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: `{1,}` (no upper bound) is legal and terminates via edge-uniqueness within a path. In v1 it was a lowering rejection ('Unbounded variable-length quantifiers are not supported yet'); v2 supports it. Equivalent to `+` on a finite graph: on the triangle each source reaches all three hubs once across depths 1..3, the fourth hop being blocked by edge reuse. 9 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'E' }, { an: 'D', bn: 'F' }, { an: 'E', bn: 'D' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'F' }, { an: 'F', bn: 'D' }, { an: 'F', bn: 'E' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->{1,}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

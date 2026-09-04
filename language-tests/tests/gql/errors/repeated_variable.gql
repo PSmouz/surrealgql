@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: reusing a node variable as an edge is a kind mismatch (a node-as-node reuse is now a join key; only kind-mismatched reuse is rejected)."
+
+[test.results]
+parsing-error = """
+Variable `n` is already bound as a node but reused as an edge
+  --> [15:19]
+   |
+15 | MATCH (n:person)-[n:knows]->(b:person) RETURN n
+   |                   ^ use a fresh name, or reuse the variable as the same kind of element
+"""
+*/
+
+MATCH (n:person)-[n:knows]->(b:person) RETURN n

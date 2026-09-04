@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-B): a multi-hop pattern with unlabeled nodes and labelled EDGES only is anchorable (the edge labels witness it) but the PR-B planner has no multi-hop edge anchor, so it is rejected cleanly with 'not supported yet' instead of a planner internal error (V2_DESIGN §6)."
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [15:7]
+   |
+15 | MATCH (a)-[:knows]->(b)-[:knows]->(c) RETURN a.name AS a, c.name AS c
+   |       ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a)-[:knows]->(b)-[:knows]->(c) RETURN a.name AS a, c.name AS c

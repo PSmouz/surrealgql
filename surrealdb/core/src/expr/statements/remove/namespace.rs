@@ -65,25 +65,14 @@ impl RemoveNamespaceStatement {
 			seq.namespace_removed(&txn, ns.namespace_id).await?;
 		}
 
-		// Delete the definition.
-		//
-		// The transactional `delp` / `clrp` path inside `del_ns` is
-		// bounded by `SURREAL_TIKV_DELR_MAX_KEYS` (default 1M) on TiKV.
-		// If the namespace is larger than that the call below returns
-		// `TransactionRangeTooLarge` and the outer transaction is
-		// rolled back — both the metadata clear and the partial
-		// prefix-delete are undone together, so the namespace is left
-		// intact (and reachable via the catalog) afterwards.
-		//
-		// Operators hitting that cap have two escape hatches:
-		//   1. Raise `SURREAL_TIKV_DELR_MAX_KEYS` for this datastore instance and re-issue the
-		//      `REMOVE NAMESPACE` statement.
-		//   2. Run [`crate::kvs::Datastore::unsafe_destroy_range`] against the namespace key prefix
-		//      *first*, shrinking the data side to something the bounded delete can swallow, then
-		//      re-issue `REMOVE NAMESPACE`. The catalog metadata still points at the (now-empty)
-		//      prefix during this window, so the unsafe destroy is consistent with what the
-		//      statement is about to do anyway.
-		txn.del_ns(&ns.name, self.expunge).await?;
+		// Delete the catalog definition and enqueue the data for background
+		// reclaim. Only the small catalog entry is removed in this transaction
+		// (so the namespace is immediately unreachable); the potentially huge
+		// `/*{ns}` data prefix is destroyed asynchronously by
+		// `Datastore::reclaim_tombstones`. This keeps `REMOVE NAMESPACE` fast
+		// and bounded regardless of how much data the namespace holds, and a
+		// rollback undoes the removal without having destroyed any data.
+		txn.del_ns_deferred(&ns.name, self.expunge).await?;
 
 		// Clear the cache
 		if let Some(cache) = ctx.get_cache() {

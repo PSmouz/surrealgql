@@ -59,6 +59,25 @@ impl DefineApiStatement {
 
 		let path: Path = path_name.parse()?;
 
+		// Reject duplicate methods across all FOR clauses on this DEFINE API.
+		// `find_definition`/`process_api_request` route a request to the first
+		// action whose `methods` contain the request's method, so a second
+		// FOR clause with an overlapping method would be silently unreachable.
+		// ALTER API consolidates overlapping methods via its split-and-replace
+		// semantics; DEFINE has no such consolidation, so we must reject up-front.
+		let mut seen: Vec<ApiMethod> = Vec::new();
+		for action in self.actions.iter() {
+			for m in &action.methods {
+				if seen.contains(m) {
+					bail!(Error::ApMethodDuplicate {
+						value: path_name,
+						method: m.to_string(),
+					});
+				}
+				seen.push(*m);
+			}
+		}
+
 		let config = self.config.compute(stk, ctx, opt, doc).await?;
 
 		let mut actions = Vec::new();

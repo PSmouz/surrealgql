@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Comma-separated patterns sharing a node (PR-B flip): v1/PR-A rejected multi-pattern MATCH; the shared node `b` now becomes the planner's equi-join key. DIFFERENT EDGES (R2) is enforced per MATCH statement, so a row where the two patterns would bind the SAME knows edge (a == c with one common target) is dropped — leaving only the genuinely distinct (a, c) pairs that reach a common `b`."
+
+[[test.results]]
+value = "[{ a: 'B', c: 'C' }, { a: 'C', c: 'B' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (c:person)-[:knows]->(b)
+RETURN a.name AS a, c.name AS c ORDER BY a, c

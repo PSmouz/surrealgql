@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "List literals `[…]` and record literals `{…}` lower to SurrealQL array/object literals and execute end to end (REFERENCE.md `generalLiteral`, LOWERING.md §5)."
+
+[[test.results]]
+value = "[{ lst: [30, 1], mp: { a: 30, b: 'x' }, name: 'A' }, { lst: [20, 1], mp: { a: 20, b: 'x' }, name: 'B' }, { lst: [NONE, 1], mp: { a: NONE, b: 'x' }, name: 'C' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name, [n.age, 1] AS lst, {a: n.age, b: 'x'} AS mp ORDER BY name

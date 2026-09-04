@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["gql/_perm_hidden_edge_import.surql"]
+auth = { namespace = "test", database = "test", access = "user", rid = "person:1" }
+
+[test]
+reason = "SECURITY (R3 + permissions, LeftJoin general path): a two-clause `OPTIONAL { MATCH …; MATCH … }` block routes through the HashJoin{Left} general path (the whole block is one standalone subplan, not the single-hop OptionalExpand fast path). The record user may SELECT `person` but NOT `knows` (`PERMISSIONS NONE`), so every `knows` hop inside the block is gated away and the block misses for all-or-nothing — null-filling EVERY block-introduced binding (`b`, `c`) together, never leaking a denied intermediate or final target through the subplan or the left-join null-fill. The mandatory `a` anchors (person:1/2/3) are all preserved with the optional columns NONE. Complements `optional_perm_hidden_edge.gql` (fast path) by pinning the same no-leak guarantee on the subplan + left-join shape."
+
+[[test.results]]
+value = "[{ name: 'A', friend: NONE, fof: NONE }, { name: 'B', friend: NONE, fof: NONE }, { name: 'C', friend: NONE, fof: NONE }]"
+*/
+
+MATCH (a:person) OPTIONAL { MATCH (a)-[:knows]->(b:person) MATCH (b)-[:knows]->(c:person) } RETURN a.name AS name, b.name AS friend, c.name AS fof ORDER BY name

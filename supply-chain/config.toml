@@ -106,7 +106,7 @@ version = "0.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.ammonia]]
-version = "4.1.2"
+version = "4.1.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.approx]]
@@ -454,19 +454,19 @@ version = "0.3.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.diskann]]
-version = "0.53.0"
+version = "0.54.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.diskann-utils]]
-version = "0.53.0"
+version = "0.54.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.diskann-vector]]
-version = "0.53.0"
+version = "0.54.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.diskann-wide]]
-version = "0.53.0"
+version = "0.54.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.doc-comment]]
@@ -505,14 +505,6 @@ criteria = "safe-to-deploy"
 version = "0.3.6"
 criteria = "safe-to-deploy"
 
-[[exemptions.endian-type]]
-version = "0.1.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.endian-type]]
-version = "0.2.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.equator]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
@@ -547,10 +539,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
 version = "2.4.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.ferntree]]
-version = "0.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.ff]]
@@ -593,10 +581,6 @@ criteria = "safe-to-deploy"
 version = "2.0.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.futf]]
-version = "0.1.5"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures]]
 version = "0.3.32"
 criteria = "safe-to-deploy"
@@ -635,7 +619,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.futures-timer]]
 version = "3.0.3"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.futures-util]]
 version = "0.3.32"
@@ -746,7 +730,7 @@ version = "0.5.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.html5ever]]
-version = "0.35.0"
+version = "0.39.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper-rustls]]
@@ -933,16 +917,12 @@ criteria = "safe-to-deploy"
 version = "0.15.7"
 criteria = "safe-to-deploy"
 
-[[exemptions.mac]]
-version = "0.1.1"
+[[exemptions.mach2]]
+version = "0.6.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.markup5ever]]
-version = "0.35.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.match_token]]
-version = "0.35.0"
+version = "0.39.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.matchit]]
@@ -999,10 +979,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.new_debug_unreachable]]
 version = "1.0.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.nibble_vec]]
-version = "0.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.nix]]
@@ -1277,14 +1253,6 @@ criteria = "safe-to-deploy"
 version = "0.7.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.radix_trie]]
-version = "0.2.1"
-criteria = "safe-to-deploy"
-
-[[exemptions.radix_trie]]
-version = "0.3.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.rand_core]]
 version = "0.10.1"
 criteria = "safe-to-deploy"
@@ -1347,14 +1315,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rmcp-macros]]
 version = "1.7.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.rmp]]
-version = "0.8.15"
-criteria = "safe-to-deploy"
-
-[[exemptions.rmp-serde]]
-version = "1.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.roaring]]
@@ -1574,11 +1534,11 @@ version = "0.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.string_cache]]
-version = "0.8.9"
+version = "0.9.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.string_cache_codegen]]
-version = "0.5.4"
+version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.symbolic-common]]
@@ -1605,10 +1565,6 @@ criteria = "safe-to-deploy"
 version = "0.37.2"
 criteria = "safe-to-deploy"
 
-[[exemptions.tar]]
-version = "0.4.46"
-criteria = "safe-to-deploy"
-
 [[exemptions.temp-dir]]
 version = "0.2.0"
 criteria = "safe-to-run"
@@ -1618,7 +1574,7 @@ version = "3.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tendril]]
-version = "0.4.3"
+version = "0.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.terminal_size]]
@@ -1818,7 +1774,7 @@ version = "1.1.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.web_atoms]]
-version = "0.1.3"
+version = "0.2.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-root-certs]]

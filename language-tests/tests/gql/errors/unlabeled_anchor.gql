@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a pattern needs a label or a reused earlier variable to anchor (V2_DESIGN §0); a bare unlabeled node has neither."
+
+[test.results]
+parsing-error = """
+Cannot choose a starting table for this pattern: label at least one node or reuse a variable bound by an earlier pattern
+  --> [15:7]
+   |
+15 | MATCH (n) RETURN n
+   |       ^^^ label a node: `(n:label)`, or reuse an earlier variable
+"""
+*/
+
+MATCH (n) RETURN n

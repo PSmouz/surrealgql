@@ -86,6 +86,7 @@ pub(crate) mod physical_expr;
 pub(crate) mod plan_or_compute;
 pub(crate) mod planner;
 pub(crate) mod pre_decode_filter;
+pub(crate) mod topk_pushdown;
 
 // Re-export access mode types
 pub(crate) use access_mode::{AccessMode, CombineAccessModes};

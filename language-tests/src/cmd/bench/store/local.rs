@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
-use surrealdb_core::{dbs::Capabilities, kvs::Datastore};
+use surrealdb_core::dbs::Capabilities;
+use surrealdb_core::kvs::Datastore;
 use surrealdb_types::{SurrealValue, Variables};
 
-use crate::{
-	cli::Backend,
-	cmd::bench::{stats::MeasurementData, store::BenchDataStore},
-};
-
 use super::BenchMarkRun;
+use crate::cli::Backend;
+use crate::cmd::bench::stats::MeasurementData;
+use crate::cmd::bench::store::BenchDataStore;
 
 pub struct LocalStore {
 	ds: Datastore,

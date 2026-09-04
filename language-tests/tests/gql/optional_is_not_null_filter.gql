@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Complement of optional_is_null_filter: the same nullable optional binding tested with `b IS NOT NULL`, again PRE-null inside the optional clause (R3). During the match `b` is always a real record, so the predicate passes for every candidate and keeps it — one row per matched edge. Hand-derived over the person->person knows graph: A->B, B->A, B->C, C->A — four matching rows. Every person matches at least one person edge here, so no anchor null-fills; contrasted with the IS NULL case this shows the amendment lets an optional binding be tested in both polarities."
+
+[[test.results]]
+value = "[{ friend: 'B', name: 'A' }, { friend: 'A', name: 'B' }, { friend: 'C', name: 'B' }, { friend: 'A', name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b IS NOT NULL RETURN a.name AS name, b.name AS friend ORDER BY name, friend

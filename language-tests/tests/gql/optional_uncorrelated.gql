@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "An OPTIONAL block sharing NO variable with the accumulator is uncorrelated (R3): it plans as a HashJoin{Left} with empty keys (build = the block subplan, probe = the accumulator). Here `(x:city)-[:knows]->(y:person)` matches nothing (the only city edges are person->city), so the block is empty and every mandatory `a` is preserved with the block bindings null-filled — the left-outer never drops the accumulator."
+
+[[test.results]]
+value = "[{ name: 'A', y: NONE }, { name: 'B', y: NONE }, { name: 'C', y: NONE }]"
+*/
+
+MATCH (a:person) OPTIONAL MATCH (x:city)-[:knows]->(y:person) RETURN a.name AS name, y.name AS y ORDER BY name, y

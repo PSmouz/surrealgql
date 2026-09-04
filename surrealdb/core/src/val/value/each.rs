@@ -82,6 +82,45 @@ impl Value {
 					}
 				}
 			},
+			// Current path part is a set
+			Value::Set(v) => match first {
+				Part::All => {
+					for (idx, v) in v.iter().enumerate() {
+						accum.push(Part::index_int(idx as i64));
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				Part::First => {
+					if let Some(v) = v.first() {
+						accum.push(Part::First);
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				Part::Last => {
+					if let Some(v) = v.last() {
+						accum.push(Part::Last);
+						v._each(rest, accum, build);
+						accum.pop();
+					}
+				}
+				x => {
+					if let Some(idx) = x.as_old_index() {
+						if let Some(v) = v.nth(idx) {
+							accum.push(x.clone());
+							v._each(rest, accum, build);
+							accum.pop();
+						}
+					} else {
+						for (idx, v) in v.iter().enumerate() {
+							accum.push(Part::index_int(idx as i64));
+							v._each(rest, accum, build);
+							accum.pop();
+						}
+					}
+				}
+			},
 			// Ignore everything else
 			_ => {}
 		}
@@ -223,5 +262,14 @@ mod tests {
 		let idi: Idiom = syn::idiom("test.something[$]").unwrap().into();
 		let val = parse_val!("{ test: { something: [] } }");
 		assert_eq!(val.each(&idi), Vec::<Idiom>::new());
+	}
+
+	#[test]
+	fn each_set_last() {
+		let idi: Idiom = syn::idiom("tags[$]").unwrap().into();
+		let val = parse_val!("{ tags: {1, 3, 5} }");
+		let res: Vec<Idiom> = vec![syn::idiom("tags[$]").unwrap().into()];
+		assert_eq!(res, val.each(&idi));
+		assert_eq!(val.pick(&res[0]), Value::from(5));
 	}
 }

@@ -33,7 +33,7 @@ authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 edition = "2024"
 license-file = "LICENSE"
 publish = false
-version = "3.2.0-nightly"
+version = "3.3.0-nightly"
 description = "A scalable, distributed, collaborative, document-graph database, for the realtime web"
 repository = "https://github.com/surrealdb/surrealdb"
 homepage = "https://github.com/surrealdb/surrealdb"
@@ -48,32 +48,32 @@ categories = ["database-implementations", "data-structures", "embedded"]
 
 [workspace.dependencies]
 # SurrealDB crates
-surrealdb = { version = "3.2.0-nightly", path = "surrealdb", default-features = false }
-surrealdb-strand = { version = "3.2.0-nightly", path = "surrealdb/strand", default-features = false }
-surrealdb-core = { version = "3.2.0-nightly", path = "surrealdb/core", default-features = false }
-surrealdb-server = { version = "3.2.0-nightly", path = "surrealdb/server", default-features = false }
-surrealdb-mcp = { version = "3.2.0-nightly", path = "surrealdb/mcp", default-features = false }
-surrealdb-types = { version = "3.2.0-nightly", path = "surrealdb/types" }
-surrealdb-types-derive = { version = "3.2.0-nightly", path = "surrealdb/types/derive" }
+surrealdb = { version = "3.3.0-nightly", path = "surrealdb", default-features = false }
+surrealdb-strand = { version = "3.3.0-nightly", path = "surrealdb/strand", default-features = false }
+surrealdb-core = { version = "3.3.0-nightly", path = "surrealdb/core", default-features = false }
+surrealdb-server = { version = "3.3.0-nightly", path = "surrealdb/server", default-features = false }
+surrealdb-mcp = { version = "3.3.0-nightly", path = "surrealdb/mcp", default-features = false }
+surrealdb-types = { version = "3.3.0-nightly", path = "surrealdb/types" }
+surrealdb-types-derive = { version = "3.3.0-nightly", path = "surrealdb/types/derive" }
 ast = { package = "surrealdb-ast", path = "surrealdb/ast" }
 token = { package = "surrealdb-token", path = "surrealdb/token" }
 parser = { package = "surrealdb-parser", path = "surrealdb/parser" }
 common = { package = "surrealdb-common", path = "surrealdb/common" }
-surrealdb-collections = { version = "3.2.0-nightly", path = "surrealdb/collections" }
+surrealdb-collections = { version = "3.3.0-nightly", path = "surrealdb/collections" }
 
 # SurrealML crates
 surrealml-core = { version = "0.1", path = "surrealml/core" }
 # Surrealism crates
-surrealism = { version = "0.4", path = "surrealism" }
-surrealism-macros = { version = "0.4", path = "surrealism/macros", default-features = false }
-surrealism-runtime = { version = "0.4", path = "surrealism/runtime" }
-surrealism-types = { version = "0.4", path = "surrealism/types", default-features = false }
+surrealism = { version = "0.5.0-beta.1", path = "surrealism" }
+surrealism-macros = { version = "0.5.0-beta.1", path = "surrealism/macros", default-features = false }
+surrealism-runtime = { version = "0.5.0-beta.1", path = "surrealism/runtime" }
+surrealism-types = { version = "0.5.0-beta.1", path = "surrealism/types", default-features = false }
 # External surreal crates
 affinitypool = "0.7.0"
 dmp = "0.2.3"
 indxdb = "0.12.0"
 lexicmp = "0.2.0"
-revision = { version = "0.28.0", features = [
+revision = { version = "0.30.0", features = [
     "bytes",
     "chrono",
     "geo",
@@ -122,9 +122,9 @@ clap = "4.6.1"
 dashmap = "6.1.0"
 dialoguer = "0.11"
 deunicode = "1.6.2"
-diskann = { version = "=0.53.0", default-features = false }
-diskann-utils = "=0.53.0"
-diskann-vector = "=0.53.0"
+diskann = { version = "=0.54.0", default-features = false }
+diskann-utils = "=0.54.0"
+diskann-vector = "=0.54.0"
 ext-sort = "^0.1.5"
 fastnum = "0.7.4"
 flatbuffers = { version = "25.12.19", features = ["serde"] }
@@ -167,7 +167,6 @@ pin-project-lite = "0.2.17"
 pprof = "0.15.0"
 opentelemetry-prometheus-text-exporter = "0.2.1"
 quick_cache = "0.6.21"
-radix_trie = "0.3.0" # TODO: Look at the use of this dependency. Last update 4 years ago, unmaintained.
 rand = "0.9.4"
 rand_core = "0.6"
 rayon = "1.12.0"
@@ -191,7 +190,7 @@ snap = "1.1.1"
 strsim = "0.11.1"
 subtle = "2.6"
 surrealdb-protocol = { version = "0.10.1", default-features = false }
-sysinfo = "0.37.2"
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", default-features = false }
@@ -223,15 +222,15 @@ wiremock = "0.6"
 ort = { version = "2.0.0-rc.12", features = ["cuda", "ndarray"] }
 
 # Surrealism specific dependencies
-tar = "0.4.45"
+tar = { version = "0.4.45", default-features = false }
 toml = "0.9.12"
 wasm-encoder = "0.245"
 wasm-opt = "0.116.1"
 wasmparser = "0.245"
-wasmtime = { version = "44.0.2", default-features = false, features = ["async", "cranelift", "winch", "runtime", "std", "wat", "component-model", "parallel-compilation"] }
-wasmtime-wasi = { version = "44.0.2", features = ["p1", "p2"] }
+wasmtime = { version = "46.0.1", default-features = false, features = ["async", "cranelift", "winch", "runtime", "std", "wat", "component-model", "parallel-compilation"] }
+wasmtime-wasi = { version = "46.0.1", features = ["p1", "p2"] }
 wit-bindgen = { version = "0.51", default-features = false, features = ["macros", "realloc"] }
-zstd = "0.13.3"
+zstd = { version = "0.13.3", default-features = false }
 
 [package]
 name = "surreal"
@@ -258,6 +257,7 @@ default = [
     "http",
     "surrealism",
     "graphql",
+    "gql",
     "mcp",
     "cli",
 ]
@@ -276,6 +276,8 @@ storage-tikv = ["surrealdb-server/storage-tikv"]
 storage-indxdb = ["surrealdb-server/storage-indxdb"]
 # GraphQL API support
 graphql = ["surrealdb-server/graphql"]
+# GQL (ISO/IEC 39075) API support
+gql = ["surrealdb-server/gql"]
 # MCP (Model Context Protocol) server support
 mcp = ["surrealdb-server/mcp"]
 # Interactive SQL CLI support

@@ -4,26 +4,28 @@
 //! target edge tables. It is used to implement graph traversal idioms like
 //! `person:alice->knows->person`.
 
-use std::ops::Bound;
 use std::sync::Arc;
 
 use futures::StreamExt;
 
-use super::common::{
-	evaluate_bound_key, extract_record_ids_into, resolve_record_batch, resolve_version_stamp,
-};
+use super::common::{extract_record_ids_into, resolve_record_batch, resolve_version_stamp};
+// Re-exported so the existing `pub use graph::{EdgeTableSpec, ...}` surface is
+// unchanged after the key-scan machinery moved into `graph_keys`.
+pub use super::graph_keys::EdgeTableSpec;
+use super::graph_keys::{compute_graph_ranges, decode_graph_edge};
 use crate::catalog::{DatabaseId, NamespaceId};
 use crate::exec::parts::LookupDirection;
 use crate::exec::permission::{PhysicalPermission, should_check_perms};
 use crate::exec::{
-	AccessMode, ContextLevel, ControlFlowExt, ExecOperator, ExecutionContext, FlowResult,
-	OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream, buffer_stream, monitor_stream,
+	AccessMode, ContextLevel, ControlFlowExt, EvalContext, ExecOperator, ExecutionContext,
+	FlowResult, OperatorMetrics, PhysicalExpr, ValueBatch, ValueBatchStream, buffer_stream,
+	monitor_stream,
 };
 use crate::expr::{ControlFlow, Dir};
 use crate::iam::Action;
 use crate::idx::planner::ScanDirection;
-use crate::kvs::{CachePolicy, KVKey};
-use crate::val::{RecordId, TableName};
+use crate::kvs::{CachePolicy, Transaction};
+use crate::val::{RecordId, TableName, Value};
 
 /// What kind of output the GraphEdgeScan should produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,20 +43,6 @@ pub enum GraphScanOutput {
 	/// keys trigger an inline fallback scan of the edge's own adjacency to
 	/// recover the target, preserving correctness on unmigrated data.
 	TargetVertex,
-}
-
-/// Specification for an edge table to scan, optionally with ID range bounds.
-///
-/// When range bounds are present, the scan is restricted to edges whose IDs fall
-/// within the specified range instead of scanning the entire table.
-#[derive(Debug, Clone)]
-pub struct EdgeTableSpec {
-	/// The edge table name (e.g., `edge`, `knows`)
-	pub table: TableName,
-	/// Range start bound. When `Unbounded`, starts from the table prefix.
-	pub range_start: Bound<Arc<dyn PhysicalExpr>>,
-	/// Range end bound. When `Unbounded`, ends at the table suffix.
-	pub range_end: Bound<Arc<dyn PhysicalExpr>>,
 }
 
 /// Scans graph edges for records received from a child operator stream.
@@ -102,6 +90,21 @@ pub struct GraphEdgeScan {
 	/// When set, edge scanning stops early after this many results.
 	pub(crate) limit: Option<usize>,
 
+	/// Optional `WHERE` predicate pushed down from the graph lookup's `cond`,
+	/// replacing the downstream `Filter` operator. Rows for which this
+	/// evaluates falsy are dropped inside the scan.
+	pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+
+	/// Whether `predicate` is "key-resident": it references only fields
+	/// decodable from the adjacency key (currently `id`), is free of
+	/// subqueries / functions / side effects, and can therefore be evaluated
+	/// against a synthesized value *before* fetching the edge record. When
+	/// `false` (and `predicate` is `Some`), the predicate is
+	/// "record-referencing" and is evaluated after fetch + permission
+	/// filtering. Set once at plan time; see
+	/// `Planner::graph_predicate_is_key_resident`.
+	pub(crate) predicate_key_resident: bool,
+
 	/// Per-operator runtime metrics for EXPLAIN ANALYZE.
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
@@ -122,6 +125,8 @@ impl GraphEdgeScan {
 			target_tables: Vec::new(),
 			version,
 			limit: None,
+			predicate: None,
+			predicate_key_resident: false,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
@@ -135,6 +140,21 @@ impl GraphEdgeScan {
 	/// `output_mode == TargetVertex`; ignored otherwise.
 	pub(crate) fn with_target_tables(mut self, tables: Vec<TableName>) -> Self {
 		self.target_tables = tables;
+		self
+	}
+
+	/// Attach a pushed-down `WHERE` predicate, replacing the downstream
+	/// `Filter` operator. `key_resident` must be `true` only when the
+	/// predicate is safe to evaluate against a synthesized key value before
+	/// fetching the edge record (see
+	/// `Planner::graph_predicate_is_key_resident`).
+	pub(crate) fn with_predicate(
+		mut self,
+		predicate: Arc<dyn PhysicalExpr>,
+		key_resident: bool,
+	) -> Self {
+		self.predicate = Some(predicate);
+		self.predicate_key_resident = key_resident;
 		self
 	}
 }
@@ -166,18 +186,38 @@ impl ExecOperator for GraphEdgeScan {
 		if let Some(limit) = self.limit {
 			attrs.push(("limit".to_string(), limit.to_string()));
 		}
+		if let Some(ref predicate) = self.predicate {
+			attrs.push(("predicate".to_string(), predicate.to_sql()));
+			attrs.push((
+				"predicate_scope".to_string(),
+				if self.predicate_key_resident {
+					"key".to_string()
+				} else {
+					"record".to_string()
+				},
+			));
+		}
 		attrs
 	}
 
 	fn required_context(&self) -> ContextLevel {
 		// GraphEdgeScan needs database context, combined with expression contexts
-		self.input.required_context().max(ContextLevel::Database)
+		let mut level = self.input.required_context().max(ContextLevel::Database);
+		if let Some(ref predicate) = self.predicate {
+			level = level.max(predicate.required_context());
+		}
+		level
 	}
 
 	fn access_mode(&self) -> AccessMode {
 		let mut mode = self.input.access_mode();
 		if let Some(ref version) = self.version {
 			mode = mode.combine(version.access_mode());
+		}
+		// A record-referencing predicate may contain a mutating subquery, so
+		// its access mode must propagate up the tree.
+		if let Some(ref predicate) = self.predicate {
+			mode = mode.combine(predicate.access_mode());
 		}
 		mode
 	}
@@ -197,7 +237,10 @@ impl ExecOperator for GraphEdgeScan {
 		// this check a low-privileged user could traverse `->edge` to
 		// enumerate otherwise-hidden relationships, and the `FullEdge` output
 		// mode would additionally return raw record data for tables they
-		// cannot SELECT.
+		// cannot SELECT. `resolve_record_batch` enforces the table-level
+		// permission and — in `FullEdge` mode — additionally applies
+		// field-level SELECT permissions and computed fields, matching a
+		// direct `SELECT *` on the edge table.
 		let check_perms = should_check_perms(&db_ctx, Action::View)?;
 		let input_stream = buffer_stream(
 			self.input.execute(ctx)?,
@@ -214,6 +257,16 @@ impl ExecOperator for GraphEdgeScan {
 		let scan_batch_size = ctx.root().ctx.config.scan_batch_size;
 		let ctx = ctx.clone();
 		let fetch_full = output_mode == GraphScanOutput::FullEdge;
+		// A pushed-down `WHERE` predicate, replacing the downstream `Filter`.
+		// Split into the mutually-exclusive key-resident vs record-referencing
+		// forms so the flush path applies each at the right point.
+		let has_predicate = self.predicate.is_some();
+		let key_predicate: Option<Arc<dyn PhysicalExpr>> =
+			self.predicate.clone().filter(|_| self.predicate_key_resident);
+		let record_predicate: Option<Arc<dyn PhysicalExpr>> =
+			self.predicate.clone().filter(|_| !self.predicate_key_resident);
+		let metrics = Arc::clone(&self.metrics);
+		let record_metrics = metrics.is_enabled();
 
 		let stream = async_stream::try_stream! {
 			let txn = ctx.txn();
@@ -293,29 +346,40 @@ impl ExecOperator for GraphEdgeScan {
 										.await
 										.context("Failed to open graph cursor")?;
 									'cursor_loop: loop {
-										// Cap each batch to the remaining edge
-										// budget (when `edge_limit` is set) so we
-										// don't over-fetch past the user's LIMIT.
-										let remaining = edge_limit.map(|l| {
-											l.saturating_sub(edges_yielded)
-												.min(crate::kvs::NORMAL_BATCH_SIZE as usize)
-										});
-										let batch_size = remaining
-											.map(|r| r as u32)
-											.unwrap_or(crate::kvs::NORMAL_BATCH_SIZE);
-										if batch_size == 0 {
-											limit_hit = true;
-											break;
-										}
+										// Without a predicate, `edges_yielded` counts scanned
+										// edges, so cap each batch to the remaining LIMIT
+										// budget to avoid over-fetching. With a predicate,
+										// `edges_yielded` counts post-filter matches, so we may
+										// need to scan many more keys than the budget to find
+										// that many matches — request full chunks and rely on
+										// the post-filter LIMIT check at flush time.
+										let batch_size = if has_predicate {
+											crate::kvs::NORMAL_BATCH_SIZE
+										} else {
+											let remaining = edge_limit.map(|l| {
+												l.saturating_sub(edges_yielded)
+													.min(crate::kvs::NORMAL_BATCH_SIZE as usize)
+											});
+											match remaining {
+												Some(0) => {
+													limit_hit = true;
+													break;
+												}
+												Some(r) => r as u32,
+												None => crate::kvs::NORMAL_BATCH_SIZE,
+											}
+										};
 										let batch = cursor
-											.next_batch(crate::kvs::ScanLimit::Count(batch_size))
+											.next_batch(batch_size)
 											.await
 											.context("Failed to scan graph edge")?;
 										if batch.is_empty() {
 											break;
 										}
+										let mut scanned_in_batch: u64 = 0;
 										for key in &batch {
 											let decoded = decode_graph_edge(key)?;
+											scanned_in_batch += 1;
 											if output_mode == GraphScanOutput::TargetVertex {
 												match decoded.target {
 													// New-format key: the embedded
@@ -355,26 +419,42 @@ impl ExecOperator for GraphEdgeScan {
 													}
 												}
 											} else {
-												// `TargetId` / `FullEdge` operate
-												// on the edge identity (unchanged
-												// behavior).
+												// `TargetId` / `FullEdge` operate on the
+												// edge identity. Defer counting until after
+												// filtering at flush time when a predicate is
+												// pushed down; otherwise count each edge as it
+												// is buffered.
 												rid_batch.push(decoded.edge);
-												edges_yielded += 1;
+												if !has_predicate {
+													edges_yielded += 1;
+												}
 											}
-											if edge_limit.is_some_and(|l| edges_yielded >= l) {
+											if !has_predicate
+												&& edge_limit.is_some_and(|l| edges_yielded >= l)
+											{
 												limit_hit = true;
 												break;
 											}
 										}
-										// `batch`'s borrow of the cursor ends with
-										// the for-loop above (NLL), so it's safe
-										// to await `resolve_record_batch` here.
-										// Flushing inside the cursor loop bounds
-										// `rid_batch` to ~`scan_batch_size +
-										// NORMAL_BATCH_SIZE` even for high-fanout
-										// edge ranges.
-										if rid_batch.len() >= scan_batch_size {
-											let values = resolve_record_batch(
+										// Record scanned adjacency keys for EXPLAIN
+										// selectivity (matched = output_rows).
+										if record_metrics && scanned_in_batch > 0 {
+											metrics.add_edges_scanned(scanned_in_batch);
+										}
+										// `batch`'s borrow of the cursor ends with the
+										// for-loop above (NLL), so awaiting the fetch here
+										// is safe. With a predicate we flush after every
+										// cursor batch so filtering and per-source LIMIT
+										// counting stay within one source (cursors are per
+										// source+direction); without one we flush at
+										// `scan_batch_size` to amortise the batch fetch.
+										let should_flush = if has_predicate {
+											!rid_batch.is_empty()
+										} else {
+											rid_batch.len() >= scan_batch_size
+										};
+										if should_flush {
+											let mut values = resolve_and_filter_batch(
 												&ctx,
 												&txn,
 												ns_id,
@@ -383,14 +463,33 @@ impl ExecOperator for GraphEdgeScan {
 												fetch_full,
 												check_perms,
 												version,
-												CachePolicy::ReadWrite,
 												&mut perm_cache,
+												key_predicate.as_ref(),
+												record_predicate.as_ref(),
 											)
 											.await?;
-											yield ValueBatch {
-												values,
-											};
 											rid_batch.clear();
+											if has_predicate {
+												// Count post-filter matches and enforce the
+												// per-source LIMIT against them.
+												if let Some(l) = edge_limit {
+													let room = l.saturating_sub(edges_yielded);
+													if values.len() >= room {
+														values.truncate(room);
+														limit_hit = true;
+													}
+												}
+												edges_yielded += values.len();
+												if !values.is_empty() {
+													yield ValueBatch {
+														values,
+													};
+												}
+											} else {
+												yield ValueBatch {
+													values,
+												};
+											}
 										}
 										if limit_hit || chunk_bound_hit {
 											break 'cursor_loop;
@@ -444,9 +543,7 @@ impl ExecOperator for GraphEdgeScan {
 												)?;
 											loop {
 												let inner_batch = inner_cursor
-													.next_batch(crate::kvs::ScanLimit::Count(
-														crate::kvs::NORMAL_BATCH_SIZE,
-													))
+													.next_batch(crate::kvs::NORMAL_BATCH_SIZE)
 													.await
 													.context(
 														"Failed to scan edge adjacency for legacy graph fallback",
@@ -526,13 +623,20 @@ impl ExecOperator for GraphEdgeScan {
 				}
 			}
 
-			// Yield remaining batch
+			// Yield any remaining rows. With a predicate this is
+			// normally empty (each cursor batch is flushed above);
+			// the helper degrades to a plain resolve when there is
+			// no predicate.
 			if !rid_batch.is_empty() {
-				let values = resolve_record_batch(
-					&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms, version,
-					CachePolicy::ReadWrite, &mut perm_cache,
-				).await?;
-				yield ValueBatch { values };
+				let values = resolve_and_filter_batch(
+					&ctx, &txn, ns_id, db_id, &rid_batch, fetch_full, check_perms,
+					version, &mut perm_cache, key_predicate.as_ref(),
+					record_predicate.as_ref(),
+				)
+				.await?;
+				if !values.is_empty() {
+					yield ValueBatch { values };
+				}
 			}
 		};
 
@@ -540,143 +644,112 @@ impl ExecOperator for GraphEdgeScan {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-/// Compute all KV key ranges to scan for a single record + direction.
+/// Fetch and filter a batch of candidate edges/vertices for one flush.
 ///
-/// When `edge_tables` is empty, returns a single wildcard range covering all
-/// edges in the given direction. Otherwise returns one range per edge table,
-/// respecting any range bounds on each [`EdgeTableSpec`].
-async fn compute_graph_ranges(
-	ns_id: NamespaceId,
-	db_id: DatabaseId,
-	rid: &RecordId,
-	dir: Dir,
-	edge_tables: &[EdgeTableSpec],
-	ctx: &ExecutionContext,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ControlFlow> {
-	if edge_tables.is_empty() {
-		// Scan all edges in this direction
-		let beg = crate::key::graph::egprefix(ns_id, db_id, &rid.table, &rid.key, dir)
-			.context("Failed to create graph prefix")?;
-		let end = crate::key::graph::egsuffix(ns_id, db_id, &rid.table, &rid.key, dir)
-			.context("Failed to create graph suffix")?;
-		Ok(vec![(beg, end)])
-	} else {
-		let mut ranges = Vec::with_capacity(edge_tables.len());
-		for spec in edge_tables {
-			let beg =
-				eval_graph_bound(ns_id, db_id, rid, dir, &spec.table, &spec.range_start, true, ctx)
-					.await?;
-			let end =
-				eval_graph_bound(ns_id, db_id, rid, dir, &spec.table, &spec.range_end, false, ctx)
-					.await?;
-			ranges.push((beg, end));
-		}
-		Ok(ranges)
-	}
-}
-
-/// Evaluate a single start or end bound of a graph edge key range.
-///
-/// `is_start` determines the fallback for `Unbounded` (prefix vs suffix) and
-/// the suffix byte semantics for `Included` / `Excluded` bounds:
-///
-/// | Bound     | start (`is_start=true`)  | end (`is_start=false`)     |
-/// |-----------|--------------------------|----------------------------|
-/// | Unbounded | `ftprefix`               | `ftsuffix`                 |
-/// | Included  | exact key                | key + `0xff` (include key) |
-/// | Excluded  | key + `0xff` (skip past) | exact key (stop before)    |
-///
-/// The suffix byte is `0xff` (rather than `0x00`) so that new-format keys,
-/// which append the target vertex after `fk`, are still captured by an
-/// Included end / skipped by an Excluded start. The first byte after `fk`
-/// in a new-format key is the first byte of the target table name's
-/// storekey encoding, which is always `< 0xff` for practical table names.
+/// Applies, in order: (1) a key-resident predicate against a synthesized
+/// `RecordId`, dropping non-matches *before* any fetch; (2) the batch record
+/// fetch + table SELECT permission (`resolve_record_batch`); (3) a
+/// record-referencing predicate against the decoded record, *after*
+/// permission filtering. `key_predicate` and `record_predicate` are mutually
+/// exclusive in practice; both `None` degrades to a plain
+/// `resolve_record_batch`.
 #[allow(clippy::too_many_arguments)]
-async fn eval_graph_bound(
+async fn resolve_and_filter_batch(
+	ctx: &ExecutionContext,
+	txn: &Transaction,
 	ns_id: NamespaceId,
 	db_id: DatabaseId,
-	rid: &RecordId,
-	dir: Dir,
-	edge_table: &TableName,
-	bound: &Bound<Arc<dyn PhysicalExpr>>,
-	is_start: bool,
-	ctx: &ExecutionContext,
-) -> Result<Vec<u8>, ControlFlow> {
-	match bound {
-		Bound::Unbounded => {
-			if is_start {
-				crate::key::graph::ftprefix(ns_id, db_id, &rid.table, &rid.key, dir, edge_table)
-					.context("Failed to create graph table prefix")
-			} else {
-				crate::key::graph::ftsuffix(ns_id, db_id, &rid.table, &rid.key, dir, edge_table)
-					.context("Failed to create graph table suffix")
+	rids: &[RecordId],
+	fetch_full: bool,
+	check_perms: bool,
+	version: Option<u64>,
+	perm_cache: &mut std::collections::HashMap<TableName, PhysicalPermission>,
+	key_predicate: Option<&Arc<dyn PhysicalExpr>>,
+	record_predicate: Option<&Arc<dyn PhysicalExpr>>,
+) -> Result<Vec<Value>, ControlFlow> {
+	let values = if let Some(pred) = key_predicate {
+		// Key-resident pre-fetch skip: evaluate against the
+		// adjacency-key identity so non-matches are never fetched
+		// or permission-checked.
+		let mut survivors: Vec<RecordId> = Vec::with_capacity(rids.len());
+		for rid in rids {
+			let candidate = Value::RecordId(rid.clone());
+			let keep = pred
+				.evaluate(EvalContext::from_exec_ctx(ctx).with_value(&candidate))
+				.await?
+				.is_truthy();
+			if keep {
+				survivors.push(rid.clone());
 			}
 		}
-		Bound::Included(expr) => {
-			let fk = evaluate_bound_key(expr, ctx).await?;
-			let mut key = encode_graph_key(ns_id, db_id, rid, dir, edge_table, fk)?;
-			// Included start: exact key.
-			// Included end: append `0xff` to include the key and any
-			// new-format-with-target variant of the same fk.
-			if !is_start {
-				key.push(0xff);
-			}
-			Ok(key)
+		if survivors.is_empty() {
+			return Ok(Vec::new());
 		}
-		Bound::Excluded(expr) => {
-			let fk = evaluate_bound_key(expr, ctx).await?;
-			let mut key = encode_graph_key(ns_id, db_id, rid, dir, edge_table, fk)?;
-			// Excluded start: append `0xff` to skip past both legacy and
-			// new-format-with-target variants of the same fk.
-			// Excluded end: exact key.
-			if is_start {
-				key.push(0xff);
-			}
-			Ok(key)
-		}
+		resolve_record_batch(
+			ctx,
+			txn,
+			ns_id,
+			db_id,
+			&survivors,
+			fetch_full,
+			check_perms,
+			version,
+			CachePolicy::ReadWrite,
+			perm_cache,
+		)
+		.await?
+	} else {
+		resolve_record_batch(
+			ctx,
+			txn,
+			ns_id,
+			db_id,
+			rids,
+			fetch_full,
+			check_perms,
+			version,
+			CachePolicy::ReadWrite,
+			perm_cache,
+		)
+		.await?
+	};
+	match record_predicate {
+		// Record-referencing predicate runs after fetch + permission,
+		// on the decoded record, preserving fetch -> permission ->
+		// filter order.
+		Some(pred) => apply_record_predicate(pred, ctx, values).await,
+		None => Ok(values),
 	}
 }
 
-/// Encode a graph key for a specific edge table and record ID key.
-fn encode_graph_key(
-	ns_id: NamespaceId,
-	db_id: DatabaseId,
-	rid: &RecordId,
-	dir: Dir,
-	edge_table: &TableName,
-	fk: crate::val::RecordIdKey,
-) -> Result<Vec<u8>, ControlFlow> {
-	crate::key::graph::new(
-		ns_id,
-		db_id,
-		&rid.table,
-		&rid.key,
-		dir,
-		&RecordId {
-			table: edge_table.clone(),
-			key: fk,
-		},
-	)
-	.encode_key()
-	.context("Failed to encode graph range key")
-}
-
-/// Decode a graph key. For legacy keys, returns the edge id; for new-format
-/// keys, also returns the embedded target vertex.
-///
-/// Thin wrapper over [`crate::key::graph::Graph::decode_key`] that converts
-/// the anyhow error into a [`ControlFlow`] with a consistent context string,
-/// so call sites in the scan pipeline can stay on `?`.
-fn decode_graph_edge(key: &[u8]) -> Result<crate::key::graph::DecodedGraph, ControlFlow> {
-	crate::key::graph::Graph::decode_key(key).context("Failed to decode graph key")
+/// Retain only rows for which `predicate` is truthy, evaluated against the
+/// decoded record. Mirrors `Filter::filter_batch_in_place`.
+async fn apply_record_predicate(
+	predicate: &Arc<dyn PhysicalExpr>,
+	ctx: &ExecutionContext,
+	mut values: Vec<Value>,
+) -> Result<Vec<Value>, ControlFlow> {
+	let results = {
+		let eval_ctx = EvalContext::from_exec_ctx(ctx);
+		predicate.evaluate_batch(eval_ctx, &values).await?
+	};
+	let mut write = 0;
+	for (read, result) in results.into_iter().enumerate() {
+		if result.is_truthy() {
+			if write != read {
+				values.swap(write, read);
+			}
+			write += 1;
+		}
+	}
+	values.truncate(write);
+	Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
+	use std::ops::Bound;
+
 	use super::*;
 	use crate::exec::operators::CurrentValueSource;
 

@@ -97,6 +97,8 @@
 //! crate::key::change::vs               /*{ns}*{db}#{ts}/*{ns}/*/{db}!vs*{tb_name}\0
 //! crate::key::change::suffix_vs        /*{ns}*{db}#{ts}/*{ns}/*/{db}!vs
 //!
+//! crate::key::lqe                      /*{ns}*{db}%{ts}*{tb_name}
+//!
 //! crate::key::record                   /*{ns}*{db}*{tb_name}*{id}
 //!
 //! crate::key::graph                    /*{ns}*{db}*{tb_name}~{id}{eg}{ft}{fk}
@@ -110,6 +112,7 @@ pub(crate) mod database;
 pub(crate) mod debug;
 pub(crate) mod graph;
 pub(crate) mod index;
+pub(crate) mod lqe;
 pub(crate) mod namespace;
 pub(crate) mod node;
 pub(crate) mod record;

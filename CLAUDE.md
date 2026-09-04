@@ -39,18 +39,23 @@ cd language-tests && cargo run run
 
 # Run specific language test
 # Note: all paths are relative to the language-tests/tests directory
-cd language-tests && cargo run run -- --test path/to/test.surql
+cd language-tests && cargo run run path/to/test.surql
 
 # Auto-generate test results
 # Note: The test results must be empty for the auto-generation to work.
-cd language-tests && cargo run run -- --results accept path/to/test.surql
+cd language-tests && cargo run run --results accept path/to/test.surql
+
+# Benchmark a language-test bench (measures by default; --profile records a flamegraph)
+# Pass the bench filter and flags after `--`. See language-tests/README.md > Benchmarking.
+cargo make bench -- scans/where_integer_in_many_full --save
+cargo make bench -- scans/where_integer_in_many_full --profile --dataset indexed
 ```
 
 ## Testing Conventions
 
-### Language Tests (`language-tests/tests/*.surql`)
+### Language Tests (`language-tests/tests/*.surql`, `*.gql`)
 
-Test SurrealQL queries with expected results. Bug reproductions go in `language-tests/tests/reproductions/ISSUE_NUMBER_description.surql`.
+Test SurrealQL queries with expected results (`.gql` files test the GQL dialect). Bug reproductions go in `language-tests/tests/reproductions/ISSUE_NUMBER_description.surql`.
 
 **Test file format:**
 ```surql

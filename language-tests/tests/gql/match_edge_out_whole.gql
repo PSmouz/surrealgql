@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Whole a/k/b returns: full anchor, edge (with in/out RecordIds) and far-node records per binding row."
+
+[[test.results]]
+value = "[{ a: { city: 'London', id: person:3, name: 'C' }, b: { active: true, age: 30, city: 'London', id: person:1, name: 'A' }, k: { id: knows:k31, in: person:3, out: person:1 }, since: NONE }, { a: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' }, b: { active: true, age: 30, city: 'London', id: person:1, name: 'A' }, k: { id: knows:k21, in: person:2, out: person:1, since: 2018 }, since: 2018 }, { a: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' }, b: { city: 'London', id: person:3, name: 'C' }, k: { id: knows:k23, in: person:2, out: person:3, since: 2020 }, since: 2020 }, { a: { active: true, age: 30, city: 'London', id: person:1, name: 'A' }, b: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' }, k: { id: knows:k12, in: person:1, out: person:2, since: 2021 }, since: 2021 }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN a, k, b, k.since AS since ORDER BY since

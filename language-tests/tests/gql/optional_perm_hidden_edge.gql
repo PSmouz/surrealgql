@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["gql/_perm_hidden_edge_import.surql"]
+auth = { namespace = "test", database = "test", access = "user", rid = "person:1" }
+
+[test]
+reason = "SECURITY (R3 + permissions): an OPTIONAL hop over a permission-denied edge null-fills the optional binding rather than leaking the target. The record user may SELECT `person` but NOT `knows` (`PERMISSIONS NONE`), so `OPTIONAL MATCH (a)-[:knows]->(b:person)` must find no targets — exactly as `perm_hidden_edge.gql` pins for a mandatory hop — yet the left-outer MUST still preserve every mandatory `a` anchor (person:1/2/3) with `b` bound to `Value::Null` (surfacing as NONE for `b.name`). This guards that the OPTIONAL combine layer (OptionalExpand fast path) inherits the same FieldState-aware edge/target gating as the mandatory Expand and adds no leak when null-filling on a denied miss."
+
+[[test.results]]
+value = "[{ name: 'A', friend: NONE }, { name: 'B', friend: NONE }, { name: 'C', friend: NONE }]"
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) RETURN a.name AS name, b.name AS friend ORDER BY name

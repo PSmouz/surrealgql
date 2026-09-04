@@ -14,11 +14,16 @@ use tracing::info;
 
 const TARGET: &str = "surrealdb::core::kvs::mem";
 
-use super::api::{BoxFut, GetMultiResult, KeysResult, ScanLimit, ScanResult};
+use super::api::{
+	BoxFut, GetMultiResult, KeyValSpan, KeysResult, ScanChunkStats, ScanCursorVals, ScanResult,
+	ValVisitor, ValsBatch,
+};
 #[cfg(not(target_family = "wasm"))]
 use super::config::{AolMode, SnapshotMode, SyncMode};
+use super::cursor::fill_vals_batch;
+use super::direction::Direction;
 use super::err::{Error, Result};
-use super::{ESTIMATED_BYTES_PER_KEY, ESTIMATED_BYTES_PER_KV};
+use super::util::update_range;
 use crate::key::debug::Sprintable;
 use crate::kvs::api::Transactable;
 use crate::kvs::timestamp::{
@@ -494,7 +499,7 @@ impl Transactable for Transaction {
 	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -524,7 +529,7 @@ impl Transactable for Transaction {
 	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -554,7 +559,7 @@ impl Transactable for Transaction {
 	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -584,7 +589,7 @@ impl Transactable for Transaction {
 	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -606,6 +611,36 @@ impl Transactable for Transaction {
 			};
 			// Consume the iterator
 			Ok(consume_vals(&mut iter, limit, skip))
+		})
+	}
+
+	/// Open a stateful key+value scan cursor. Overrides the default
+	/// (double-copying) cursor with a resume-by-bound cursor whose `for_each`
+	/// streams the engine's refcounted `Bytes` to the visitor with no payload
+	/// copy. See [`MemValsCursor`].
+	fn open_vals_cursor<'a>(
+		&'a self,
+		rng: Range<Key>,
+		dir: Direction,
+		skip: u32,
+		version: Option<u64>,
+	) -> BoxFut<'a, Result<Box<dyn ScanCursorVals + 'a>>> {
+		Box::pin(async move {
+			self.ensure_versioned(version)?;
+			if self.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			Ok(Box::new(MemValsCursor {
+				tx: self,
+				rng,
+				dir,
+				version,
+				skip,
+				exhausted: false,
+				key_buf: Vec::new(),
+				val_buf: Vec::new(),
+				spans: Vec::new(),
+			}) as Box<dyn ScanCursorVals + 'a>)
 		})
 	}
 
@@ -685,7 +720,7 @@ impl TimeStampImpl for SurrealMxTimeStampImpl {
 }
 
 // Consume and iterate over only keys
-fn consume_keys(cursor: &mut KeyIterator<'_>, limit: ScanLimit, skip: u32) -> KeysResult {
+fn consume_keys(cursor: &mut KeyIterator<'_>, limit: u32, skip: u32) -> KeysResult {
 	// Skip entries efficiently without allocation
 	for _ in 0..skip {
 		if cursor.next().is_none() {
@@ -693,50 +728,17 @@ fn consume_keys(cursor: &mut KeyIterator<'_>, limit: ScanLimit, skip: u32) -> Ke
 		}
 	}
 	let mut key_bytes = 0u64;
-	let keys = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				if let Some(k) = cursor.next() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut keys = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while keys.len() < limit as usize {
+		if let Some(k) = cursor.next() {
+			key_bytes += k.len() as u64;
+			keys.push(k.to_vec());
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KEY).min(4096) as usize);
-			// Check that we don't exceed the byte limit
-			while key_bytes < b as u64 {
-				if let Some(k) = cursor.next() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && key_bytes < b as u64 {
-				if let Some(k) = cursor.next() {
-					key_bytes += k.len() as u64;
-					res.push(k.to_vec());
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	KeysResult {
 		keys,
 		key_bytes,
@@ -744,82 +746,170 @@ fn consume_keys(cursor: &mut KeyIterator<'_>, limit: ScanLimit, skip: u32) -> Ke
 }
 
 // Consume and iterate over keys and values
-fn consume_vals(cursor: &mut ScanIterator<'_>, limit: ScanLimit, skip: u32) -> ScanResult {
+fn consume_vals(cursor: &mut ScanIterator<'_>, limit: u32, skip: u32) -> ScanResult {
 	// Skip entries efficiently without allocation
 	for _ in 0..skip {
 		if cursor.next().is_none() {
 			return ScanResult::default();
 		}
 	}
-	// Track the cumulative key/value bytes for the metric. The byte-bounded limit
-	// branches still rely on `bytes_fetched` (key + value bytes) to decide
-	// when to stop, so the two counters are kept separate.
+	// Track the cumulative key/value bytes for the scan metrics.
 	let mut key_bytes = 0u64;
 	let mut value_bytes = 0u64;
-	let values = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				if let Some((k, v)) = cursor.next() {
-					key_bytes += k.len() as u64;
-					value_bytes += v.len() as u64;
-					res.push((k.to_vec(), v.to_vec()));
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut values = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while values.len() < limit as usize {
+		if let Some((k, v)) = cursor.next() {
+			key_bytes += k.len() as u64;
+			value_bytes += v.len() as u64;
+			values.push((k.to_vec(), v.to_vec()));
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KV).min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the byte limit
-			while bytes_fetched < b as u64 {
-				if let Some((k, v)) = cursor.next() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((k.to_vec(), v.to_vec()));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && bytes_fetched < b as u64 {
-				if let Some((k, v)) = cursor.next() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-
-					res.push((k.to_vec(), v.to_vec()));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	ScanResult {
 		values,
 		key_bytes,
 		value_bytes,
+	}
+}
+
+/// Stateful, resume-by-bound key+value scan cursor for the in-memory engine.
+///
+/// surrealmx scan iterators borrow the transaction's `RwLock` read guard, so a
+/// cursor cannot hold one across calls without a self-referential borrow.
+/// Instead this cursor re-seeks the B-tree from the current range bound on each
+/// call (a cheap operation) and advances the bound past the last visited key.
+/// `for_each` hands the engine's refcounted `Bytes` to the visitor by
+/// reference — zero payload copy — while `next_batch` fills the reusable
+/// buffers for callers that need an owned-in-buffer batch.
+struct MemValsCursor<'a> {
+	/// The parent transaction (source of the `RwLock`-guarded inner tx).
+	tx: &'a Transaction,
+	/// Remaining range to scan; advanced past the last visited key each call.
+	rng: Range<Key>,
+	/// Fixed scan direction.
+	dir: Direction,
+	/// Optional historical version timestamp.
+	version: Option<u64>,
+	/// Entries still to skip before the first visited row (burned once).
+	skip: u32,
+	/// Set once the range is exhausted; further calls are cheap no-ops.
+	exhausted: bool,
+	/// Reusable concatenated key buffer for the `next_batch` path.
+	key_buf: Vec<u8>,
+	/// Reusable concatenated value buffer for the `next_batch` path.
+	val_buf: Vec<u8>,
+	/// Reusable per-pair spans for the `next_batch` path.
+	spans: Vec<KeyValSpan>,
+}
+
+impl MemValsCursor<'_> {
+	/// Build a fresh forward/backward (optionally versioned) iterator over the
+	/// current range, borrowing the supplied read guard.
+	fn build_iter<'g>(&self, inner: &'g Tx) -> Result<ScanIterator<'g>> {
+		let rng = self.rng.start.clone()..self.rng.end.clone();
+		Ok(match (self.version, self.dir) {
+			(Some(ts), Direction::Forward) => inner.scan_iter_at_version(rng, ts)?,
+			(None, Direction::Forward) => inner.scan_iter(rng)?,
+			(Some(ts), Direction::Backward) => inner.scan_iter_at_version_reverse(rng, ts)?,
+			(None, Direction::Backward) => inner.scan_iter_reverse(rng)?,
+		})
+	}
+}
+
+impl ScanCursorVals for MemValsCursor<'_> {
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<ValsBatch<'s>>> {
+		// The materialising path shares the default cursor's `scan`-based fill;
+		// the zero-copy path that borrows the engine's `Bytes` is `for_each`.
+		Box::pin(async move {
+			if self.tx.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			let (key_bytes, value_bytes) = fill_vals_batch(
+				self.tx,
+				&mut self.rng,
+				self.dir,
+				self.version,
+				&mut self.skip,
+				&mut self.exhausted,
+				&mut self.key_buf,
+				&mut self.val_buf,
+				&mut self.spans,
+				limit,
+			)
+			.await?;
+			Ok(ValsBatch::from_parts(
+				&self.key_buf,
+				&self.val_buf,
+				&self.spans,
+				key_bytes,
+				value_bytes,
+			))
+		})
+	}
+
+	/// Zero-copy chunk drive. Note: the transaction's `RwLock` read guard is
+	/// held for the whole chunk — including the visitor's per-row work (e.g.
+	/// record decode) — so a same-transaction writer queues behind it for a
+	/// bounded stretch: ≤ `skip + limit` rows on the first call (the leading
+	/// skip burns under the same guard), ≤ `limit` rows thereafter. Concurrent
+	/// readers are unaffected unless a writer is already queued (the lock is
+	/// FIFO-fair).
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn ValVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>> {
+		Box::pin(async move {
+			if self.tx.closed() {
+				return Err(Error::TransactionFinished);
+			}
+			let mut stats = ScanChunkStats::default();
+			// A zero-budget call must be a pure no-op: bail before burning
+			// `skip` or touching the iterator so the cursor state is intact
+			// for the next (non-zero) call.
+			if limit == 0 || self.exhausted || self.rng.start >= self.rng.end {
+				return Ok(stats);
+			}
+			let tx = self.tx;
+			let mut last = None;
+			let mut broke = false;
+			{
+				let inner = tx.inner.read().await;
+				let mut iter = self.build_iter(&inner)?;
+				for _ in 0..std::mem::take(&mut self.skip) {
+					if iter.next().is_none() {
+						self.exhausted = true;
+						return Ok(stats);
+					}
+				}
+				while stats.rows < limit as u64 {
+					let Some((k, v)) = iter.next() else {
+						self.exhausted = true;
+						break;
+					};
+					// Count only after the visitor accepts the row, so a
+					// visitor error never records an unresumed row.
+					let flow = f(&k[..], &v[..])?;
+					stats.rows += 1;
+					stats.key_bytes += k.len() as u64;
+					stats.value_bytes += v.len() as u64;
+					last = Some(k);
+					if let std::ops::ControlFlow::Break(()) = flow {
+						broke = true;
+						break;
+					}
+				}
+			}
+			update_range(&mut self.rng, self.dir, last.as_deref());
+			// A short chunk without an early `Break` means the iterator dried
+			// up before the row budget: the range is exhausted.
+			if !broke && stats.rows < limit as u64 {
+				self.exhausted = true;
+			}
+			Ok(stats)
+		})
 	}
 }

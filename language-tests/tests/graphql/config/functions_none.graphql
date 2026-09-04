@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["./_functions_none.surql"]
+
+[test]
+reason = "FUNCTIONS NONE removes the fn_ query fields from the schema"
+
+[[test.results]]
+error = 'Unknown field "fn_num" on type "Query".'
+*/
+query {
+	fn_num
+}

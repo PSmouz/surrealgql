@@ -1,16 +1,26 @@
+#![cfg(feature = "tokio-console")]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use console_subscriber::ConsoleLayer;
+use surrealdb_core::lazy_env_parse;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::cnf::{TOKIO_CONSOLE_RETENTION, TOKIO_CONSOLE_SOCKET_ADDR};
-
 const DEFAULT_TOKIO_CONSOLE_ADDR: SocketAddr =
 	SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6669);
+
+/// The socket address that Tokio Console will bind on
+static TOKIO_CONSOLE_SOCKET_ADDR: LazyLock<Option<String>> =
+	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_SOCKET_ADDR", Option<String>);
+
+/// How long, in seconds, to retain data for completed events (default: 60)
+static TOKIO_CONSOLE_RETENTION: LazyLock<u64> =
+	lazy_env_parse!("SURREAL_TOKIO_CONSOLE_RETENTION", u64, 60);
 
 pub fn new<S>() -> Result<Box<dyn Layer<S> + Send + Sync>>
 where

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "REGRESSION (residual correlates against a NULLABLE earlier-OPTIONAL binding): the second OPTIONAL is self-rooted (general / LeftJoin path) and its WHERE `c.age > b.age` references `b`, which is bound by the FIRST optional and may itself be Value::Null on a miss. The deferred residual must still evaluate 3VL on a Null `b` (=> UNKNOWN => no match => null-fill c,d) while preserving the (a,b) accumulator row — and must produce real matches when `b` is non-null. First optional (a)-[:knows]->(b:person) WHERE b.age < 25 (fast path, rides Expand.predicate): a=A -> b=B(20); a=B -> A(30)/C(none) both fail -> b=NONE; a=C -> A(30) fails -> b=NONE. Second optional (c:person)-[:knows]->(d:person) WHERE c.age > b.age (residual): a=A (b=20) keeps c with age>20 and a person->person edge => c=A(30) via A->B => (c=A,d=B); a=B/a=C (b=NONE) => `c.age > NONE` is UNKNOWN for all => null-fill c,d. Every (a,b) preserved."
+
+[[test.results]]
+value = "[{ a: 'A', b: 'B', c: 'A', d: 'B' }, { a: 'B', b: NONE, c: NONE, d: NONE }, { a: 'C', b: NONE, c: NONE, d: NONE }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b.age < 25 OPTIONAL MATCH (c:person)-[:knows]->(d:person) WHERE c.age > b.age RETURN a.name AS a, b.name AS b, c.name AS c, d.name AS d ORDER BY a, b, c, d

@@ -1462,15 +1462,7 @@ impl Parser<'_> {
 
 				t!("FUNCTION") => {
 					self.pop_peek();
-					expected!(self, t!("fn"));
-					expected!(self, t!("::"));
-					let mut ident = self.parse_ident()?.into_string();
-					while self.eat(t!("::")) {
-						let value = self.parse_ident()?.into_string();
-						ident.push_str("::");
-						ident.push_str(&value);
-					}
-					res.function = Some(ident.into());
+					res.function = Some(self.parse_analyzer_function_name()?);
 				}
 				t!("COMMENT") => {
 					self.pop_peek();

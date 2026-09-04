@@ -23,7 +23,7 @@ mod cnf;
 mod dbs;
 mod env;
 #[cfg(feature = "graphql")]
-mod gql;
+mod graphql;
 /// Make `ntw` public so embedders can access RouterFactory and related networking definitions
 /// when running SurrealDB as a library.
 pub mod ntw;

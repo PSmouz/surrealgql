@@ -18,6 +18,7 @@ pub mod count;
 pub mod crypto;
 pub mod duration;
 pub mod encoding;
+pub mod eval;
 pub mod file;
 pub mod geo;
 pub mod http;
@@ -91,6 +92,7 @@ pub async fn run(
 		|| name.eq("value::expect")
 		|| name.eq("value::patch")
 		|| name.eq("sequence::nextval")
+		|| name.starts_with("eval::")
 		|| name.starts_with("api")
 		|| name.starts_with("http")
 		|| name.starts_with("search")
@@ -578,6 +580,9 @@ pub async fn asynchronous(
 		"api::res::status" => api::res::status((stk, ctx, opt, doc)).await,
 		"api::res::header" => api::res::header((stk, ctx, opt, doc)).await,
 		"api::res::headers" => api::res::headers((stk, ctx, opt, doc)).await,
+		//
+		"eval::surql" => eval::surql((stk, ctx, opt, doc)).await,
+		"eval::gql" => eval::gql((stk, ctx, opt, doc)).await,
 		//
 		"array::all" => array::all((stk, ctx, Some(opt), doc)).await,
 		"array::any" => array::any((stk, ctx, Some(opt), doc)).await,

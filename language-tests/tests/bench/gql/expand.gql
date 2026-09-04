@@ -1,0 +1,15 @@
+/**
+[bench]
+reason = "GQL single-hop MATCH expansion over a 5000-node knows graph (out-degree 4). Exercises the Bind -> Expand -> EndpointBind operator chain: scan all person nodes, expand each along :knows, bind the far endpoint. ~20000 result paths."
+run = true
+rebuild = false
+imports = ["bench/gql/util/knows-graph-5000.surql"]
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+MATCH (a:person)-[:knows]->(b:person)
+RETURN a.name AS a, b.name AS b

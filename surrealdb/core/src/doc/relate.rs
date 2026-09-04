@@ -1,4 +1,5 @@
 use reblessive::tree::Stk;
+use surrealdb_types::ToSql;
 
 use super::IgnoreError;
 use crate::ctx::FrozenContext;
@@ -32,12 +33,14 @@ impl Document {
 	) -> Result<Value, IgnoreError> {
 		// Ensure we can write to the table at all
 		self.check_permissions_quick_create(ctx, opt)?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Ensure any input data is computed
 		self.compute_input_data(stk, ctx, opt, stm).await?;
 		// Set the specified record content
 		self.process_record_data(stk, ctx, opt).await?;
 		// Generate a record id
-		self.generate_record_id()?;
+		self.generate_record_id(stk, ctx, opt).await?;
 		// Ensure we can store this type of record
 		self.check_table_type_relate()?;
 		// Ensure all special fields are valid
@@ -74,6 +77,17 @@ impl Document {
 		opt: &Options,
 		stm: &Statement<'_>,
 	) -> Result<Value, IgnoreError> {
+		if matches!(stm, Statement::Relate(relate) if !relate.or_update)
+			&& let Some(rid) = self.current.rid.as_ref().or(self.id.as_ref())
+		{
+			tracing::warn!(
+				target = "surrealdb::core::dbs",
+				record = %rid.to_sql(),
+				"RELATE updated an existing record instead of creating a new edge; \
+				 use `RELATE OR UPDATE` to opt in to update semantics explicitly, or \
+				 define a UNIQUE index for an immediate error. This behaviour will change in a future version.",
+			);
+		}
 		// Ensure the record actually exists
 		self.check_record_exists()?;
 		// Check if table has correct relation status
@@ -83,6 +97,8 @@ impl Document {
 		// Otherwise a `SET x = THROW ...` could exfiltrate field values
 		// before the permission check rejects the operation.
 		self.check_update_permissions(stk, ctx, opt, &self.current).await?;
+		// Reject writes to read-only view tables (after the permission gate)
+		self.check_table_not_view(opt)?;
 		// Ensure any input data is computed
 		self.compute_input_data(stk, ctx, opt, stm).await?;
 		// Ensure all special fields are valid

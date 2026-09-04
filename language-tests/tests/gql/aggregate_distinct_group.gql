@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "RETURN DISTINCT over a GROUP BY collapses duplicate aggregate rows: the per-name edge counts are 1 (A), 2 (B), 1 (C); DISTINCT leaves {1, 2}."
+
+[[test.results]]
+value = "[{ c: 1 }, { c: 2 }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN DISTINCT count(*) AS c GROUP BY a.name ORDER BY c

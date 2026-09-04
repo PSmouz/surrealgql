@@ -63,6 +63,70 @@ impl McpSession {
 		self.execute_with_session(&session, query, vars).await
 	}
 
+	/// Execute a GQL (ISO/IEC 39075) query with optional typed variable
+	/// bindings, against the namespace and database selected on the session.
+	///
+	/// Mirrors [`Self::execute`]: the query capability is checked for the
+	/// subject and top-level failures are returned in-band as error
+	/// [`QueryResult`]s. GQL is an experimental capability; when it is not
+	/// enabled the datastore returns that as the (in-band) error here, so the
+	/// `gql` tool degrades to a clear message rather than disappearing.
+	pub async fn execute_gql(
+		&self,
+		query: &str,
+		vars: Option<Variables>,
+	) -> Result<Vec<QueryResult>, Error> {
+		let session = self.session.read().await;
+		if !self.ds.allows_query_by_subject(session.au.as_ref()) {
+			let err = surrealdb_types::Error::query(
+				"Capabilities denied this query for the current subject".to_string(),
+				None,
+			);
+			return Ok(vec![QueryResultBuilder::started_now().finish_with_result(Err(err))]);
+		}
+		self.run_to_results(self.ds.execute_gql(query, &session, vars)).await
+	}
+
+	/// Execute a GraphQL request against the namespace and database selected on
+	/// the session, returning the GraphQL response envelope (`{ data, errors }`)
+	/// as plain JSON.
+	///
+	/// `variables` is a plain-JSON object (or `Null`). Capability denial,
+	/// schema-generation failures (no namespace/database, GraphQL not
+	/// configured), and timeouts are returned as the `Err` message for the
+	/// tool layer to surface in-band; GraphQL execution errors ride back inside
+	/// the returned envelope.
+	pub async fn execute_graphql(
+		&self,
+		query: &str,
+		variables: serde_json::Value,
+		operation: Option<String>,
+	) -> Result<serde_json::Value, String> {
+		// Clone the session so the read lock is not held across schema
+		// generation and request execution.
+		let session = self.session.read().await.clone();
+		if !self.ds.allows_query_by_subject(session.au.as_ref()) {
+			return Err("Capabilities denied this query for the current subject".to_string());
+		}
+		let fut = surrealdb_core::graphql::execute_request(
+			&self.ds,
+			&session,
+			query.to_string(),
+			variables,
+			operation,
+		);
+		let outcome = match self.config.query_timeout {
+			Some(dur) => tokio::time::timeout(dur, fut).await.map_err(|_elapsed| {
+				format!(
+					"MCP GraphQL request exceeded the {}s timeout (set SURREAL_MCP_QUERY_TIMEOUT_SECS=0 to disable)",
+					dur.as_secs()
+				)
+			})?,
+			None => fut.await,
+		};
+		outcome.map_err(|e| e.to_string())
+	}
+
 	/// Execute `query` scoped to an explicit `(namespace, database)` without
 	/// mutating the MCP session's own `use` state.
 	///
@@ -107,7 +171,20 @@ impl McpSession {
 			return Ok(vec![QueryResultBuilder::started_now().finish_with_result(Err(err))]);
 		}
 
-		let fut = self.ds.execute(query, session, vars);
+		self.run_to_results(self.ds.execute(query, session, vars)).await
+	}
+
+	/// Run a datastore query future under the configured
+	/// [`McpConfig::query_timeout`], normalising both a timeout and a top-level
+	/// execution failure into an in-band error [`QueryResult`]. Shared by the
+	/// SurrealQL ([`Self::execute`]) and GQL ([`Self::execute_gql`])
+	/// paths, which differ only in which datastore entrypoint produces `fut`.
+	async fn run_to_results<F>(&self, fut: F) -> Result<Vec<QueryResult>, Error>
+	where
+		F: std::future::Future<
+				Output = std::result::Result<Vec<QueryResult>, surrealdb_types::Error>,
+			>,
+	{
 		let outcome = match self.config.query_timeout {
 			Some(dur) => match tokio::time::timeout(dur, fut).await {
 				Ok(inner) => inner,

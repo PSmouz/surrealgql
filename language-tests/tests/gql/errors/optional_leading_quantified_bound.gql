@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-C): a QUANTIFIED bound-variable expansion leading an OPTIONAL block is a PathExpand off the outer accumulator, which the single-hop OptionalExpand fast path does not build and a standalone subplan cannot self-root (unlabelled quantified start). Rejected cleanly at lowering."
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [15:33]
+   |
+15 | MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->{1,3}(b:person) RETURN a.name A...
+   |                                 ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->{1,3}(b:person) RETURN a.name AS name

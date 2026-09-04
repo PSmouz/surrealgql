@@ -170,10 +170,10 @@ pub(crate) fn evaluate_flatten(value: &Value) -> anyhow::Result<Value> {
 }
 
 // ============================================================================
-// FirstPart -- [$]
+// FirstPart -- [0]
 // ============================================================================
 
-/// First element - `[$]` or `.first()`.
+/// First element - `[0]` or `.first()`.
 #[derive(Debug, Clone)]
 pub struct FirstPart;
 impl PhysicalExpr for FirstPart {
@@ -194,6 +194,7 @@ impl PhysicalExpr for FirstPart {
 			let value = ctx.current_value.cloned().unwrap_or(Value::None);
 			match value {
 				Value::Array(arr) => Ok(arr.first().cloned().unwrap_or(Value::None)),
+				Value::Set(set) => Ok(set.first().cloned().unwrap_or(Value::None)),
 				other => Ok(other),
 			}
 		})
@@ -206,15 +207,15 @@ impl PhysicalExpr for FirstPart {
 
 impl ToSql for FirstPart {
 	fn fmt_sql(&self, f: &mut String, _fmt: SqlFormat) {
-		f.push_str("[$]");
+		f.push_str("[0]");
 	}
 }
 
 // ============================================================================
-// LastPart -- [~]
+// LastPart -- [$]
 // ============================================================================
 
-/// Last element - `[~]` or `.last()`.
+/// Last element - `[$]` or `.last()`.
 #[derive(Debug, Clone)]
 pub struct LastPart;
 impl PhysicalExpr for LastPart {
@@ -235,6 +236,7 @@ impl PhysicalExpr for LastPart {
 			let value = ctx.current_value.cloned().unwrap_or(Value::None);
 			match value {
 				Value::Array(arr) => Ok(arr.last().cloned().unwrap_or(Value::None)),
+				Value::Set(set) => Ok(set.last().cloned().unwrap_or(Value::None)),
 				other => Ok(other),
 			}
 		})
@@ -247,6 +249,6 @@ impl PhysicalExpr for LastPart {
 
 impl ToSql for LastPart {
 	fn fmt_sql(&self, f: &mut String, _fmt: SqlFormat) {
-		f.push_str("[~]");
+		f.push_str("[$]");
 	}
 }

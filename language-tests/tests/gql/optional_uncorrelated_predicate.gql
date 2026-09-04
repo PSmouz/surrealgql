@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "CONTROL / no-regression: an OPTIONAL on the general path whose inline WHERE deps are ENTIRELY within the block (`x.age > 25`, no outer binding) must NOT be routed to the residual — it places inside the block subplan (pre-null), exactly as before the correlated-predicate fix. Guards that the residual change touches only boundary-correlated predicates and that the empty-keys uncorrelated Left still works. The block matches whenever some x->y has x.age>25: only x=A(30) via A->B, so the block yields one distinct x. Uncorrelated (no shared variable with `a`) -> every mandatory `a` (A,B,C) crosses with x='A'."
+
+[[test.results]]
+value = "[{ name: 'A', x: 'A' }, { name: 'B', x: 'A' }, { name: 'C', x: 'A' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (x:person)-[:knows]->(y:person) WHERE x.age > 25 RETURN a.name AS name, x.name AS x ORDER BY name, x

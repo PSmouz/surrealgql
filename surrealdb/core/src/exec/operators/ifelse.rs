@@ -11,7 +11,7 @@ use surrealdb_types::{SqlFormat, ToSql};
 
 use crate::err::Error;
 use crate::exec::context::{ContextLevel, ExecutionContext};
-use crate::exec::plan_or_compute::{evaluate_expr, expr_required_context};
+use crate::exec::plan_or_compute::{evaluate_expr_at_depth, expr_required_context};
 use crate::exec::{
 	AccessMode, CardinalityHint, ExecOperator, FlowResult, OperatorMetrics, ValueBatch,
 	ValueBatchStream,
@@ -43,14 +43,23 @@ pub struct IfElsePlan {
 	pub(crate) metrics: Arc<OperatorMetrics>,
 	/// Optional else body
 	pub else_body: Option<Expr>,
+	/// Expression-nesting depth recorded when this operator was planned. The
+	/// deferred condition/body planning below is seeded with it so re-entry
+	/// nodes (eval/UDF) keep counting toward `max_computation_depth`.
+	plan_depth: u32,
 }
 
 impl IfElsePlan {
-	pub(crate) fn new(branches: Vec<(Expr, Expr)>, else_body: Option<Expr>) -> Self {
+	pub(crate) fn new(
+		branches: Vec<(Expr, Expr)>,
+		else_body: Option<Expr>,
+		plan_depth: u32,
+	) -> Self {
 		Self {
 			branches,
 			else_body,
 			metrics: Arc::new(OperatorMetrics::new()),
+			plan_depth,
 		}
 	}
 }
@@ -100,9 +109,13 @@ impl ExecOperator for IfElsePlan {
 	fn execute(&self, ctx: &ExecutionContext) -> FlowResult<ValueBatchStream> {
 		let branches = self.branches.clone();
 		let else_body = self.else_body.clone();
+		// Branch bodies are re-planned one re-entry deeper than this operator, so
+		// the depth count continues at `plan_depth + 1` toward `max_computation_depth`.
+		let depth = self.plan_depth + 1;
 		let ctx = ctx.clone();
 
-		let stream = stream::once(async move { execute_ifelse(&branches, &else_body, &ctx).await });
+		let stream =
+			stream::once(async move { execute_ifelse(&branches, &else_body, &ctx, depth).await });
 
 		Ok(Box::pin(stream))
 	}
@@ -127,15 +140,16 @@ async fn execute_ifelse(
 	branches: &[(Expr, Expr)],
 	else_body: &Option<Expr>,
 	ctx: &ExecutionContext,
+	depth: u32,
 ) -> crate::expr::FlowResult<ValueBatch> {
 	for (cond, body) in branches {
 		if ctx.cancellation().is_cancelled() {
 			return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 		}
-		let cond_value = evaluate_expr(cond, ctx).await?;
+		let cond_value = evaluate_expr_at_depth(cond, ctx, depth).await?;
 
 		if cond_value.is_truthy() {
-			let result = evaluate_expr(body, ctx).await?;
+			let result = evaluate_expr_at_depth(body, ctx, depth).await?;
 			return Ok(ValueBatch {
 				values: vec![result],
 			});
@@ -144,7 +158,7 @@ async fn execute_ifelse(
 
 	// No branch matched - check for else body
 	if let Some(else_expr) = else_body {
-		let result = evaluate_expr(else_expr, ctx).await?;
+		let result = evaluate_expr_at_depth(else_expr, ctx, depth).await?;
 		Ok(ValueBatch {
 			values: vec![result],
 		})

@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Strict GQL: a RETURN item that is neither a grouping key nor an aggregate (here `n.age`, while grouping by `n.name`) is rejected."
+
+[test.results]
+parsing-error = """
+RETURN item `n.age` must be a GROUP BY key, an aggregate, or determined by the GROUP BY keys
+  --> [15:33]
+   |
+15 | MATCH (n:person) RETURN n.name, n.age GROUP BY n.name
+   |                                 ^^^^^ add it to GROUP BY or wrap it in an aggregate
+"""
+*/
+
+MATCH (n:person) RETURN n.name, n.age GROUP BY n.name

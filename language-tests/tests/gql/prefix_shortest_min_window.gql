@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Shortest with `min > 1` (`{2,4}`): the in-window shortest can sit above a node's global shortest, so the per-node extension caps are disabled and the search fully enumerates, selecting the minimum *in-window* depth per terminal. Anchored on X, only depths 2..4 count: Y1/Y2/Y3 (depth 1) are out of window; Y4 is reached at depth 2 (one path) and Z at depth 2 (two paths X→Y1→Z, X→Y2→Z) — the depth-3 path to Z is not shortest-in-window and is dropped. Three rows."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ALL SHORTEST (a:wp WHERE a.name = 'X')-[:road]->{2,4}(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

@@ -1,0 +1,26 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL create mutation inserts a record with an explicit id"
+
+[[test.results]]
+value = "{ createPerson: { age: 41, id: 'person:dave', name: 'Dave', tags: ['ops'] } }"
+*/
+mutation {
+	createPerson(data: {
+		id: "dave",
+		name: "Dave",
+		age: 41,
+		active: true,
+		score: 2.5,
+		tags: ["ops"],
+		address: { city: "Oslo", country: "NO" }
+	}) {
+		id
+		name
+		age
+		tags
+	}
+}

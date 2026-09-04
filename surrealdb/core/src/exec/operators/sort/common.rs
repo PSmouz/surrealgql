@@ -1,5 +1,6 @@
 //! Shared types and utilities for sort operators.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -44,7 +45,11 @@ pub struct OrderByField {
 /// - No duplicate expression evaluation
 /// - Cleaner separation of concerns
 /// - Type-safe field path extraction (no execution required)
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` compare the full specification (path, direction, collate,
+/// numeric); the TopK threshold pushdown install guard relies on this to
+/// verify the sort plan matches the probe built at scan-planning time.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortKey {
 	/// Path to extract for sorting
 	pub path: FieldPath,
@@ -102,46 +107,23 @@ pub fn compare_keys(keys_a: &[Value], keys_b: &[Value], order_by: &[OrderByField
 
 /// Compare two pre-extracted key tuples using `SortKey` directions / modes.
 ///
-/// Mirrors [`compare_keys`] for the `SortKey`-keyed sort path. Used by
-/// `ExternalSortByKey`, which serialises pre-extracted keys to disk alongside
-/// each row, then merges them back.
-#[cfg(all(storage, not(target_family = "wasm")))]
-pub fn compare_keys_by_sort_key(
-	keys_a: &[Value],
-	keys_b: &[Value],
+/// Mirrors [`compare_keys`] for the `SortKey`-keyed sort path. All `ByKey`
+/// sort operators extract each row's keys exactly once and compare the
+/// cached tuples with this function: `SortTopKByKey` / `SortByKey` keep them
+/// in memory, `ExternalSortByKey` serialises them to disk alongside each row.
+///
+/// Generic over [`Borrow<Value>`] so callers can compare freshly extracted
+/// `Cow<Value>` keys against cached owned keys without cloning first.
+pub fn compare_keys_by_sort_key<A: Borrow<Value>, B: Borrow<Value>>(
+	keys_a: &[A],
+	keys_b: &[B],
 	sort_keys: &[SortKey],
 ) -> Ordering {
 	for (i, key) in sort_keys.iter().enumerate() {
-		let a = &keys_a[i];
-		let b = &keys_b[i];
+		let a = keys_a[i].borrow();
+		let b = keys_b[i].borrow();
 
 		let ordering = compare_values(a, b, key.collate, key.numeric);
-		let ordering = match key.direction {
-			SortDirection::Asc => ordering,
-			SortDirection::Desc => ordering.reverse(),
-		};
-
-		if ordering != Ordering::Equal {
-			return ordering;
-		}
-	}
-	Ordering::Equal
-}
-
-/// Compare two records using SortKey specifications.
-///
-/// This extracts values from records using FieldPath (which supports
-/// nested field access like `user.address.city`) and compares them.
-pub fn compare_records_by_keys(
-	record_a: &Value,
-	record_b: &Value,
-	sort_keys: &[SortKey],
-) -> Ordering {
-	for key in sort_keys {
-		let a = key.path.extract(record_a);
-		let b = key.path.extract(record_b);
-
-		let ordering = compare_values(&a, &b, key.collate, key.numeric);
 		let ordering = match key.direction {
 			SortDirection::Asc => ordering,
 			SortDirection::Desc => ordering.reverse(),

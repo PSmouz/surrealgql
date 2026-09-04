@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use indxdb::{Database as Db, Transaction as Tx};
 use tokio::sync::RwLock;
 
-use super::api::{BoxFut, KeysResult, ScanLimit, ScanResult};
+use super::api::{BoxFut, KeysResult, ScanResult};
 use super::err::{Error, Result};
-use super::{ESTIMATED_BYTES_PER_KEY, ESTIMATED_BYTES_PER_KV, util};
+use super::util;
 use crate::key::debug::Sprintable;
 use crate::kvs::api::Transactable;
 use crate::kvs::{Key, Val};
@@ -260,7 +260,7 @@ impl Transactable for Transaction {
 	fn keys(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -275,12 +275,8 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let inner = self.inner.read().await;
-			// Extract the limit count, adding skip to fetch enough entries
-			let count = match limit {
-				ScanLimit::Count(c) => c.saturating_add(skip),
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KEY).max(1).saturating_add(skip),
-				ScanLimit::BytesOrCount(_, c) => c.saturating_add(skip),
-			};
+			// Add skip to the row budget so enough entries are fetched
+			let count = limit.saturating_add(skip);
 			// Scan the keys
 			let res = inner.keys(rng, count).await?;
 			// Consume the results
@@ -293,7 +289,7 @@ impl Transactable for Transaction {
 	fn keysr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<KeysResult>> {
@@ -308,12 +304,8 @@ impl Transactable for Transaction {
 			}
 			// Load the inner transaction
 			let inner = self.inner.read().await;
-			// Extract the limit count, adding skip to fetch enough entries
-			let count = match limit {
-				ScanLimit::Count(c) => c.saturating_add(skip),
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KEY).max(1).saturating_add(skip),
-				ScanLimit::BytesOrCount(_, c) => c.saturating_add(skip),
-			};
+			// Add skip to the row budget so enough entries are fetched
+			let count = limit.saturating_add(skip);
 			// Scan the keys
 			let res = inner.keysr(rng, count).await?;
 			// Consume the results
@@ -326,7 +318,7 @@ impl Transactable for Transaction {
 	fn scan(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -356,14 +348,8 @@ impl Transactable for Transaction {
 			} else {
 				rng
 			};
-			// Extract the limit count
-			let count = match limit {
-				ScanLimit::Count(c) => c,
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KV).max(1),
-				ScanLimit::BytesOrCount(_, c) => c,
-			};
 			// Scan the keys
-			let res = inner.scan(rng, count).await?;
+			let res = inner.scan(rng, limit).await?;
 			// Consume the results
 			Ok(consume_vals(&mut res.into_iter(), limit))
 		})
@@ -374,7 +360,7 @@ impl Transactable for Transaction {
 	fn scanr(
 		&self,
 		rng: Range<Key>,
-		limit: ScanLimit,
+		limit: u32,
 		skip: u32,
 		version: Option<u64>,
 	) -> BoxFut<'_, Result<ScanResult>> {
@@ -403,14 +389,8 @@ impl Transactable for Transaction {
 			} else {
 				rng
 			};
-			// Extract the limit count
-			let count = match limit {
-				ScanLimit::Count(c) => c,
-				ScanLimit::Bytes(b) => (b / ESTIMATED_BYTES_PER_KV).max(1),
-				ScanLimit::BytesOrCount(_, c) => c,
-			};
 			// Scan the keys in reverse
-			let res = inner.scanr(rng, count).await?;
+			let res = inner.scanr(rng, limit).await?;
 			// Consume the results
 			Ok(consume_vals(&mut res.into_iter(), limit))
 		})
@@ -439,7 +419,7 @@ impl Transactable for Transaction {
 }
 
 // Consume and iterate over keys
-fn consume_keys<I: Iterator<Item = Key>>(iter: &mut I, limit: ScanLimit, skip: u32) -> KeysResult {
+fn consume_keys<I: Iterator<Item = Key>>(iter: &mut I, limit: u32, skip: u32) -> KeysResult {
 	// Skip entries from the pre-fetched iterator
 	for _ in 0..skip {
 		if iter.next().is_none() {
@@ -447,53 +427,18 @@ fn consume_keys<I: Iterator<Item = Key>>(iter: &mut I, limit: ScanLimit, skip: u
 		}
 	}
 	let mut key_bytes = 0u64;
-	let keys = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(k);
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut keys = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while keys.len() < limit as usize {
+		// Check the key
+		if let Some(k) = iter.next() {
+			key_bytes += k.len() as u64;
+			keys.push(k);
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KEY).min(4096) as usize);
-			// Check that we don't exceed the byte limit
-			while key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(k);
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && key_bytes < b as u64 {
-				// Check the key
-				if let Some(k) = iter.next() {
-					key_bytes += k.len() as u64;
-					res.push(k);
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	KeysResult {
 		keys,
 		key_bytes,
@@ -501,72 +446,23 @@ fn consume_keys<I: Iterator<Item = Key>>(iter: &mut I, limit: ScanLimit, skip: u
 }
 
 // Consume and iterate over keys and values
-fn consume_vals<I: Iterator<Item = (Key, Val)>>(iter: &mut I, limit: ScanLimit) -> ScanResult {
-	// Track the cumulative key/value bytes for the metric. The byte-bounded
-	// limit branches still rely on `bytes_fetched` (key + value bytes) to
-	// decide when to stop, so the two counters are kept separate.
+fn consume_vals<I: Iterator<Item = (Key, Val)>>(iter: &mut I, limit: u32) -> ScanResult {
+	// Track the cumulative key/value bytes for the scan metrics.
 	let mut key_bytes = 0u64;
 	let mut value_bytes = 0u64;
-	let values = match limit {
-		ScanLimit::Count(c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Check that we don't exceed the count limit
-			while res.len() < c as usize {
-				// Check the key and value
-				if let Some((k, v)) = iter.next() {
-					key_bytes += k.len() as u64;
-					value_bytes += v.len() as u64;
-					res.push((k, v));
-				} else {
-					break;
-				}
-			}
-			res
+	// Create the result set
+	let mut values = Vec::with_capacity(limit.min(4096) as usize);
+	// Check that we don't exceed the count limit
+	while values.len() < limit as usize {
+		// Check the key and value
+		if let Some((k, v)) = iter.next() {
+			key_bytes += k.len() as u64;
+			value_bytes += v.len() as u64;
+			values.push((k, v));
+		} else {
+			break;
 		}
-		ScanLimit::Bytes(b) => {
-			// Create the result set
-			let mut res = Vec::with_capacity((b / ESTIMATED_BYTES_PER_KV).min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the byte limit
-			while bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some((k, v)) = iter.next() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-					res.push((k, v));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-		ScanLimit::BytesOrCount(b, c) => {
-			// Create the result set
-			let mut res = Vec::with_capacity(c.min(4096) as usize);
-			// Count the bytes fetched
-			let mut bytes_fetched = 0u64;
-			// Check that we don't exceed the count limit AND the byte limit
-			while res.len() < c as usize && bytes_fetched < b as u64 {
-				// Check the key and value
-				if let Some((k, v)) = iter.next() {
-					let key_len = k.len() as u64;
-					let value_len = v.len() as u64;
-					bytes_fetched += key_len + value_len;
-					key_bytes += key_len;
-					value_bytes += value_len;
-					res.push((k, v));
-				} else {
-					break;
-				}
-			}
-			res
-		}
-	};
+	}
 	ScanResult {
 		values,
 		key_bytes,

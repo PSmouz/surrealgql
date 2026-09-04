@@ -23,6 +23,12 @@ impl IfelseStatement {
 			&& self.close.as_ref().map(|x| x.read_only()).unwrap_or(true)
 	}
 
+	/// Check if any branch directly contains a data-modifying statement.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		self.exprs.iter().any(|x| x.0.has_direct_write() || x.1.has_direct_write())
+			|| self.close.as_ref().map(|x| x.has_direct_write()).unwrap_or(false)
+	}
+
 	/// Process this type returning a computed simple Value
 	#[instrument(level = "trace", name = "IfelseStatement::compute", skip_all)]
 	pub(crate) async fn compute(

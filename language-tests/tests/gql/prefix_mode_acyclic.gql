@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path mode `ACYCLIC`: no repeated node at all (not even closing on the start). On the triangle D→E→F→D anchored at D the close back to D is rejected, so only D→E and D→E→F survive — two rows (E, F), vs three for SIMPLE."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'E' }, { an: 'D', bn: 'F' }]"
+*/
+
+MATCH ACYCLIC (a:hub WHERE a.name = 'D')-[:link]->+(b:hub)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

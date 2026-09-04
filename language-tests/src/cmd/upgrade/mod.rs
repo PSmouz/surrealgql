@@ -172,6 +172,9 @@ pub async fn run(color: ColorMode, matches: &ArgMatches) -> Result<()> {
 	let run_set = RunSetBuilder::new(&case_set, &mut load_errors)
 		.with_filter(|x| x.test.config.parsed.test.run)
 		.with_filter(|x| x.test.config.parsed.test.upgrade)
+		// Upgrade tests send the raw source over the SurrealQL query endpoint,
+		// so only SurrealQL test cases can run here.
+		.with_filter(|x| x.test.dialect == crate::tests::case::Dialect::SurrealQl)
 		.with_filter(|x| x.test.origin.path.contains(&filter))
 		.with_filter(|x| no_wip || !x.test.config.parsed.test.wip)
 		.with_filter(|x| no_results || x.test.config.parsed.test.results.is_some())

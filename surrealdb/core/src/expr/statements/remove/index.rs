@@ -81,8 +81,14 @@ impl RemoveIndexStatement {
 			.await;
 		}
 		retire_durable_index(&txn, ns, db, &table_name, ix.index_id).await?;
-		// Delete the index data.
-		txn.del_tb_index(ns, db, &table_name, &name).await?;
+		// Delete the catalog definition and enqueue the index data for
+		// background reclaim. The catalog entry and id→name lookup are removed
+		// now (so the index immediately stops being used and maintained); the
+		// `/*{ns}*{db}*{tb}+{ix}` data prefix is destroyed asynchronously by
+		// `Datastore::reclaim_tombstones`. The small durable build-state keys
+		// retired above live under the table prefix, so they are cleared here
+		// rather than by the prefix reclaim.
+		txn.del_tb_index_deferred(ns, db, &table_name, &name).await?;
 		// Refresh the table cache for indexes
 		txn.put_tb(
 			ns_name,

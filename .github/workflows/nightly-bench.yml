@@ -10,6 +10,8 @@ on:
   #    - synchronize
   #    - reopened
 
+  workflow_dispatch:
+
   schedule:
     - cron: "0 0 * * *" # Run every night at 12 a clock
 
@@ -17,11 +19,22 @@ defaults:
   run:
     shell: bash
 
+# sccache → S3 backend (drop-in for the former Depot Cache). See ci.yml for rationale.
+env:
+  SCCACHE_BUCKET: ${{ secrets.AWS_S3_SCCACHE_BUCKET_NAME }}
+  SCCACHE_REGION: us-east-1
+  SCCACHE_S3_KEY_PREFIX: ${{ github.repository }}
+  SCCACHE_IDLE_TIMEOUT: "0"
+  # Dedicated bucket-scoped creds, not the release-publishing AMAZON_* keys.
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+
 jobs:
   bench:
     name: Nightly benchmark
-    runs-on: [self-hosted, benchmarking]
+    runs-on: runner-arm-bench
     if: ${{ github.repository == 'surrealdb/surrealdb-private' }} # Don't run outside the private repo
+    timeout-minutes: 240
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -53,7 +66,7 @@ jobs:
   # path don't silently re-introduce the race.
   regression-7318:
     name: DiskANN #7318 regression
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: ubuntu-latest-8-cores
     if: ${{ github.repository == 'surrealdb/surrealdb-private' }}
     steps:
       - name: Checkout sources
@@ -64,7 +77,6 @@ jobs:
         with:
           save-cache: false
           free-disk-space: 'false'
-          depot-runner: 'true'
 
       - name: Run reproduction test
         run: |

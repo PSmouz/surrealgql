@@ -544,11 +544,38 @@ async fn handle_parse_error(
 			}
 		}
 		_ => {
-			warn!("Failed to deserialise message; {error:?}");
+			// The payload could not be decoded far enough to recover the request
+			// id, so we cannot route the error to a single waiting request. Rather
+			// than silently dropping it — which leaves every awaiting query hanging
+			// forever (https://github.com/surrealdb/surrealdb/issues/7037) — fail
+			// all currently-pending requests so callers surface the deserialization
+			// error instead of blocking indefinitely.
+			error!("Failed to deserialise message, failing pending requests; {error:?}");
+			fail_all_pending_requests(sessions, error).await;
 		}
 	}
 
 	HandleResult::Ok
+}
+
+/// Fail every pending request across all sessions with the given error.
+///
+/// Used when an incoming message cannot be parsed well enough to identify which
+/// request it belongs to; failing the requests prevents them from hanging.
+async fn fail_all_pending_requests(
+	sessions: &HashMap<Uuid, Result<Arc<SessionState>, SessionError>>,
+	error: crate::Error,
+) {
+	for (_, session) in sessions.to_vec() {
+		let Ok(session_state) = session else {
+			continue;
+		};
+		for (id, _) in session_state.pending_requests.to_vec() {
+			if let Some(pending) = session_state.pending_requests.take(&id) {
+				pending.response_channel.send(Err(error.clone())).await.ok();
+			}
+		}
+	}
 }
 
 // ============================================================================

@@ -11,11 +11,11 @@ pub fn hours((val,): (Duration,)) -> Result<Value> {
 }
 
 pub fn micros((val,): (Duration,)) -> Result<Value> {
-	Ok(val.micros().into())
+	Ok(Value::try_from(val.micros())?)
 }
 
 pub fn millis((val,): (Duration,)) -> Result<Value> {
-	Ok(val.millis().into())
+	Ok(Value::try_from(val.millis())?)
 }
 
 pub fn mins((val,): (Duration,)) -> Result<Value> {
@@ -23,7 +23,7 @@ pub fn mins((val,): (Duration,)) -> Result<Value> {
 }
 
 pub fn nanos((val,): (Duration,)) -> Result<Value> {
-	Ok(val.nanos().into())
+	Ok(Value::try_from(val.nanos())?)
 }
 
 pub fn secs((val,): (Duration,)) -> Result<Value> {

@@ -344,7 +344,20 @@ fn format_metrics_text(metrics: &OperatorMetrics, redact_volatile_explain_attrs:
 		format!("{}ns", elapsed)
 	};
 
-	format!("rows: {}, batches: {}, elapsed: {}", rows, batches, elapsed_str)
+	// Scan-side counters that depend on how far the scan progressed (volatile
+	// like batches/elapsed), rendered only when non-zero. `scanned` is the
+	// denominator for graph-traversal filter selectivity (matched = rows);
+	// `skipped` is the TopK threshold-pushdown reject count.
+	let mut extra = String::new();
+	let scanned = metrics.edges_scanned();
+	if scanned > 0 {
+		extra.push_str(&format!(", scanned: {}", scanned));
+	}
+	let skipped = metrics.skipped_rows();
+	if skipped > 0 {
+		extra.push_str(&format!(", skipped: {}", skipped));
+	}
+	format!("rows: {}, batches: {}, elapsed: {}{}", rows, batches, elapsed_str, extra)
 }
 
 /// Format an execution plan node as a text tree with metrics.
@@ -440,6 +453,17 @@ fn format_analyze_plan_json(
 		if !redact_volatile_explain_attrs {
 			metrics_obj.insert("output_batches", Value::from(metrics.output_batches() as i64));
 			metrics_obj.insert("elapsed_ns", Value::from(metrics.elapsed_ns() as i64));
+			// Volatile (progress/publish-timing dependent); rendered only when
+			// non-zero. `edges_scanned` is the graph-traversal selectivity
+			// denominator (matched = output_rows).
+			let scanned = metrics.edges_scanned();
+			if scanned > 0 {
+				metrics_obj.insert("edges_scanned", Value::from(scanned as i64));
+			}
+			let skipped = metrics.skipped_rows();
+			if skipped > 0 {
+				metrics_obj.insert("skipped_rows", Value::from(skipped as i64));
+			}
 		}
 		obj.insert("metrics", Value::Object(metrics_obj));
 	}

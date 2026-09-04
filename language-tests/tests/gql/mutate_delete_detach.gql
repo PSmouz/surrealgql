@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "DETACH DELETE removes a matched node (cascading its edges); a mutation-only query (no RETURN) returns an empty result."
+
+[[test.results]]
+value = "[]"
+*/
+
+MATCH (n:person WHERE n.name = 'A') DETACH DELETE n

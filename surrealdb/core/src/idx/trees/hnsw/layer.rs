@@ -14,7 +14,7 @@ use crate::idx::trees::graph::UndirectedGraph;
 use crate::idx::trees::hnsw::filter::HnswTruthyDocumentFilter;
 use crate::idx::trees::hnsw::heuristic::Heuristic;
 use crate::idx::trees::hnsw::index::HnswContext;
-use crate::idx::trees::hnsw::{ElementId, HnswElements, HnswSearch};
+use crate::idx::trees::hnsw::{ElementId, HnswElements, HnswSearch, VectorId};
 use crate::idx::trees::knn::{DoublePriorityQueue, Ids64};
 use crate::idx::trees::vector::SharedVector;
 use crate::key::index::hn::HnswNode;
@@ -253,6 +253,23 @@ where
 				break;
 			}
 			if let Some(neighbourhood) = self.graph.get_edges(doc) {
+				// Warm the transaction record cache for this neighbourhood's
+				// filter-eligible candidates in one batch, so the per-candidate
+				// `get_record` calls inside `add_if_truthy` below become cache
+				// hits instead of each issuing an individual round-trip. The loop
+				// itself is left unchanged, so results are identical.
+				self.prefetch_neighbourhood_records(
+					ctx,
+					elements,
+					search,
+					neighbourhood,
+					&visited,
+					w.len(),
+					f_dist,
+					filter,
+					pending_docs,
+				)
+				.await?;
 				for &e_id in neighbourhood.iter() {
 					// Did we already visit it?
 					if !visited.insert(e_id) {
@@ -283,6 +300,67 @@ where
 			}
 		}
 		Ok(w)
+	}
+
+	/// Prefetches the records of a popped node's filter-eligible neighbours in a
+	/// single batch, warming the transaction cache before the (unchanged)
+	/// evaluation loop in [`Self::search_with_filter`] reads them one by one.
+	///
+	/// Only neighbours that are unvisited and pass the distance gate — using the
+	/// `f_dist` / `w_len` captured at the *start* of this neighbourhood — are
+	/// considered. That start-of-neighbourhood gate is the loosest the loop will
+	/// use: while `w` is below `ef` the `w_len < ef` term holds unconditionally
+	/// (so `f_dist`, which can transiently rise in that phase, is irrelevant), and
+	/// once `w` is full `f_dist` only decreases — so the loop's evolving gate is
+	/// always a subset. The collected set is therefore a superset of what the loop
+	/// fetches, so every record it needs is already cached. Over-collecting never
+	/// affects correctness, but it is not free: a candidate the evolving gate
+	/// later skips still has its record pulled in this batch (the old one-by-one
+	/// path skipped such candidates *before* fetching), so this trades fewer
+	/// round-trips for potentially more total record bytes read — a win only on
+	/// latency-bound backends. Doc-sets are resolved cache-first and pending-only
+	/// elements are skipped, mirroring [`Self::add_if_truthy`].
+	#[expect(clippy::too_many_arguments)]
+	async fn prefetch_neighbourhood_records(
+		&self,
+		ctx: &HnswContext<'_>,
+		elements: &HnswElements,
+		search: &HnswSearch,
+		neighbourhood: &S,
+		visited: &HashSet<ElementId>,
+		w_len: usize,
+		f_dist: f64,
+		filter: &mut HnswTruthyDocumentFilter<'_>,
+		pending_docs: Option<&RoaringTreemap>,
+	) -> Result<()> {
+		let mut ids: Vec<VectorId> = Vec::new();
+		for &e_id in neighbourhood.iter() {
+			if visited.contains(&e_id) {
+				continue;
+			}
+			let Some(e_pt) = elements.get_vector(&ctx.tx, &e_id).await? else {
+				continue;
+			};
+			let e_dist = elements.distance(&e_pt, &search.pt);
+			// Same gate as the evaluation loop, but against the f_dist / w.len()
+			// captured at the start of this neighbourhood — the loosest form (see
+			// the method doc), so the collected set is a superset of the loop's.
+			if !(e_dist < f_dist || w_len < search.ef) {
+				continue;
+			}
+			let Some(docs) = ctx.vec_docs.get_docs_by_element(&ctx.tx, e_id, &e_pt).await? else {
+				continue;
+			};
+			if let Some(pending_docs) = pending_docs
+				&& Self::check_all_docs_in_pending(&docs, pending_docs)
+			{
+				continue;
+			}
+			for doc_id in docs.iter() {
+				ids.push(VectorId::DocId(doc_id));
+			}
+		}
+		filter.prefetch_records(ctx, &ids).await
 	}
 
 	#[expect(clippy::too_many_arguments)]
@@ -541,9 +619,7 @@ where
 		let mut count = 0;
 		let mut cursor = tx.open_vals_cursor(range, ScanDirection::Forward, 0, None).await?;
 		loop {
-			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
-				.await?;
+			let batch = cursor.next_batch(crate::kvs::NORMAL_BATCH_SIZE).await?;
 			if batch.is_empty() {
 				break;
 			}

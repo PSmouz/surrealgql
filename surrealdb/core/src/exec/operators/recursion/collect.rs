@@ -28,16 +28,19 @@
 //!
 //! # How the loop runs (step-by-step)
 //!
-//! Internal state: `collected` (output list), `seen` (hashes of nodes already visited),
+//! Internal state: `collected` (output list), `seen` (hashes of nodes already collected),
+//! `expanded` (hashes of nodes already expanded at depth >= min_depth),
 //! `frontier` (nodes to expand at current depth), `depth` (current level).
 //!
 //! 1. **Initial:** `frontier = [planet:earth]`, `collected = []`, `seen = {}`, `depth = 0`. If
 //!    `inclusive`: push start into `collected` and `seen`.
 //!
 //! 2. **Iteration 1 (depth 0):** For each value in `frontier` (planet:earth), evaluate path → e.g.
-//!    `[country:us, country:canada]`. For each `v`: if `v` not in `seen`, insert hash into `seen`;
-//!    if `depth + 1 >= min_depth` (1 >= 1), push `v` into `collected`; push `v` into
-//!    `next_frontier`. Then `frontier = next_frontier` = [country:us, country:canada], `depth = 1`.
+//!    `[country:us, country:canada]`. For each `v` (discovered at `depth + 1 = 1 >= min_depth`): if
+//!    `v` not in `seen`, insert hash into `seen` and push `v` into `collected`; if `v` not in
+//!    `expanded`, insert hash and push `v` into `next_frontier`. Then `frontier = next_frontier` =
+//!    [country:us, country:canada], `depth = 1`. (At depths below `min_depth`, discovered nodes are
+//!    instead deduplicated per level only and pushed to `next_frontier` without collection.)
 //!
 //! 3. **Iteration 2 (depth 1):** Expand country:us → states; country:canada → provinces. Each new
 //!    node (state:california, state:texas, province:ontario, province:bc) is added to `seen`, to
@@ -65,8 +68,17 @@ use crate::val::Value;
 
 /// Collect recursion: gather all unique nodes encountered during BFS traversal.
 ///
-/// Uses breadth-first search to collect all reachable nodes, respecting
-/// depth bounds and avoiding cycles via hash-based deduplication.
+/// Collects every distinct node reachable by a walk whose length falls in
+/// `[min_depth, max_depth]`, matching the legacy compute engine. Walks may
+/// revisit nodes, so cycle pruning must not lose nodes whose only in-range
+/// walk passes through an already-visited node:
+///
+/// - Below `min_depth`, the frontier is deduplicated per level only. A node visited here is not
+///   collected, so it must remain collectable (and expandable) when re-reached at a depth within
+///   range via a cycle.
+/// - At or beyond `min_depth`, a node is collected once and expanded once (`expanded`): any walk
+///   through a later occurrence reaches the same nodes at shallower, still-in-range depths via the
+///   first occurrence. This also bounds unbounded recursion on cyclic graphs.
 ///
 /// Fully iterative -- frontier-based BFS loop.
 pub(crate) async fn evaluate_recurse_collect(
@@ -78,7 +90,13 @@ pub(crate) async fn evaluate_recurse_collect(
 	ctx: EvalContext<'_>,
 ) -> FlowResult<Value> {
 	let mut collected = Vec::new();
+	// Nodes already collected (output dedup). The inclusive start is seeded
+	// here so it is not collected again if re-reached through a cycle.
 	let mut seen: HashSet<u64> = HashSet::new();
+	// Nodes already expanded at a depth >= min_depth. Deliberately separate
+	// from `seen`: the inclusive start sits in `seen` from depth 0 but must
+	// still be expanded when re-reached at a depth within range.
+	let mut expanded: HashSet<u64> = HashSet::new();
 	let mut frontier = vec![start.clone()];
 
 	if inclusive {
@@ -90,6 +108,10 @@ pub(crate) async fn evaluate_recurse_collect(
 
 	while depth < max_depth && !frontier.is_empty() {
 		let mut next_frontier = Vec::new();
+		// Nodes discovered in this iteration sit at depth + 1.
+		let collecting = depth + 1 >= min_depth;
+		// Per-level frontier dedup for the below-min phase.
+		let mut level_seen: HashSet<u64> = HashSet::new();
 
 		// Phase 1: Evaluate all frontier values concurrently (bounded).
 		let futures: Vec<_> = frontier
@@ -124,13 +146,19 @@ pub(crate) async fn evaluate_recurse_collect(
 				}
 
 				let hash = value_hash(&v);
-				if seen.insert(hash) {
-					// Only collect nodes discovered at or beyond min_depth.
-					// Nodes below the threshold are traversed but not emitted.
-					if depth + 1 >= min_depth {
+				if collecting {
+					if seen.insert(hash) {
 						collected.push(v.clone());
 					}
-					next_frontier.push(v);
+					if expanded.insert(hash) {
+						next_frontier.push(v);
+					}
+				} else {
+					// Below min_depth: dedupe within this level only, so the
+					// node stays collectable when re-reached within range.
+					if level_seen.insert(hash) {
+						next_frontier.push(v);
+					}
 				}
 			}
 		}

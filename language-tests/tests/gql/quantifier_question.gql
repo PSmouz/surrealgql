@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: the `?` quantifier is `{0,1}` — zero-or-one hop. In v1 `?` was a lowering rejection ('The `?` quantifier is not supported yet'); v2 supports it. min == 0 emits the zero-length path (target == source) plus the single depth-1 hop. On the triangle each source yields itself and its one out-neighbour: D->D, D->E; E->E, E->F; F->F, F->D. 6 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'D', bn: 'E' }, { an: 'E', bn: 'E' }, { an: 'E', bn: 'F' }, { an: 'F', bn: 'D' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->?(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

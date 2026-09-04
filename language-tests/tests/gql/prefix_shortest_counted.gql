@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `SHORTEST k` (counted): the k shortest paths per endpoint pair, in non-decreasing length order. Anchored X→Z there are three paths (lengths 2, 2, 3); `SHORTEST 3` keeps all three — three identical projected rows."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH SHORTEST 3 (a:wp WHERE a.name = 'X')-[:road]->+(b:wp WHERE b.name = 'Z')
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

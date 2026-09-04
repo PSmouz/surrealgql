@@ -720,6 +720,11 @@ impl RpcProtocol for Websocket {
 		&self.datastore
 	}
 
+	/// The datastore for this RPC interface as a shared handle.
+	fn kvs_arc(&self) -> Arc<Datastore> {
+		Arc::clone(&self.datastore)
+	}
+
 	/// The version information for this RPC context
 	fn version_data(&self) -> DbResult {
 		let value = Value::String(format!("{PKG_NAME}-{}", *PKG_VERSION));
@@ -883,13 +888,15 @@ impl RpcProtocol for Websocket {
 		if self.cancel.is_cancelled() {
 			drop(live_queries);
 			if let Err(err) = self.kvs().delete_queries(vec![*lqid]).await {
-				// TODO(metrics): emit an orphan-LQ counter here. We've
-				// already lost the in-memory registration and now we've
-				// failed to clean up the datastore-side row too, so
-				// notifications for `lqid` will be produced and
-				// silently discarded by the broker for the lifetime of
-				// the datastore. A counter would let operators alert on
-				// this without grepping logs.
+				// We've already lost the in-memory registration and now
+				// we've failed to clean up the datastore-side row too, so
+				// notifications for `lqid` will be produced and silently
+				// discarded by the broker for the lifetime of the
+				// datastore. Emit an orphan-LQ counter so operators can
+				// alert on this without grepping logs.
+				if let Some(obs) = self.state.metrics_observer.as_ref() {
+					obs.record_live_query_orphaned(namespace.as_deref(), database.as_deref());
+				}
 				error!(
 					"Error cleaning up orphaned live query {lqid} after WebSocket cancel: {err}"
 				);

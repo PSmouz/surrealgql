@@ -1,0 +1,21 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL list queries support limit and start pagination arguments"
+
+[[test.results]]
+value = "{ firstTwo: [{ name: 'Alice' }, { name: 'Bob' }], middle: [{ name: 'Bob' }], skipFirst: [{ name: 'Bob' }, { name: 'Carol' }] }"
+*/
+query {
+	firstTwo: persons(limit: 2) {
+		name
+	}
+	skipFirst: persons(start: 1) {
+		name
+	}
+	middle: persons(limit: 1, start: 1) {
+		name
+	}
+}

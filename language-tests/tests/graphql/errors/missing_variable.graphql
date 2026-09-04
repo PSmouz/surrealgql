@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "A non-null variable that is not provided fails the request"
+
+[[test.results]]
+error = "Variable personId is not defined."
+*/
+query Fetch($personId: String!) {
+	person(id: $personId) {
+		name
+	}
+}

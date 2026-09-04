@@ -1,0 +1,17 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL list query returns every record of a table in record-key order"
+
+[[test.results]]
+value = "{ persons: [{ age: 30, id: 'person:alice', name: 'Alice' }, { age: 25, id: 'person:bob', name: 'Bob' }, { age: 35, id: 'person:carol', name: 'Carol' }] }"
+*/
+query {
+	persons {
+		id
+		name
+		age
+	}
+}

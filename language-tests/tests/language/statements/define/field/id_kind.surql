@@ -47,13 +47,13 @@ value = "NONE"
 value = "NONE"
 
 [[test.results]]
-value = "NONE"
+error = "Cannot use the `set` type on the `id` field, as that's not a valid record id key."
 
 [[test.results]]
-value = "NONE"
+error = "Cannot use the `set<int>` type on the `id` field, as that's not a valid record id key."
 
 [[test.results]]
-value = "NONE"
+error = "Cannot use the `set<datetime>` type on the `id` field, as that's not a valid record id key."
 
 [[test.results]]
 error = "Cannot use the `range` type on the `id` field, as that's not a valid record id key."
@@ -101,9 +101,6 @@ DEFINE FIELD OVERWRITE id ON a TYPE uuid;
 DEFINE FIELD OVERWRITE id ON a TYPE array;
 DEFINE FIELD OVERWRITE id ON a TYPE array<int>;
 DEFINE FIELD OVERWRITE id ON a TYPE array<datetime>;
-DEFINE FIELD OVERWRITE id ON a TYPE set;
-DEFINE FIELD OVERWRITE id ON a TYPE set<int>;
-DEFINE FIELD OVERWRITE id ON a TYPE set<datetime>;
 DEFINE FIELD OVERWRITE id ON a TYPE object;
 
 DEFINE FIELD OVERWRITE id ON a TYPE 123;
@@ -114,6 +111,9 @@ DEFINE FIELD OVERWRITE id ON a TYPE { uuid: 'string', datetime: datetime };
 DEFINE FIELD OVERWRITE id ON a TYPE string | int;
 
 // Invalid
+DEFINE FIELD OVERWRITE id ON a TYPE set;
+DEFINE FIELD OVERWRITE id ON a TYPE set<int>;
+DEFINE FIELD OVERWRITE id ON a TYPE set<datetime>;
 DEFINE FIELD OVERWRITE id ON a TYPE range;
 DEFINE FIELD OVERWRITE id ON a TYPE function;
 DEFINE FIELD OVERWRITE id ON a TYPE file;

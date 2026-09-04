@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -71,9 +72,26 @@ pub struct StartCommandArguments {
 	#[arg(env = "SURREAL_INDEX_COMPACTION_INTERVAL", long = "index-compaction-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "5s")]
 	index_compaction_interval: Duration,
+	#[arg(
+		help = "The interval at which to resume index builds left unfinished by a crashed node (0 to disable)",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_INDEX_BUILD_RESUME_INTERVAL", long = "index-build-resume-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "30s")]
+	index_build_resume_interval: Duration,
 	#[arg(env = "SURREAL_ASYNC_EVENT_PROCESSING_INTERVAL", long = "async-event-interval", value_parser = super::validator::duration)]
 	#[arg(default_value = "5s")]
 	event_processing_interval: Duration,
+	#[arg(env = "SURREAL_RECLAIM_INTERVAL", long = "reclaim-interval", value_parser = super::validator::duration)]
+	#[arg(default_value = "60s")]
+	reclaim_interval: Duration,
+	#[arg(
+		help = "Minimum age a removed namespace/database/index must reach before its data is physically reclaimed (snapshot-safety grace; effective value is max(this, --tikv-gc-lifetime))",
+		help_heading = "Database"
+	)]
+	#[arg(env = "SURREAL_RECLAIM_GRACE", long = "reclaim-grace", value_parser = super::validator::duration)]
+	#[arg(default_value = "10m")]
+	reclaim_grace: Duration,
 	#[arg(
 		help = "The interval at which the TiKV MVCC garbage collector runs",
 		help_heading = "Database"
@@ -212,7 +230,10 @@ pub async fn init<
 		node_membership_cleanup_interval,
 		changefeed_gc_interval,
 		index_compaction_interval,
+		index_build_resume_interval,
 		event_processing_interval,
+		reclaim_interval,
+		reclaim_grace,
 		tikv_gc_interval,
 		tikv_gc_lifetime,
 		tikv_lock_cleanup_interval,
@@ -223,10 +244,6 @@ pub async fn init<
 	}: StartCommandArguments,
 	runtime: ObservabilityRuntime,
 ) -> Result<()> {
-	// Install the rustls process-default crypto provider before any TLS
-	// operations occur. Under `feature = "fips"` this asserts FIPS mode is
-	// active and aborts startup otherwise.
-	crate::tls::install_default_crypto_provider()?;
 	// Check the path is valid
 	C::path_valid(&path)?;
 	// Check if we should output a banner
@@ -253,7 +270,10 @@ pub async fn init<
 		.with_node_membership_cleanup_interval(node_membership_cleanup_interval)
 		.with_changefeed_gc_interval(changefeed_gc_interval)
 		.with_index_compaction_interval(index_compaction_interval)
+		.with_index_build_resume_interval(index_build_resume_interval)
 		.with_event_processing_interval(event_processing_interval)
+		.with_reclaim_interval(reclaim_interval)
+		.with_reclaim_grace(reclaim_grace)
 		.with_tikv_gc_interval(tikv_gc_interval)
 		.with_tikv_gc_lifetime(tikv_gc_lifetime)
 		.with_tikv_lock_cleanup_interval(tikv_lock_cleanup_interval);
@@ -296,10 +316,46 @@ pub async fn init<
 	if *METRICS_ENABLED || otlp_metrics_active() {
 		spawn_process_snapshot_refresh(canceller.clone());
 	}
-	// Start the datastore
-	let (datastore, recv, router_state) =
+	// Start the datastore. The startup import and credential initialisation are
+	// returned rather than run here, so the web server can bind before they run.
+	let (datastore, recv, router_state, pending_startup) =
 		dbs::init::<C>(composer, &config, canceller.clone(), combined_observer, dbs).await?;
 	let datastore = Arc::new(datastore);
+	// Tracks whether the instance has finished starting up (import + credentials)
+	// and is ready to serve user-facing queries. The HTTP listener binds
+	// immediately; until this flips to `true`, query/auth endpoints return 503
+	// and `/ready` reports not-ready.
+	let ready = Arc::new(AtomicBool::new(false));
+	if pending_startup.has_work() {
+		// Run the deferred startup work (import, then credentials) concurrently
+		// so the listener comes up right away, flipping `ready` once it succeeds.
+		let ds = Arc::clone(&datastore);
+		let ready = Arc::clone(&ready);
+		let startup_canceller = canceller.clone();
+		tokio::spawn(async move {
+			tokio::select! {
+				biased;
+				// Stop promptly if the server is shutting down; leave `ready`
+				// unset so we never flip to ready mid-shutdown.
+				_ = startup_canceller.cancelled() => {
+					debug!("Startup aborted before completion due to shutdown");
+				}
+				res = dbs::finish_startup(&ds, &pending_startup) => match res {
+					Ok(()) => {
+						ready.store(true, Ordering::SeqCst);
+						info!("Startup complete; instance is now ready to serve");
+					}
+					Err(err) => {
+						error!("Startup failed; instance will not become ready: {err}");
+					}
+				}
+			}
+		});
+	} else {
+		// Nothing deferred (no import, credentials already initialised): ready to
+		// serve as soon as the listener binds.
+		ready.store(true, Ordering::SeqCst);
+	}
 	// Eagerly load surrealism modules in the background unless opted out
 	#[cfg(feature = "surrealism")]
 	if !datastore.is_lazy_surrealism() {
@@ -319,6 +375,23 @@ pub async fn init<
 	}
 	// Start the node agent
 	let nodetasks = tasks::init(Arc::clone(&datastore), canceller.clone(), &config.engine);
+	// The `/ready` probe treats the node as unhealthy if its cluster heartbeat
+	// hasn't refreshed within a few cycles of the node-membership refresh task
+	// (which also confirms the storage read and write paths are working).
+	const READINESS_HEARTBEAT_STALENESS_FACTOR: u32 = 3;
+	// `checked_mul` guards against overflow from an extreme configured interval;
+	// `Duration::MAX` degrades to "heartbeat never considered stale".
+	let max_heartbeat_age = config
+		.engine
+		.node_membership_refresh_interval
+		.checked_mul(READINESS_HEARTBEAT_STALENESS_FACTOR)
+		.unwrap_or(Duration::MAX);
+	let readiness = ntw::Readiness {
+		ready: Arc::clone(&ready),
+		// The heartbeat freshness check applies on the server path, where the
+		// node-membership refresh task keeps the heartbeat current.
+		max_heartbeat_age: Some(max_heartbeat_age),
+	};
 	// Build and run the HTTP server using the provided RouterFactory implementation
 	ntw::init_with_metrics::<C>(
 		&config,
@@ -327,6 +400,7 @@ pub async fn init<
 		canceller.clone(),
 		router_state,
 		metrics_state,
+		readiness,
 	)
 	.await?;
 	// Shutdown and stop closed tasks

@@ -3,8 +3,10 @@ mod auth;
 pub mod client_ip;
 pub mod error;
 pub mod export;
-#[cfg(feature = "graphql")]
+#[cfg(feature = "gql")]
 pub mod gql;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 pub(crate) mod headers;
 pub mod health;
 pub mod import;
@@ -15,6 +17,7 @@ pub mod mcp;
 pub mod ml;
 pub(crate) mod output;
 mod params;
+mod ready;
 pub mod rpc;
 mod signals;
 pub mod signin;
@@ -27,6 +30,7 @@ pub mod version;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,7 +38,8 @@ use axum::response::Redirect;
 use axum::routing::get;
 use axum::{Extension, Router, middleware};
 use axum_server::Handle;
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use http::header;
 use surrealdb::headers::{AUTH_DB, AUTH_NS, DB, ID, NS};
 use surrealdb_core::CommunityComposer;
@@ -55,6 +60,10 @@ use tower_http::sensitive_headers::{
 };
 use tower_http::trace::TraceLayer;
 
+/// Re-exported so an edition overriding `/ready` can reuse the community
+/// readiness decision; pair it with [`community_router`] to omit the built-in
+/// `/ready` route.
+pub use self::ready::community_readiness;
 use crate::cli::Config;
 use crate::cnf;
 use crate::ntw::signals::graceful_shutdown;
@@ -126,31 +135,57 @@ pub trait RouterFactory: TransactionBuilderFactory {
 /// composer to customize routes.
 impl RouterFactory for CommunityComposer {
 	fn configure_router(_router_state: Self::RouterState) -> Router<Arc<RpcState>> {
-		let router = Router::<Arc<RpcState>>::new()
-			// Redirect until we provide a UI
-			.route("/", get(|| async { Redirect::temporary(cnf::APP_ENDPOINT) }))
-			.route("/status", get(|| async {}))
-			.merge(health::router())
-			.merge(export::router())
-			.merge(import::router())
-			.merge(rpc::router())
-			.merge(version::router())
-			.merge(sync::router())
-			.merge(sql::router())
-			.merge(signin::router())
-			.merge(signup::router())
-			.merge(key::router())
-			.merge(ml::router())
-			.merge(api::router());
-
-		#[cfg(feature = "graphql")]
-		let router = router.merge(gql::router());
-
-		#[cfg(feature = "mcp")]
-		let router = router.merge(mcp::router());
-
-		router
+		community_router(&[])
 	}
+}
+
+/// Build the community HTTP router, omitting any path in `exclude` so an edition
+/// can register its own handler for that path without an axum merge collision
+/// (axum panics on a duplicate `(path, method)`). Pass `&[]` for the standard
+/// community router — [`CommunityComposer::configure_router`] does exactly that.
+///
+/// `/ready` is the route intended to be overridable this way: an edition that
+/// layers an extra serve-readiness condition builds `community_router(&["/ready"])`,
+/// then merges its own `/ready` that calls [`community_readiness`] and ANDs in
+/// its condition.
+pub fn community_router(exclude: &[&str]) -> Router<Arc<RpcState>> {
+	let mut router = Router::<Arc<RpcState>>::new()
+		// Redirect until we provide a UI
+		.route("/", get(|| async { Redirect::temporary(cnf::APP_ENDPOINT) }))
+		.route("/status", get(|| async {}))
+		.merge(health::router());
+	if !exclude.contains(&"/ready") {
+		router = router.merge(ready::router());
+	}
+	router = router
+		.merge(export::router())
+		.merge(import::router())
+		.merge(rpc::router())
+		.merge(version::router())
+		.merge(sync::router())
+		.merge(sql::router())
+		.merge(signin::router())
+		.merge(signup::router())
+		.merge(key::router())
+		.merge(ml::router())
+		.merge(api::router());
+
+	#[cfg(feature = "graphql")]
+	{
+		router = router.merge(graphql::router());
+	}
+
+	#[cfg(feature = "gql")]
+	{
+		router = router.merge(gql::router());
+	}
+
+	#[cfg(feature = "mcp")]
+	{
+		router = router.merge(mcp::router());
+	}
+
+	router
 }
 
 ///
@@ -164,6 +199,25 @@ pub struct AppState {
 	/// metrics reader is attached, in which case the recording sites
 	/// short-circuit.
 	pub metrics_observer: Option<Arc<crate::observe::metrics::MetricsObserver>>,
+	/// Readiness signals (the startup-complete flag and heartbeat staleness
+	/// limit) read by the `/ready` handler.
+	pub readiness: Readiness,
+}
+
+/// Readiness signals shared with the HTTP layer to gate traffic during startup.
+#[derive(Clone)]
+pub struct Readiness {
+	/// Whether the instance has finished starting up and is ready to serve
+	/// user-facing queries. Flipped to `true` once the deferred startup work
+	/// (import + credentials) has completed; read by the readiness gate and the
+	/// `/ready` handler.
+	pub ready: Arc<AtomicBool>,
+	/// Maximum age of the current node's cluster heartbeat for `/ready` to
+	/// consider the node healthy, derived from the node-membership refresh
+	/// interval (see `start::init`). `None` disables the heartbeat check — used
+	/// by embedder entrypoints that do not run the membership refresh task, so
+	/// `/ready` reflects only the `ready` flag.
+	pub max_heartbeat_age: Option<Duration>,
 }
 
 /// Configuration options for building a [`SurrealRouter`].
@@ -300,7 +354,16 @@ impl SurrealRouter {
 		ct: CancellationToken,
 		router_state: F::RouterState,
 	) -> Result<Self> {
-		Self::build_with_metrics::<F>(opt, ds, notifications, ct, router_state, None).await
+		// Embedders that build the router directly are responsible for their own
+		// startup sequencing, so the readiness gate is open from the start. The
+		// heartbeat check is disabled (`None`): this path does not start the
+		// node-membership refresh task, so the heartbeat would never refresh.
+		let readiness = Readiness {
+			ready: Arc::new(AtomicBool::new(true)),
+			max_heartbeat_age: None,
+		};
+		Self::build_with_metrics::<F>(opt, ds, notifications, ct, router_state, None, readiness)
+			.await
 	}
 
 	/// Build a fully-configured [`SurrealRouter`], optionally mounting the
@@ -319,12 +382,17 @@ impl SurrealRouter {
 		ct: CancellationToken,
 		router_state: F::RouterState,
 		metrics: Option<MetricsState>,
+		readiness: Readiness,
 	) -> Result<Self> {
 		let opt = opt.into();
+		// Clone the readiness flag for the gate layer before moving `readiness`
+		// into the shared app state.
+		let gate_ready = Arc::clone(&readiness.ready);
 		let app_state = AppState {
 			client_ip: opt.client_ip,
 			datastore: Arc::clone(&ds),
 			metrics_observer: metrics.as_ref().map(|m| Arc::clone(&m.observer)),
+			readiness,
 		};
 
 		// Specify headers to be obfuscated from all requests/responses
@@ -426,6 +494,10 @@ impl SurrealRouter {
 			)
 			.layer(HttpMetricsLayer::new(events_observer))
 			.layer(SetSensitiveResponseHeadersLayer::from_shared(headers))
+			// Gate user-facing endpoints with 503 until startup completes. Sits
+			// ahead of auth so gated requests short-circuit before authentication
+			// touches the (still-initialising) datastore.
+			.layer(middleware::from_fn_with_state(gate_ready, ready::readiness_gate))
 			.layer(auth::SurrealAuthLayer)
 			.layer(headers::add_server_header(!opt.no_identification_headers)?)
 			.layer(headers::add_version_header(!opt.no_identification_headers)?)
@@ -578,7 +650,13 @@ pub async fn init<F: RouterFactory>(
 	ct: CancellationToken,
 	router_state: F::RouterState,
 ) -> Result<()> {
-	init_with_metrics::<F>(opt, ds, recv, ct, router_state, None).await
+	// No separate startup phase via this entrypoint: serve immediately, with the
+	// heartbeat check disabled (no membership refresh task runs here).
+	let readiness = Readiness {
+		ready: Arc::new(AtomicBool::new(true)),
+		max_heartbeat_age: None,
+	};
+	init_with_metrics::<F>(opt, ds, recv, ct, router_state, None, readiness).await
 }
 
 /// Initialize and run the SurrealDB HTTP server with optional Prometheus
@@ -596,10 +674,12 @@ pub async fn init_with_metrics<F: RouterFactory>(
 	ct: CancellationToken,
 	router_state: F::RouterState,
 	metrics: Option<MetricsState>,
+	readiness: Readiness,
 ) -> Result<()> {
 	// Build the fully-configured router
 	let surreal =
-		SurrealRouter::build_with_metrics::<F>(opt, ds, recv, ct, router_state, metrics).await?;
+		SurrealRouter::build_with_metrics::<F>(opt, ds, recv, ct, router_state, metrics, readiness)
+			.await?;
 
 	// Get a new server handler
 	let handle = Handle::new();
@@ -621,8 +701,10 @@ pub async fn init_with_metrics<F: RouterFactory>(
 	let res = if let (Some(cert), Some(key)) = (&opt.crt, &opt.key) {
 		// Configure certificate and private key used by https
 		let tls = RustlsConfig::from_pem_file(cert, key).await?;
+		// Disable Nagle's algorithm on the raw TCP stream before the TLS handshake
+		let acceptor = RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new());
 		// Setup the Axum server with TLS
-		let server = axum_server::bind_rustls(opt.bind, tls);
+		let server = axum_server::bind(opt.bind).acceptor(acceptor);
 		// Log the server startup to the CLI
 		info!(target: LOG, "Started web server on {}", &opt.bind);
 		// Start the server and listen for connections
@@ -631,8 +713,8 @@ pub async fn init_with_metrics<F: RouterFactory>(
 			.serve(axum_app.into_make_service_with_connect_info::<SocketAddr>())
 			.await
 	} else {
-		// Setup the Axum server
-		let server = axum_server::bind(opt.bind);
+		// Setup the Axum server, disabling Nagle's algorithm on accepted connections
+		let server = axum_server::bind(opt.bind).acceptor(NoDelayAcceptor::new());
 		// Log the server startup to the CLI
 		info!(target: LOG, "Started web server on {}", &opt.bind);
 		// Start the server and listen for connections

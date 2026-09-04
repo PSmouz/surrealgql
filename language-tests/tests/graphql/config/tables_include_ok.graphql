@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["./_tables_include.surql"]
+
+[test]
+reason = "Tables listed in TABLES INCLUDE stay queryable"
+
+[[test.results]]
+value = "{ persons: [{ name: 'Alice' }, { name: 'Carol' }] }"
+*/
+query {
+	persons(filter: {age: {gte: 30}}) {
+		name
+	}
+}

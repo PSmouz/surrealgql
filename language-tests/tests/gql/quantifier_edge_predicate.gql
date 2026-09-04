@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6 / §8: a predicate written inside a quantified edge that references only an already-bound node (not the quantified edge group) is legal — the planner places it as a Filter, not a per-edge condition. In v1 any WHERE/property map on a variable-length edge was rejected ('Variable-length edge patterns cannot have a WHERE clause or property map'); v2 accepts predicates that do not touch the group var (a group-var predicate combined with another binding is the new cross-var rejection, pinned by errors/quant_pred_cross_var.gql). Here `WHERE a.age >= 50` filters the anchor to hubs E(50) and F(60); on `{1,2}`: E reaches F(d1) and D(d2); F reaches D(d1) and E(d2). 4 rows."
+
+[[test.results]]
+value = "[{ an: 'E', bn: 'D' }, { an: 'E', bn: 'F' }, { an: 'F', bn: 'D' }, { an: 'F', bn: 'E' }]"
+*/
+
+MATCH (a:hub)-[g:link WHERE a.age >= 50]->{1,2}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

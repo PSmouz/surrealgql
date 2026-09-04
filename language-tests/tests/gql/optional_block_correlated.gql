@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "REGRESSION (correlated OPTIONAL, MULTI-CLAUSE block): a two-clause OPTIONAL block binding x,y,z whose WHERE (on the block's second clause) correlates the block's `x` with the outer mandatory `a`. The correlated predicate is deferred out of EACH block clause's plan (the rest-loop deferred path, not just the seed), collected by plan_optional_block, and applied as the HashJoin{Left} residual so the whole all-or-nothing block null-fills (x,z) when no chain satisfies it. Block 2-hop person->person->person chains x->y->z over edges A->B,B->A,B->C,C->A: (A,B,A),(A,B,C),(B,A,B),(B,C,A),(C,A,B). Residual x.age > a.age (A=30,B=20,C=none): a=A need x.age>30 -> none -> null-fill; a=B need x.age>20 -> x=A(30) -> chains (A,B,A),(A,B,C); a=C 3VL-false -> null-fill. Every mandatory `a` preserved."
+
+[[test.results]]
+value = "[{ name: 'A', x: NONE, z: NONE }, { name: 'B', x: 'A', z: 'A' }, { name: 'B', x: 'A', z: 'C' }, { name: 'C', x: NONE, z: NONE }]"
+
+*/
+
+MATCH (a:person) OPTIONAL { MATCH (x:person)-[:knows]->(y:person) MATCH (y)-[:knows]->(z:person) WHERE x.age > a.age } RETURN a.name AS name, x.name AS x, z.name AS z ORDER BY name, x, z

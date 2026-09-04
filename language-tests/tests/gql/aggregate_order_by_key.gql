@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A non-DISTINCT aggregating query may ORDER BY a grouping key it does not project (a.name); the planner materialises a hidden sort-only column and drops it before returning, so only `c` is output, ordered A,B,C."
+
+[[test.results]]
+value = "[{ c: 1 }, { c: 2 }, { c: 1 }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN count(*) AS c GROUP BY a.name ORDER BY a.name

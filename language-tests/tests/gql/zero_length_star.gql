@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6: `*` includes the zero-length path (min == 0). Returning the edge group makes the zero-length row unmistakable: each source emits a depth-0 self-row with an EMPTY group [] (target == source), and SEPARATELY a depth-3 self-row carrying the full three-edge loop. That D->D appears twice — once with grp [] and once with grp [l45,l56,l64] — is the canonical witness of one-row-per-path (R6), not distinct-reachable. Hand-derived per source: depth0 self ([]), depth1 next hub, depth2 second hub, depth3 self (full loop). 4 rows x 3 sources = 12 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D', grp: [] }, { an: 'D', bn: 'D', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'D', bn: 'E', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'D', bn: 'F', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'E', bn: 'D', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'E', bn: 'E', grp: [] }, { an: 'E', bn: 'E', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'E', bn: 'F', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'F', bn: 'D', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'F', bn: 'E', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'F', bn: 'F', grp: [] }, { an: 'F', bn: 'F', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }]"
+*/
+
+MATCH (a:hub)-[g:link]->*(b:hub) RETURN a.name AS an, b.name AS bn, g AS grp ORDER BY an, bn

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "RETURN * with an optional binding (R3 + R8). `RETURN *` expands to all user-named bindings alphabetically — `a` (mandatory node), `b` (optional node), `k` (optional edge). On an optional miss the WHOLE introduced set binds Value::Null, so the `b` and `k` columns are present and equal to NULL (NOT absent, NOT NONE-as-missing — the optional-miss-is-Null rule, visible because RETURN * surfaces the raw binding values). Hand-derived (only person:1/A has a knows->city edge, k1c -> city:1): A's row carries the full `a`, `b`=city:1 and `k`=knows:k1c records; person:2/B and person:3/C miss, so their `b` and `k` columns are NULL while the full `a` record is preserved. (Node/edge bindings hold FULL record objects, V2_DESIGN binding-row contract.)"
+
+[[test.results]]
+value = "[{ a: { active: true, age: 30, city: 'London', id: person:1, name: 'A' }, b: { id: city:1, name: 'London' }, k: { id: knows:k1c, in: person:1, out: city:1, since: 2019 } }, { a: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' }, b: NULL, k: NULL }, { a: { city: 'London', id: person:3, name: 'C' }, b: NULL, k: NULL }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b:city) RETURN * ORDER BY a.name

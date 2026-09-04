@@ -133,7 +133,11 @@ impl Parser<'_> {
 			}
 
 			let (key, value) = self.parse_object_entry(stk).await?;
-			// TODO: Error on duplicate key?
+			// Duplicate keys are accepted at parse time and resolved last-wins
+			// when the literal is computed (`Literal::Object` inserts into a
+			// `BTreeMap`, see `expr/literal.rs`). This matches JSON / JavaScript
+			// object literal semantics — note that DEFINE FIELD does still
+			// reject duplicate field names at the schema layer.
 			res.push(ObjectEntry {
 				key: key.into(),
 				value,

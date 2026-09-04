@@ -1034,22 +1034,10 @@ impl From<Null> for Value {
 	}
 }
 
-// TODO: Remove these implementations
-// They truncate by default and therefore should not be implement for value.
-impl From<i128> for Value {
-	fn from(v: i128) -> Self {
-		Value::Number(Number::from(v))
-	}
-}
-
+// `u64`/`usize` always fit losslessly into a Number (as an Int, or a Decimal
+// when they exceed i64), so these conversions are infallible.
 impl From<u64> for Value {
 	fn from(v: u64) -> Self {
-		Value::Number(Number::from(v))
-	}
-}
-
-impl From<u128> for Value {
-	fn from(v: u128) -> Self {
 		Value::Number(Number::from(v))
 	}
 }
@@ -1057,6 +1045,22 @@ impl From<u128> for Value {
 impl From<usize> for Value {
 	fn from(v: usize) -> Self {
 		Value::Number(Number::from(v))
+	}
+}
+
+// `i128`/`u128` can exceed Decimal's range, so these conversions are fallible
+// and error rather than truncate when the value is too large to represent.
+impl TryFrom<i128> for Value {
+	type Error = Error;
+	fn try_from(v: i128) -> Result<Self, Self::Error> {
+		Ok(Value::Number(Number::try_from(v)?))
+	}
+}
+
+impl TryFrom<u128> for Value {
+	type Error = Error;
+	fn try_from(v: u128) -> Result<Self, Self::Error> {
+		Ok(Value::Number(Number::try_from(v)?))
 	}
 }
 

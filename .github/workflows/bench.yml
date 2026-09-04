@@ -38,7 +38,7 @@ jobs:
   # Disable Bench common until we can get it to run under 1h.
   # common:
   #   name: Bench common
-  #   runs-on: [runner-arm64-2xlarge]
+  #   runs-on: [runner-arm-32-cores]
   #   timeout-minutes: 60
   #   steps:
   #     - name: Setup environment
@@ -97,7 +97,7 @@ jobs:
 
   engines:
     name: Benchmark engines
-    runs-on: [ runner-arm64-2xlarge ]
+    runs-on: [ runner-arm-32-cores ]
     timeout-minutes: 60
     permissions:
       id-token: write

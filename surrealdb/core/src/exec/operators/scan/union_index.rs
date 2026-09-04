@@ -129,7 +129,7 @@ fn extract_merge_key(mode: &MergeMode, value: &Value) -> Option<MergeKey> {
 		| MergeMode::ByIndexKeyDedup {
 			path,
 			..
-		} => Some(MergeKey::Field(path.extract(value))),
+		} => Some(MergeKey::Field(path.extract(value).into_owned())),
 	}
 }
 

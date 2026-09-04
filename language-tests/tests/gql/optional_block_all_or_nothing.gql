@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "OPTIONAL { MATCH …; MATCH … } is one all-or-nothing left-outer block (R3): the whole block is planned as a single subplan and left-joined as a unit, so a row that cannot complete the WHOLE block nulls EVERY block binding together. The block here is `(a)-[:knows]->(b:person)` then `(b)-[:knows]->(c:city)`; only chains reaching a city survive, and person:1 (no completing chain) nulls both `b` and `c`."
+
+[[test.results]]
+value = "[{ city: NONE, friend: NONE, name: 'A' }, { city: 'London', friend: 'A', name: 'B' }, { city: 'London', friend: 'A', name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL { MATCH (a)-[:knows]->(b:person) MATCH (b)-[:knows]->(c:city) } RETURN a.name AS name, b.name AS friend, c.name AS city ORDER BY name, friend

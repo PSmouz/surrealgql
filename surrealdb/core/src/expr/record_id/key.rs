@@ -49,7 +49,6 @@ impl RecordIdKeyLit {
 			Kind::String => true,
 			Kind::Uuid => true,
 			Kind::Array(_, _) => true,
-			Kind::Set(_, _) => true,
 			Kind::Object => true,
 			Kind::Literal(l) => matches!(
 				l,

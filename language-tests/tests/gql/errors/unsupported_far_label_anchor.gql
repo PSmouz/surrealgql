@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-B): a single-hop pattern whose only labelled element is the FAR node (unlabeled start, unlabeled edge) is anchorable in the abstract but outside the PR-B planner's anchor set (labelled start node | single labelled edge | bound start/far node). It is rejected cleanly with a 'not supported yet' message rather than surfacing a planner internal error (V2_DESIGN §6)."
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [15:7]
+   |
+15 | MATCH (a)-[]->(b:person) RETURN a.name AS a, b.name AS b
+   |       ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a)-[]->(b:person) RETURN a.name AS a, b.name AS b

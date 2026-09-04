@@ -523,7 +523,11 @@ impl ExecutionContext {
 
 	/// Rebuild this ExecutionContext with a new FrozenContext, preserving
 	/// ns/db definitions, auth, session, options, datastore, and cancellation.
-	fn with_new_ctx(&self, ctx: FrozenContext) -> Self {
+	///
+	/// `pub(crate)` so `eval::*` can run a nested query against an *isolated*
+	/// child context (only the explicit bindings visible, never the call site's
+	/// scope) while keeping the current transaction, auth and ns/db level.
+	pub(crate) fn with_new_ctx(&self, ctx: FrozenContext) -> Self {
 		match self {
 			Self::Root(r) => Self::Root(RootContext {
 				ctx,

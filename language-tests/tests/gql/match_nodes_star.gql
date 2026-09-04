@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "RETURN * expands to the named pattern variables; ordering on the whole node object uses SurrealQL's total value order (key-then-value pairwise), so active:false < active:true < city:..."
+
+[[test.results]]
+value = "[{ n: { active: false, age: 20, city: 'Paris', id: person:2, name: 'B' } }, { n: { active: true, age: 30, city: 'London', id: person:1, name: 'A' } }, { n: { city: 'London', id: person:3, name: 'C' } }]"
+*/
+
+MATCH (n:person) RETURN * ORDER BY n

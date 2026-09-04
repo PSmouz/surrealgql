@@ -34,7 +34,7 @@ value = ''''SelectProject [ctx: Db] [projections: *]
 value = ''''SelectProject [ctx: Db] [projections: *]
     Limit [ctx: Db] [limit: 2, offset: 1]
         SortTopKByKey [ctx: Db] [sort_keys: val DESC, limit: 3]
-            TableScan [ctx: Db] [table: record, direction: Forward]
+            TableScan [ctx: Db] [table: record, direction: Forward, topk_pushdown: yes]
 ''''
 */
 

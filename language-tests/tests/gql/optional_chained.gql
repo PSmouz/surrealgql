@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Chained OPTIONALs fold left-to-right (R3): the second OPTIONAL left-joins onto the accumulator the first already null-filled. Block #0 (`a`->city) only matches person:1; block #1 (`a`->person) then expands off every accumulator row — including those where the first optional's `b` is already Null — so a later optional reads an earlier (possibly Null) optional binding's neighbourhood independently."
+
+[[test.results]]
+value = "[{ city: 'London', friend: 'B', name: 'A' }, { city: NONE, friend: 'A', name: 'B' }, { city: NONE, friend: 'C', name: 'B' }, { city: NONE, friend: 'A', name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:city) OPTIONAL MATCH (a)-[:knows]->(c:person) RETURN a.name AS name, b.name AS city, c.name AS friend ORDER BY name, friend

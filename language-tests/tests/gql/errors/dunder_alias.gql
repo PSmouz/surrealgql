@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: the lowering owns the `__` prefix for its internal binding fields."
+
+[test.results]
+parsing-error = '''
+Aliases starting with `__` are reserved for internal use
+  --> [15:35]
+   |
+15 | MATCH (n:person) RETURN n.name AS __name
+   |                                   ^^^^^^ rename the alias
+'''
+*/
+
+MATCH (n:person) RETURN n.name AS __name

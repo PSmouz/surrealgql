@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R6 emit-window boundary: `{0}` == `{0,0}` emits ONLY the zero-length path and traverses no edges at all. This is the tightest corner of the quantifier matrix — it isolates the `min == 0` zero-length emission from every hop, complementing the depth-1+ windows pinned by quantifier_{star,plus,question,zero_min,unbounded,fixed_two,range_two_three}.gql. On the triangle each source matches only itself: D->D, E->E, F->F. 3 rows."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'D' }, { an: 'E', bn: 'E' }, { an: 'F', bn: 'F' }]"
+*/
+
+MATCH (a:hub)-[:link]->{0}(b:hub) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

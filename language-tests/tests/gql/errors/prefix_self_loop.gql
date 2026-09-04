@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: a selective path search needs distinct endpoints; a self-loop (start == end binding) collapses the per-endpoint partition."
+
+[test.results]
+parsing-error = """
+A path search does not support a pattern whose start and end are the same node
+  --> [15:7]
+   |
+15 | MATCH ANY SHORTEST (a:wp)-[:road]->+(a) RETURN a.name AS an
+   |       ^^^^^^^^^^^^ use distinct start and end nodes
+"""
+*/
+
+MATCH ANY SHORTEST (a:wp)-[:road]->+(a) RETURN a.name AS an

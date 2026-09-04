@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Guard inside edge scope on an edge property: knows:k31 has no since, so the guarded since < 2020 excludes it (unguarded, NONE < 2020 would be true), leaving only the 2018 edge."
+
+[[test.results]]
+value = "[{ an: 'B', bn: 'A', since: 2018 }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) WHERE k.since < 2020 RETURN a.name AS an, b.name AS bn, k.since AS since ORDER BY since

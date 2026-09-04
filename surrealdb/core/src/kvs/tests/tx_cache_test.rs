@@ -306,15 +306,16 @@ async fn test_single_tx_cache_invalidation_on_db_put_and_del() {
 		"After put_db, all_db should return the new database (cache must be invalidated)"
 	);
 
-	// Delete the database
-	tx.del_db("test", "testdb", false).await.unwrap();
+	// Delete the database (deferred: removes the catalog entry + invalidates
+	// the cache now; the data prefix is reclaimed in the background).
+	tx.del_db_deferred("test", "testdb", false).await.unwrap();
 
 	// Query again — must see empty list
 	let dbs = tx.all_db(NamespaceId(1), None).await.unwrap();
 	assert_eq!(
 		dbs.len(),
 		0,
-		"After del_db, all_db should return empty list (cache must be invalidated)"
+		"After del_db_deferred, all_db should return empty list (cache must be invalidated)"
 	);
 
 	tx.cancel().await.unwrap();

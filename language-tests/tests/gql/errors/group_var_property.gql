@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (V2_DESIGN §8 new rule): a group variable holds a LIST of edge records, so a scalar property access like `g.since` has no single value to resolve. PR-A rejects property access on group/path variables with 'Property access on a group or path variable is not supported yet'; the variable may only be returned whole (see group_var_list.gql). Pairs with path_var_property.gql for the Path-variable form. No schema import: rejected during lowering before execution."
+
+[test.results]
+parsing-error = '''
+Property access on a group or path variable is not supported yet
+  --> [15:47]
+   |
+15 | MATCH (a:hub)-[g:link]->{1,2}(b:hub) RETURN g.since AS s
+   |                                               ^^^^^ return the variable itself
+'''
+*/
+
+MATCH (a:hub)-[g:link]->{1,2}(b:hub) RETURN g.since AS s

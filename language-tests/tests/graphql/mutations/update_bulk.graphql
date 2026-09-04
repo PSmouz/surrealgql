@@ -1,0 +1,16 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL bulk update mutation updates every record matching the where filter"
+
+[[test.results]]
+value = "{ updatePosts: [{ published: true, title: 'Draft post' }] }"
+*/
+mutation {
+	updatePosts(where: { published: { eq: false } }, data: { published: true }) {
+		title
+		published
+	}
+}

@@ -43,6 +43,9 @@ impl KVKey for DiskAnnRecordPending<'_> {
 
 impl<'a> DiskAnnRecordPending<'a> {
 	/// Creates the `!dr{record_key}` pending-operation key.
+	///
+	/// New writes use the sharded [`crate::key::index::dw`] layout; this legacy constructor backs
+	/// the write path's dual-read fold (reading and deleting a pre-upgrade entry) and tests.
 	pub(crate) fn new(
 		ns: NamespaceId,
 		db: DatabaseId,

@@ -1252,34 +1252,22 @@ fn parse_define_access_record() {
 			}))),
 		);
 	}
-	// TODO: Parameterization broke the guarantee that token duration is not none.
-	/*
-	// kjjification with JWT is explicitly defined only with symmetric key. Token
-	// duration is none.
+	// `DURATION FOR TOKEN NONE` on TYPE RECORD used to be rejected at parse
+	// time. Parameterization made the duration an arbitrary expression, so the
+	// rejection now lives in `DefineAccessStatement::to_definition` (and the
+	// matching ALTER path) — see `language-tests/tests/access/*/record_token_duration_*.surql`.
+	// TYPE RECORD is only valid at the database level.
 	{
 		syn::parse_with(
-			r#"DEFINE ACCESS a ON DB TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
+			r#"DEFINE ACCESS a ON ROOT TYPE RECORD"#.as_bytes(),
 			async |parser, stk| parser.parse_expr_inherit(stk).await,
 		)
 		.unwrap_err();
-	}
-	// Attempt to define record access at the root level.
-	{
-		syn::parse_with(
-			r#"DEFINE ACCESS a ON ROOT TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
-			async |parser, stk| parser.parse_expr_inherit(stk).await,
-		)
+		syn::parse_with(r#"DEFINE ACCESS a ON NS TYPE RECORD"#.as_bytes(), async |parser, stk| {
+			parser.parse_expr_inherit(stk).await
+		})
 		.unwrap_err();
 	}
-	// Attempt to define record access at the namespace level.
-	{
-		syn::parse_with(
-			r#"DEFINE ACCESS a ON NS TYPE RECORD DURATION FOR TOKEN NONE"#.as_bytes(),
-			async |parser, stk| parser.parse_expr_inherit(stk).await,
-		)
-		.unwrap_err();
-	}
-	*/
 }
 
 #[test]
@@ -1930,6 +1918,67 @@ fn parse_define_analyzer() {
 }
 
 #[test]
+fn parse_define_analyzer_module_function() {
+	// Test statement with surrealism enabled
+	let res = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string TOKENIZERS class"#.as_bytes(),
+		ParserSettings {
+			surrealism_enabled: true,
+			..Default::default()
+		},
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	assert_eq!(
+		res,
+		Expr::Define(Box::new(DefineStatement::Analyzer(DefineAnalyzerStatement {
+			kind: DefineKind::Default,
+			name: Expr::Idiom(Idiom::field("ana".to_string())),
+			tokenizers: Some(vec![Tokenizer::Class]),
+			filters: None,
+			comment: Expr::Literal(Literal::None),
+			function: Some("mod::demo::alter_string".into()),
+		}))),
+	);
+
+	// Test statement without surrealism capability enabled
+	let err = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string TOKENIZERS class"#.as_bytes(),
+		ParserSettings::default(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(err.to_string().contains("Experimental capability `surrealism` is not enabled"));
+}
+
+#[test]
+fn parse_define_analyzer_rejects_function_calls() {
+	let err = syn::parse_with(
+		r#"DEFINE ANALYZER ana FUNCTION fn::foo::bar() TOKENIZERS class"#.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(
+		err.to_string().contains("Analyzer FUNCTION expects a function name, not a function call")
+	);
+	assert!(err.to_string().contains("Remove `()` from the analyzer FUNCTION clause"));
+
+	let err = syn::parse_with_settings(
+		r#"DEFINE ANALYZER ana FUNCTION mod::demo::alter_string() TOKENIZERS class"#.as_bytes(),
+		ParserSettings {
+			surrealism_enabled: true,
+			..Default::default()
+		},
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap_err();
+	assert!(
+		err.to_string().contains("Analyzer FUNCTION expects a function name, not a function call")
+	);
+	assert!(err.to_string().contains("Remove `()` from the analyzer FUNCTION clause"));
+}
+
+#[test]
 fn parse_delete() {
 	let res = syn::parse_with("DELETE FROM ONLY |foo:32..64| WITH INDEX index,index_2 Where 2 RETURN AFTER TIMEOUT 1s EXPLAIN FULL".as_bytes(),async |parser,stk| parser. parse_expr_inherit(stk).await).unwrap();
 	assert_eq!(
@@ -2495,6 +2544,7 @@ fn parse_relate() {
 		res,
 		Expr::Relate(Box::new(RelateStatement {
 			only: true,
+			or_update: false,
 			through: Expr::Literal(Literal::RecordId(RecordIdLit {
 				table: "a".into(),
 				key: RecordIdKeyLit::String("b".into()),
@@ -2519,6 +2569,36 @@ fn parse_relate() {
 			timeout: Expr::Literal(Literal::None),
 		})),
 	)
+}
+
+#[test]
+fn parse_relate_or_update() {
+	let res = syn::parse_with(
+		r#"RELATE OR UPDATE person:one->likes:[person:one, post:one]->post:one SET note = 'x'"#
+			.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	let Expr::Relate(stmt) = res else {
+		panic!("expected RELATE statement");
+	};
+	assert!(stmt.or_update);
+	assert!(!stmt.only);
+	assert!(matches!(stmt.data, Some(Data::SetExpression(_))));
+}
+
+#[test]
+fn parse_relate_only_or_update() {
+	let res = syn::parse_with(
+		r#"RELATE ONLY OR UPDATE a:1->edge:1->a:2 SET name = 'A'"#.as_bytes(),
+		async |parser, stk| parser.parse_expr_inherit(stk).await,
+	)
+	.unwrap();
+	let Expr::Relate(stmt) = res else {
+		panic!("expected RELATE statement");
+	};
+	assert!(stmt.or_update);
+	assert!(stmt.only);
 }
 
 #[test]

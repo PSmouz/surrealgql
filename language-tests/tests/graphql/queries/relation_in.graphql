@@ -1,0 +1,21 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Incoming relation fields traverse the relation in reverse"
+
+[[test.results]]
+value = "{ post: { likes_in: [{ in: { name: 'Bob' }, rating: 4 }, { in: { name: 'Alice' }, rating: 5 }], title: 'Hello world' } }"
+*/
+query {
+	post(id: "hello") {
+		title
+		likes_in(order: {asc: rating}) {
+			rating
+			in {
+				name
+			}
+		}
+	}
+}

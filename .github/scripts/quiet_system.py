@@ -11,10 +11,19 @@ SWAP_SYS = Path("/proc/sys/vm/swappiness")
 ASLR_SYS = Path("/proc/sys/kernel/randomize_va_space")
 CPU_SET = "0-16"
 
+
 @contextmanager
 def swappiness(value):
-    existingValue = SWAP_SYS.read_text()
-    SWAP_SYS.write_text(value)
+    # Some runners (e.g. the dedicated bench pool) mount /proc read-only, so the
+    # tweak can't be applied even as root. Skip gracefully and still run the
+    # command rather than aborting the benchmark.
+    try:
+        existingValue = SWAP_SYS.read_text()
+        SWAP_SYS.write_text(value)
+    except OSError as e:
+        print(f"Skipping swappiness tweak ({e}); continuing without it")
+        yield
+        return
     try:
         yield
     finally:
@@ -23,11 +32,17 @@ def swappiness(value):
         try:
             SWAP_SYS.write_text(existingValue)
         except Exception as e:
-            print("Failed to reset swappiness!",e)
+            print("Failed to reset swappiness!", e)
+
 
 @contextmanager
 def aslr():
-    ASLR_SYS.write_text("0")
+    try:
+        ASLR_SYS.write_text("0")
+    except OSError as e:
+        print(f"Skipping ASLR tweak ({e}); continuing without it")
+        yield
+        return
     try:
         yield
     finally:
@@ -36,25 +51,30 @@ def aslr():
         try:
             ASLR_SYS.write_text("2")
         except Exception as e:
-            print("Failed to reset address space randomization!",e)
+            print("Failed to reset address space randomization!", e)
 
 
 @contextmanager
 def performance_scaling():
     sysFiles = list(Path("/sys/devices/system/cpu").glob("cpu*/cpufreq/scaling_governor"))
-    existingValues = [p.read_text() for p in sysFiles]
-    for p in sysFiles:
-        p.write_text("performance")
+    try:
+        existingValues = [p.read_text() for p in sysFiles]
+        for p in sysFiles:
+            p.write_text("performance")
+    except OSError as e:
+        print(f"Skipping CPU governor tweak ({e}); continuing without it")
+        yield
+        return
     try:
         yield
     finally:
         if os.getuid() != 0:
             return
         try:
-            for p,v in zip(sysFiles,existingValues):
+            for p, v in zip(sysFiles, existingValues):
                 p.write_text(v)
         except Exception as e:
-            print("Failed to reset CPU scheduler!",e)
+            print("Failed to reset CPU scheduler!", e)
 
 
 def runCmd(uid,gid,user, cmd):
@@ -68,9 +88,11 @@ def runCmd(uid,gid,user, cmd):
         sys.exit(proc.returncode)
     else:
         while True:
-            pid,exit_code = os.wait()
+            pid,status = os.wait()
             if pid == child:
-                return exit_code
+                if os.WIFSIGNALED(status):
+                    return 128 + os.WTERMSIG(status)
+                return os.WEXITSTATUS(status)
 
 
 if __name__ == "__main__":

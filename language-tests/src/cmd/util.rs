@@ -1,18 +1,13 @@
 use anyhow::Result;
-
-use crate::tests::{
-	run::RunConfig,
-	schema::{BoolOr, Capabilities as TestCapabilities, SchemaTarget},
-};
-use surrealdb_core::{
-	dbs::{Capabilities, NewPlannerStrategy, Session, capabilities::Targets},
-	kvs::Datastore,
-};
+use surrealdb_core::dbs::capabilities::Targets;
+use surrealdb_core::dbs::{Capabilities, NewPlannerStrategy, Session};
+use surrealdb_core::kvs::Datastore;
 use surrealdb_types::Value as SurValue;
 
-use crate::tests::{
-	TestRun,
-	schema::{AuthLevel, TestAuth, TestConfig},
+use crate::tests::TestRun;
+use crate::tests::run::RunConfig;
+use crate::tests::schema::{
+	AuthLevel, BoolOr, Capabilities as TestCapabilities, SchemaTarget, TestAuth, TestConfig,
 };
 
 /// Builds a `Session` from a test config and a specific planner strategy.
@@ -87,6 +82,24 @@ pub struct ImportFailure {
 
 pub async fn run_imports<T: RunConfig>(
 	run: &TestRun<T>,
+	session: Session,
+	dbs: &Datastore,
+) -> Result<Option<ImportFailure>> {
+	run_imports_list(&run.case.imports, session, dbs).await
+}
+
+/// Runs an explicit list of import cases against the datastore, after defining
+/// the session's namespace/database. Used by [`run_imports`] (which forwards the
+/// test's resolved imports) and by the bench runner, which may substitute a
+/// per-variant import chain (see `[bench].datasets`).
+///
+/// Imports always run as `Session::owner()` retargeted (via `process_use`) to the
+/// session's `(ns, db)`, so the populated data depends only on `(ns, db)` and the
+/// import chain — never on the test's `[env].auth`. This is what lets the bench
+/// runner share one populated datastore across read-only benches that differ only
+/// in auth (see `calc_group_key`).
+pub async fn run_imports_list(
+	imports: &[std::sync::Arc<crate::tests::case::TestCase>],
 	mut session: Session,
 	dbs: &Datastore,
 ) -> Result<Option<ImportFailure>> {
@@ -103,7 +116,7 @@ pub async fn run_imports<T: RunConfig>(
 	let mut import_session = Session::owner();
 	dbs.process_use(None, &mut import_session, session.ns.clone(), session.db.clone()).await?;
 
-	for import in run.case.imports.iter() {
+	for import in imports.iter() {
 		match dbs.execute(&import.source, &import_session, None).await {
 			Err(e) => {
 				return Ok(Some(ImportFailure {
@@ -163,4 +176,8 @@ pub fn core_capabilities_from_test_config(cap: &TestCapabilities) -> Capabilitie
 		.without_http_routes(extract_targets(&cap.deny_http))
 		.with_experimental(extract_targets(&cap.allow_experimental))
 		.without_experimental(extract_targets(&cap.deny_experimental))
+		.with_arbitrary_query(extract_targets(&cap.allow_arbitrary_query))
+		.without_arbitrary_query(extract_targets(&cap.deny_arbitrary_query))
+		.with_eval_query(extract_targets(&cap.allow_eval_query))
+		.without_eval_query(extract_targets(&cap.deny_eval_query))
 }

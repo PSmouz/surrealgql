@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "E4 hazard pinned through GQL: a missing far-end property must not satisfy an ordering predicate (person:3 has no age; unguarded, NONE < 25 would be true), so only A->B qualifies."
+
+[[test.results]]
+value = "[{ an: 'A', bn: 'B' }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) WHERE b.age < 25 RETURN a.name AS an, b.name AS bn ORDER BY an

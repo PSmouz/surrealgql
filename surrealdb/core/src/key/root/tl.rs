@@ -29,6 +29,8 @@ impl Tl {
 			TaskLeaseType::ChangeFeedCleanup => 1,
 			TaskLeaseType::IndexCompaction => 2,
 			TaskLeaseType::EventProcessing => 3,
+			TaskLeaseType::ReclaimTombstones => 4,
+			TaskLeaseType::IndexBuildResume => 5,
 		};
 		Self {
 			__: b'/',

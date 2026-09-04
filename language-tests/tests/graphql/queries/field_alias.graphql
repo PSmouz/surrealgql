@@ -1,0 +1,16 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL field aliases rename fields in the response"
+
+[[test.results]]
+value = "{ person: { fullName: 'Carol', yearsOld: 35 } }"
+*/
+query {
+	person(id: "carol") {
+		fullName: name
+		yearsOld: age
+	}
+}

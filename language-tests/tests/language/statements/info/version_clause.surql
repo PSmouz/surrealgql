@@ -4,6 +4,10 @@ reason = "INFO FOR DB / NS accepts a VERSION clause referencing a past timestamp
 
 [env]
 planner-strategy = ["all-ro", "best-effort-ro"]
+# Excludes tikv: the TiKV backend does not support versioned / time-travel
+# queries (it returns UnsupportedVersionedQueries), so a VERSION clause
+# cannot be exercised there.
+backend = ["mem", "rocksdb", "surrealkv"]
 # surrealkv / rocksdb refuse versioned queries unless the datastore was
 # opened with `?versioned=true`; the harness passes that through when
 # `versioned = true` is set on the env. Memory implicitly supports it.

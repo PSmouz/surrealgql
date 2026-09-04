@@ -1,0 +1,18 @@
+/**
+[env]
+imports = ["./_tables_include.surql"]
+
+[test]
+reason = "TABLES INCLUDE only exposes the listed tables; the rest are absent from the schema"
+
+[[test.results]]
+error = 'Unknown field "posts" on type "Query".'
+*/
+query {
+	persons {
+		name
+	}
+	posts {
+		title
+	}
+}

@@ -7,6 +7,7 @@ pub mod nd;
 pub mod nh;
 pub mod ni;
 pub mod ns;
+pub mod rc;
 pub mod root_config;
 pub mod tl;
 pub mod us;

@@ -74,7 +74,58 @@ macro_rules! from_prim_ints {
 	};
 }
 
-from_prim_ints!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+// Only integer types that always fit losslessly into an i64 are converted
+// infallibly here. Wider types are handled below so they store the value
+// correctly (as a Decimal when it exceeds i64) instead of truncating.
+from_prim_ints!(i8, i16, i32, i64, isize, u8, u16, u32);
+
+// `u64`/`usize` can exceed i64::MAX but always fit within Decimal's 96-bit
+// mantissa, so the conversion is lossless and infallible: store as an Int when
+// it fits, otherwise as a Decimal.
+impl From<u64> for Number {
+	fn from(i: u64) -> Self {
+		match i64::try_from(i) {
+			Ok(v) => Self::Int(v),
+			Err(_) => Self::Decimal(Decimal::from(i)),
+		}
+	}
+}
+
+impl From<usize> for Number {
+	fn from(i: usize) -> Self {
+		// usize is at most 64 bits wide on every supported target.
+		Self::from(i as u64)
+	}
+}
+
+// `i128`/`u128` can exceed Decimal's range (2^96), so the conversion is
+// fallible: store as an Int when it fits in i64, otherwise as a Decimal, and
+// error rather than silently truncate when the value is too large for either.
+impl TryFrom<i128> for Number {
+	type Error = Error;
+	fn try_from(i: i128) -> Result<Self, Self::Error> {
+		if let Ok(v) = i64::try_from(i) {
+			Ok(Self::Int(v))
+		} else if let Some(v) = Decimal::from_i128(i) {
+			Ok(Self::Decimal(v))
+		} else {
+			Err(Error::TryFrom(i.to_string(), "Number"))
+		}
+	}
+}
+
+impl TryFrom<u128> for Number {
+	type Error = Error;
+	fn try_from(i: u128) -> Result<Self, Self::Error> {
+		if let Ok(v) = i64::try_from(i) {
+			Ok(Self::Int(v))
+		} else if let Some(v) = Decimal::from_u128(i) {
+			Ok(Self::Decimal(v))
+		} else {
+			Err(Error::TryFrom(i.to_string(), "Number"))
+		}
+	}
+}
 
 impl From<f32> for Number {
 	fn from(f: f32) -> Self {

@@ -45,6 +45,15 @@ impl ApiConfig {
 			});
 		}
 
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			return Err(crate::err::Error::PermissionClauseNotReadonly {
+				kind: "config",
+				name: "api".to_string(),
+			}
+			.into());
+		}
+
 		Ok(ApiConfigDefinition {
 			middleware,
 			permissions: self.permissions.clone(),

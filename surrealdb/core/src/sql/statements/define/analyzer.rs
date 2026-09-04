@@ -2,7 +2,8 @@ use surrealdb_strand::Strand;
 use surrealdb_types::{SqlFormat, ToSql, write_sql};
 
 use super::DefineKind;
-use crate::fmt::{CoverStmts, EscapeKwFreeIdent, Fmt};
+use crate::fmt::{CoverStmts, Fmt};
+use crate::sql::analyzer_function::fmt_analyzer_function;
 use crate::sql::filter::Filter;
 use crate::sql::tokenizer::{Tokenizer, write_tokenizers_sql};
 use crate::sql::{Expr, Literal};
@@ -40,11 +41,7 @@ impl ToSql for DefineAnalyzerStatement {
 		}
 		write_sql!(f, sql_fmt, " {}", CoverStmts(&self.name));
 		if let Some(ref i) = self.function {
-			f.push_str(" FUNCTION fn");
-			for x in i.as_str().split("::") {
-				f.push_str("::");
-				EscapeKwFreeIdent(x).fmt_sql(f, sql_fmt);
-			}
+			fmt_analyzer_function(f, sql_fmt, i.as_str());
 		}
 		if let Some(v) = &self.tokenizers {
 			write_sql!(f, sql_fmt, " TOKENIZERS ");

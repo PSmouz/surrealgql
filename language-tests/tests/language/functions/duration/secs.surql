@@ -14,8 +14,7 @@ value = "0"
 value = "31536000"
 
 [[test.results]]
-value = "-1"
-
+value = "18446744073709551615dec"
 */
 duration::secs(25s);
 duration::secs(1m25s);

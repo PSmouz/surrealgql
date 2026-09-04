@@ -13,7 +13,7 @@ tokio = "1.52.1"
 
 [dependencies.surrealdb-core]
 path = "../surrealdb/core"
-features = ["kv-mem", "arbitrary"]
+features = ["kv-mem", "arbitrary", "gql"]
 default-features = false
 
 [dependencies.surrealdb-types]
@@ -32,6 +32,12 @@ debug = 1
 [[bin]]
 name = "fuzz_sql_parser"
 path = "fuzz_targets/fuzz_sql_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gql_parser"
+path = "fuzz_targets/fuzz_gql_parser.rs"
 test = false
 doc = false
 

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Inline WHERE inside an edge pattern is pushed into the lookup condition: 2021 and 2020 qualify, 2018 fails, and the edge without since is excluded by the guard."
+
+[[test.results]]
+value = "[{ an: 'B', since: 2020 }, { an: 'A', since: 2021 }]"
+*/
+
+MATCH (a:person)-[k:knows WHERE k.since > 2019]->(b:person) RETURN a.name AS an, k.since AS since ORDER BY since

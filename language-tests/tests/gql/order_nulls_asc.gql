@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "ASC ordering with a missing key: SurrealQL's total order sorts NONE below numbers, so the ageless row comes first (GQL leaves null placement implementation-defined; this pins ours)."
+
+[[test.results]]
+value = "[{ age: NONE, name: 'C' }, { age: 20, name: 'B' }, { age: 30, name: 'A' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name, n.age AS age ORDER BY age ASC

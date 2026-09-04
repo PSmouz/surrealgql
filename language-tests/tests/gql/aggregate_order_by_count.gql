@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "ORDER BY an aggregate result (count descending, then name): B has 2 outgoing knows edges, A and C have 1 each."
+
+[[test.results]]
+value = "[{ c: 2, name: 'B' }, { c: 1, name: 'A' }, { c: 1, name: 'C' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS name, count(*) AS c GROUP BY a.name ORDER BY c DESC, name

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "`SHORTEST k GROUP(S)` counts distinct lengths, not paths. Anchored X→Z the path lengths are {2, 2, 3}; `SHORTEST 2 GROUPS` keeps both length groups (all three paths) — three rows, sharply distinguishing it from `SHORTEST 2` (counted: two rows) and `SHORTEST 1 GROUP` (two rows)."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH SHORTEST 2 GROUPS (a:wp WHERE a.name = 'X')-[:road]->+(b:wp WHERE b.name = 'Z')
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

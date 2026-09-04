@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A bare RETURN count(*) with no GROUP BY aggregates over all matched rows (GROUP ALL): one row with the count of the three person nodes."
+
+[[test.results]]
+value = "[{ total: 3 }]"
+*/
+
+MATCH (n:person) RETURN count(*) AS total

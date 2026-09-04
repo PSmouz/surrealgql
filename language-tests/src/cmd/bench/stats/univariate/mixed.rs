@@ -1,9 +1,8 @@
 //! Mixed bootstrap
 
-use crate::cmd::bench::stats::{
-	tuple::{Tuple, TupledDistributionsBuilder},
-	univariate::{Sample, resamples::Resamples},
-};
+use crate::cmd::bench::stats::tuple::{Tuple, TupledDistributionsBuilder};
+use crate::cmd::bench::stats::univariate::Sample;
+use crate::cmd::bench::stats::univariate::resamples::Resamples;
 
 /// Performs a *mixed* two-sample bootstrap
 pub fn bootstrap<T, S>(a: &Sample, b: &Sample, nresamples: usize, statistic: S) -> T::Distributions

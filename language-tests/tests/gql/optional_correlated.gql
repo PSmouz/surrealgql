@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A correlated OPTIONAL: the optional clause's predicate references the MANDATORY binding `a` (`b.age < a.age`), so the match is constrained by the outer row. The predicate rides the optional pre-null (R3). Hand-derived over the person->person knows graph (A->B; B->A, B->C; C->A), ages A=30, B=20, C=(none): A's neighbour B (20 < 30) is kept (friend='B'); B's neighbours A (30 < 20 false) and C (none < 20, 3VL-false) both fail -> null-fill (friend=NONE); C has no age so its neighbour A fails `30 < none` (3VL-false) -> null-fill (friend=NONE). Every mandatory `a` is preserved."
+
+[[test.results]]
+value = "[{ friend: 'B', name: 'A' }, { friend: NONE, name: 'B' }, { friend: NONE, name: 'C' }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:person) WHERE b.age < a.age RETURN a.name AS name, b.name AS friend ORDER BY name, friend

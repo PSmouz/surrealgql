@@ -133,6 +133,7 @@ pub struct MetricsObserver {
 	// Live query (scope: surrealdb.live_query)
 	live_query_active: UpDownCounter<i64>,
 	live_query_notifications: Counter<u64>,
+	live_query_orphaned: Counter<u64>,
 	// Slow query (scope: surrealdb.slow_query)
 	slow_query_total: Counter<u64>,
 	/// Cached threshold (in milliseconds) for `slow_query_total`. `0` disables
@@ -327,6 +328,14 @@ impl MetricsObserver {
 				.u64_counter(names::LIVE_QUERY_NOTIFICATIONS)
 				.with_description("Cumulative count of LIVE query notifications dispatched")
 				.build(),
+			live_query_orphaned: lq
+				.u64_counter(names::LIVE_QUERY_ORPHANED)
+				.with_description(
+					"Cumulative count of LIVE queries that were orphaned because their \
+					 datastore-side registration could not be cleaned up after the \
+					 WebSocket closed",
+				)
+				.build(),
 			slow_query_total: slow
 				.u64_counter(names::SLOW_QUERY_TOTAL)
 				.with_description(
@@ -390,6 +399,19 @@ impl MetricsObserver {
 			KeyValue::new(attrs::DATABASE, label_cow(database)),
 		];
 		self.live_query_notifications.add(1, &attrs);
+	}
+
+	/// Record a single orphaned LIVE query: the in-memory registration was
+	/// lost and the datastore-side catalog row could not be removed, so the
+	/// broker will keep producing notifications for it that are silently
+	/// discarded for the lifetime of the datastore. The labels mirror those
+	/// on the active gauge so operators can attribute the leak to a tenant.
+	pub fn record_live_query_orphaned(&self, namespace: Option<&str>, database: Option<&str>) {
+		let attrs = [
+			KeyValue::new(attrs::NAMESPACE, label_cow(namespace)),
+			KeyValue::new(attrs::DATABASE, label_cow(database)),
+		];
+		self.live_query_orphaned.add(1, &attrs);
 	}
 
 	/// Record a single GraphQL operation completion.

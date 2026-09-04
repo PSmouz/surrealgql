@@ -66,7 +66,8 @@ use rocksdb::{DBRawIteratorWithThreadMode, OptimisticTransactionDB};
 use super::{Direction, Transaction};
 use crate::kvs::Key;
 use crate::kvs::api::{
-	BoxFut, KeySpan, KeyValSpan, KeysBatch, ScanCursorKeys, ScanCursorVals, ScanLimit, ValsBatch,
+	BoxFut, KeySpan, KeyValSpan, KeyVisitor, KeysBatch, ScanChunkStats, ScanCursorKeys,
+	ScanCursorVals, ValVisitor, ValsBatch,
 };
 use crate::kvs::err::Result;
 
@@ -196,13 +197,29 @@ pub(super) struct RocksDbValsCursor<'tx> {
 }
 
 impl ScanCursorKeys for RocksDbKeysCursor<'_> {
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<KeysBatch<'s>>> {
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<KeysBatch<'s>>> {
 		Box::pin(async move { super::cursor_next_keys(self, limit).await })
+	}
+
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn KeyVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>> {
+		Box::pin(async move { super::cursor_for_each_keys(self, limit, f).await })
 	}
 }
 
 impl ScanCursorVals for RocksDbValsCursor<'_> {
-	fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> BoxFut<'s, Result<ValsBatch<'s>>> {
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<ValsBatch<'s>>> {
 		Box::pin(async move { super::cursor_next_vals(self, limit).await })
+	}
+
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn ValVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>> {
+		Box::pin(async move { super::cursor_for_each_vals(self, limit, f).await })
 	}
 }

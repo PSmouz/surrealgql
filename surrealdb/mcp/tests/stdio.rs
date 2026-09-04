@@ -128,7 +128,7 @@ async fn stdio_tools_list_matches_surface() {
 
 	let mut expected = vec![
 		"query", "select", "create", "insert", "upsert", "update", "delete", "relate", "info",
-		"list", "use", "run",
+		"list", "use", "run", "gql", "graphql",
 	];
 	expected.sort_unstable();
 	assert_eq!(names, expected, "published tool surface drifted");
@@ -211,6 +211,58 @@ async fn stdio_call_list_tables_after_define() {
 		.expect("list tables call");
 	let text = tool_text(&result);
 	assert!(text.contains("widget"), "expected `widget` in list output: {text}");
+
+	client.cancel().await.expect("client cancel");
+	server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_call_graphql_returns_envelope() {
+	let (client, server) = spawn_server().await;
+
+	// Seed a table + data and expose it to GraphQL, all through the `query`
+	// tool (same ns/db the `graphql` tool will resolve against).
+	let seed = json!({
+		"query": "DEFINE TABLE foo SCHEMAFULL; DEFINE FIELD val ON foo TYPE int; CREATE foo:1 SET val = 42; DEFINE CONFIG GRAPHQL AUTO;"
+	})
+	.as_object()
+	.cloned()
+	.unwrap();
+	client
+		.call_tool(CallToolRequestParams::new("query").with_arguments(seed))
+		.await
+		.expect("seed via query tool");
+
+	let args = json!({ "query": "query{ foos { id, val } }" }).as_object().cloned().unwrap();
+	let result = client
+		.call_tool(CallToolRequestParams::new("graphql").with_arguments(args))
+		.await
+		.expect("graphql tool call");
+	let text = tool_text(&result);
+	assert!(text.contains("foos"), "expected `foos` in GraphQL envelope: {text}");
+	assert!(text.contains("42"), "expected the seeded value in GraphQL envelope: {text}");
+
+	client.cancel().await.expect("client cancel");
+	server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_call_gql_reports_disabled_capability() {
+	// The default in-memory datastore does not enable the experimental
+	// `gql` capability. The `gql` tool must still be registered and return
+	// a clear in-band error rather than being absent from the tool surface.
+	let (client, server) = spawn_server().await;
+
+	let args = json!({ "query": "MATCH (n) RETURN n" }).as_object().cloned().unwrap();
+	let result = client
+		.call_tool(CallToolRequestParams::new("gql").with_arguments(args))
+		.await
+		.expect("gql tool call");
+	let text = tool_text(&result);
+	assert!(
+		text.contains("gql") && text.contains("not enabled"),
+		"expected an experimental-capability error: {text}"
+	);
 
 	client.cancel().await.expect("client cancel");
 	server.abort();

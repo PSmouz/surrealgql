@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use tokio::fs;
 
 use crate::tests::TestLoadError;
@@ -16,6 +16,15 @@ mod config;
 /// A unique id identifying a specific test case.
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub struct CaseId(usize);
+
+impl CaseId {
+	/// Construct a [`CaseId`] directly. Only used by the harness's own unit tests,
+	/// which build [`TestCase`]s by hand rather than loading them from disk.
+	#[cfg(test)]
+	pub fn new(id: usize) -> Self {
+		CaseId(id)
+	}
+}
 
 /// A origin of a test, which is some path + possibly an offset within the file at that path.
 #[derive(Debug, Eq, PartialEq, Hash)]
@@ -30,20 +39,36 @@ pub struct Origin {
 	pub line_offset: Option<usize>,
 }
 
+/// The query language a test case is written in, derived from the file
+/// extension: `.surql` is SurrealQL, `.gql` is GQL, `.graphql` is GraphQL.
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Dialect {
+	SurrealQl,
+	Gql,
+	GraphQl,
+}
+
 /// A single test case, which might produce multiple test runs depending on configuration.
 #[derive(Debug)]
 pub struct TestCase {
 	pub id: CaseId,
 	pub origin: Arc<Origin>,
 	pub config: CaseConfig,
-	/// The surrealql source for the test.
+	/// The query language the test source is written in.
+	pub dialect: Dialect,
+	/// The query source for the test, in the language given by `dialect`.
 	/// Includes the config.
 	pub source: String,
 }
 
 impl TestCase {
-	pub fn from_source_origin_id(id: CaseId, origin: Arc<Origin>, source: String) -> Result<Self> {
-		let config = CaseConfig::parse(&source).with_context(|| {
+	pub fn from_source_origin_id(
+		id: CaseId,
+		origin: Arc<Origin>,
+		source: String,
+		dialect: Dialect,
+	) -> Result<Self> {
+		let config = CaseConfig::parse(&source, dialect).with_context(|| {
 			if let Some(line) = origin.line_offset {
 				format!("Could not parse config for test file `{}` at line {line}", origin.path)
 			} else {
@@ -55,6 +80,7 @@ impl TestCase {
 			id,
 			origin,
 			config,
+			dialect,
 			source,
 		})
 	}
@@ -118,6 +144,121 @@ impl CaseSet {
 		self.cases.iter()
 	}
 
+	/// Resolve a list of import paths transitively (imports-of-imports included),
+	/// returning the ordered, de-duplicated list of import cases with each
+	/// dependency placed before the file that imports it.
+	///
+	/// `importing` and `origin` identify the file whose imports are being
+	/// resolved (used for relative-path resolution and error attribution).
+	/// Returns `None` if any import could not be resolved (errors are pushed to
+	/// `errors`).
+	pub fn resolve_imports(
+		&self,
+		import_paths: &[String],
+		importing: CaseId,
+		origin: &Arc<Origin>,
+		errors: &mut Vec<TestLoadError>,
+	) -> Option<Vec<Arc<TestCase>>> {
+		let mut out = Vec::new();
+		let mut visited = Vec::new();
+		if self.resolve_imports_into(
+			import_paths,
+			importing,
+			origin,
+			errors,
+			&mut visited,
+			&mut out,
+		) {
+			Some(out)
+		} else {
+			None
+		}
+	}
+
+	/// Recursive worker for [`resolve_imports`](Self::resolve_imports).
+	///
+	/// Appends each resolved import to `out` with dependencies first — an
+	/// import's own `[env].imports` are resolved before the import itself —
+	/// using `visited` (a list of [`CaseId`] indices) to de-duplicate shared
+	/// imports and guard against cycles. Missing or ambiguous imports push a
+	/// [`TestLoadError`] onto `errors`. Returns `true` only if every import
+	/// resolved.
+	fn resolve_imports_into(
+		&self,
+		import_paths: &[String],
+		importing: CaseId,
+		origin: &Arc<Origin>,
+		errors: &mut Vec<TestLoadError>,
+		visited: &mut Vec<usize>,
+		out: &mut Vec<Arc<TestCase>>,
+	) -> bool {
+		let mut ok = true;
+		for import in import_paths {
+			match self.find_import(import, importing) {
+				Some(x) if x.len() == 1 => {
+					let imp = x[0].clone();
+					// Imports are executed as SurrealQL (`Datastore::execute` on
+					// the raw source), so non-SurrealQL files cannot be imported.
+					if imp.dialect != Dialect::SurrealQl {
+						errors.push(TestLoadError {
+							origin: origin.clone(),
+							error: Error::msg(format!(
+								"Import `{import}` is not a SurrealQL file; imports must be SurrealQL (.surql) files"
+							)),
+						});
+						ok = false;
+						continue;
+					}
+					// Dedup + cycle guard: skip anything already added or in progress.
+					if visited.contains(&imp.id.0) {
+						continue;
+					}
+					visited.push(imp.id.0);
+					// Resolve this import's own imports first so dependencies run
+					// before the file that depends on them.
+					let nested = &imp.config.parsed.env.imports;
+					if !nested.is_empty()
+						&& !self.resolve_imports_into(
+							nested,
+							imp.id,
+							&imp.origin,
+							errors,
+							visited,
+							out,
+						) {
+						ok = false;
+					}
+					out.push(imp);
+				}
+				Some(_) => {
+					errors.push(TestLoadError {
+						origin: origin.clone(),
+						error: Error::msg(format!(
+							"Import `{import}` refered to a file which contained multiple tests"
+						)),
+					});
+					ok = false;
+				}
+				None => {
+					errors.push(TestLoadError {
+						origin: origin.clone(),
+						error: Error::msg(format!("Could not find import `{import}`")),
+					});
+					ok = false;
+				}
+			}
+		}
+		ok
+	}
+
+	/// Loads every `.surql` (SurrealQL), `.gql` (GQL) and `.graphql`
+	/// (GraphQL) file under `root` (recursively) into a [`CaseSet`].
+	///
+	/// Each file's config comment is parsed into a [`TestCase`] keyed by its path
+	/// relative to `root`. Files whose config fails to parse are recorded in
+	/// `errors` (with their [`Origin`]) and skipped rather than aborting the whole
+	/// load, so one bad file doesn't hide the rest. Files with other extensions
+	/// are ignored.
 	pub async fn load_surrealql_files(root: &str, errors: &mut Vec<TestLoadError>) -> Result<Self> {
 		let mut cases = Vec::new();
 		let mut by_path = HashMap::new();
@@ -128,9 +269,15 @@ impl CaseSet {
 		}
 
 		walk_directory(&root, &mut async |path: &str| {
-			if !path.ends_with(".surql") {
+			let dialect = if path.ends_with(".surql") {
+				Dialect::SurrealQl
+			} else if path.ends_with(".gql") {
+				Dialect::Gql
+			} else if path.ends_with(".graphql") {
+				Dialect::GraphQl
+			} else {
 				return Ok(());
-			}
+			};
 
 			let metadata = fs::metadata(path).await.context("Could not read file metadata")?;
 
@@ -152,7 +299,7 @@ impl CaseSet {
 
 			let id = CaseId(cases.len());
 
-			match TestCase::from_source_origin_id(id, origin.clone(), source) {
+			match TestCase::from_source_origin_id(id, origin.clone(), source, dialect) {
 				Ok(x) => {
 					let case = Arc::new(x);
 					by_path.entry(path.to_string()).or_insert_with(Vec::new).push(case.clone());

@@ -224,7 +224,7 @@ pub(crate) async fn evaluate_table_select_for_doc(
 		Permission::None => Ok(false),
 		Permission::Full => Ok(true),
 		Permission::Specific(e) => {
-			let opt_no_perms = opt.new_with_perms(false);
+			let opt_no_perms = opt.new_for_permission_predicate();
 			Ok(stk
 				.run(|stk| e.compute(stk, ctx, &opt_no_perms, Some(cursor_doc)))
 				.await

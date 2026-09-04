@@ -410,6 +410,105 @@ mod http_integration {
 	}
 
 	#[test(tokio::test)]
+	async fn client_ip_extractor() -> Result<(), Box<dyn std::error::Error>> {
+		// Verify that each `--client-ip` extractor mode maps an incoming HTTP
+		// request to the right `$session.ip`. The mode is fixed at server
+		// startup, so every sub-scenario needs its own server.
+		async fn extracted_ip(
+			client_ip_mode: &str,
+			request_headers: &[(&'static str, &'static str)],
+		) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+			let (addr, _server) = common::start_server(StartServerArguments {
+				args: format!("--allow-guests --client-ip {client_ip_mode}"),
+				..Default::default()
+			})
+			.await?;
+			let url = format!("http://{addr}/sql");
+
+			let ns = Ulid::new().to_string();
+			let db = Ulid::new().to_string();
+
+			// Guest request that runs `session::ip()` with the headers under test.
+			let mut headers = reqwest::header::HeaderMap::new();
+			headers.insert("surreal-ns", ns.parse()?);
+			headers.insert("surreal-db", db.parse()?);
+			headers.insert(header::ACCEPT, "application/json".parse()?);
+			for (name, value) in request_headers {
+				headers.insert(*name, value.parse()?);
+			}
+			let client = reqwest::Client::builder()
+				.connect_timeout(Duration::from_millis(10))
+				.default_headers(headers)
+				.build()?;
+
+			// Bootstrap NS/DB with root auth so the guest query has somewhere to land.
+			ensure_namespace_and_database(&client, &addr, &ns, &db).await?;
+
+			let res = client.post(&url).body("RETURN session::ip()").send().await?;
+			assert_eq!(res.status(), 200);
+			let body: serde_json::Value = res.json().await?;
+			Ok(body[0]["result"].clone())
+		}
+
+		// Default mode (Socket): the raw socket peer IP becomes the session IP.
+		// Headers are ignored.
+		let ip = extracted_ip("socket", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::json!("127.0.0.1"), "socket mode");
+
+		// Disabled mode (None): no IP is attached even when headers are present.
+		let ip = extracted_ip("none", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::Value::Null, "none mode ignores headers");
+
+		// X-Forwarded-For: the raw header value is forwarded into the session.
+		let ip = extracted_ip("X-Forwarded-For", &[("X-Forwarded-For", "203.0.113.7")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.7"), "X-Forwarded-For mode");
+
+		// X-Forwarded-For with no header: nothing to extract, so the IP is unset.
+		let ip = extracted_ip("X-Forwarded-For", &[]).await?;
+		assert_eq!(ip, serde_json::Value::Null, "X-Forwarded-For missing header");
+
+		// X-Forwarded-For with a proxy chain: the extractor stores the raw
+		// header verbatim and does not split the list.
+		let ip = extracted_ip(
+			"X-Forwarded-For",
+			&[("X-Forwarded-For", "203.0.113.7, 198.51.100.1, 192.0.2.1")],
+		)
+		.await?;
+		assert_eq!(
+			ip,
+			serde_json::json!("203.0.113.7, 198.51.100.1, 192.0.2.1"),
+			"X-Forwarded-For stores raw header value"
+		);
+
+		// X-Real-IP: nginx-style single-IP header.
+		let ip = extracted_ip("X-Real-IP", &[("X-Real-IP", "198.51.100.42")]).await?;
+		assert_eq!(ip, serde_json::json!("198.51.100.42"), "X-Real-IP mode");
+
+		// CF-Connecting-IP: Cloudflare-specific header.
+		let ip = extracted_ip("CF-Connecting-IP", &[("CF-Connecting-IP", "203.0.113.10")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.10"), "CF-Connecting-IP mode");
+
+		// Fly-Client-IP: Fly.io-specific header.
+		let ip = extracted_ip("Fly-Client-IP", &[("Fly-Client-IP", "203.0.113.20")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.20"), "Fly-Client-IP mode");
+
+		// True-Client-IP: Akamai / Cloudflare true-client header.
+		let ip = extracted_ip("True-Client-IP", &[("True-Client-IP", "203.0.113.30")]).await?;
+		assert_eq!(ip, serde_json::json!("203.0.113.30"), "True-Client-IP mode");
+
+		// RFC 7239 `Forwarded`: parse the `for=` identifier from the first element,
+		// ignoring later elements appended by intermediaries closer to the origin.
+		let ip = extracted_ip(
+			"Forwarded",
+			&[("Forwarded", "for=192.0.2.43;by=203.0.113.43, for=198.51.100.17")],
+		)
+		.await?;
+		assert_eq!(ip, serde_json::json!("192.0.2.43"), "Forwarded mode picks first for=");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
 	async fn client_ip_none() -> Result<(), Box<dyn std::error::Error>> {
 		// `--client-ip none` short-circuits the extractor regardless of what
 		// headers (or socket address) are visible.
@@ -564,6 +663,135 @@ mod http_integration {
 
 		let res = Client::default().get(url).send().await?;
 		assert_eq!(res.status(), 200, "response: {res:#?}");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn readiness_gate_during_startup_import() -> Result<(), Box<dyn std::error::Error>> {
+		// A sleeping import keeps the instance "starting" long enough to observe the
+		// readiness gate: the listener binds immediately and `/health` (backend
+		// reachability) answers throughout, while `/ready` and query endpoints are
+		// gated with 503 until the import completes and the node is able to serve.
+		let import_file = common::tmp_file("readiness_import.surql");
+		std::fs::write(&import_file, "SLEEP 5s;")?;
+
+		// `wait_is_ready: false` hands back the server immediately, before it is
+		// ready, so the test can observe the in-progress state itself.
+		let (addr, _server) = common::start_server(StartServerArguments {
+			import_file: Some(import_file),
+			wait_is_ready: false,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		let client = Client::builder().build()?;
+		let status_url = format!("http://{addr}/status");
+		let health_url = format!("http://{addr}/health");
+		let ready_url = format!("http://{addr}/ready");
+		let sql_url = format!("http://{addr}/sql");
+
+		// The listener binds straight away (before the import), so `/status` starts
+		// answering well before the import finishes.
+		let mut bound = false;
+		for _ in 0..150 {
+			if let Ok(res) = client.get(&status_url).send().await
+				&& res.status() == 200
+			{
+				bound = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(bound, "the listener should bind before the startup import completes");
+
+		// While the import is still running: liveness and backend reachability are
+		// OK, but readiness is not, and user-facing query endpoints are gated.
+		assert_eq!(client.get(&status_url).send().await?.status(), 200, "/status during import");
+		assert_eq!(client.get(&health_url).send().await?.status(), 200, "/health during import");
+		assert_eq!(client.get(&ready_url).send().await?.status(), 503, "/ready during import");
+		let sql_during = client
+			.post(&sql_url)
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(sql_during.status(), 503, "queries should be gated during the import");
+
+		// Wait for the import to complete; the instance then reports ready.
+		let mut ready = false;
+		for _ in 0..150 {
+			if client.get(&ready_url).send().await?.status() == 200 {
+				ready = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(ready, "/ready should return 200 once the startup import completes");
+
+		// Once ready, `/health` still answers and queries are actually served.
+		assert_eq!(client.get(&health_url).send().await?.status(), 200, "/health after import");
+		let sql_after = client
+			.post(&sql_url)
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(sql_after.status(), 200, "queries should be served once ready");
+
+		Ok(())
+	}
+
+	#[test(tokio::test)]
+	async fn no_import_server_is_ready_at_bind() -> Result<(), Box<dyn std::error::Error>> {
+		// A server without a startup import has no deferred work, so it must be
+		// ready the instant its listener binds. Clients that connect immediately
+		// (without polling `/ready`, as the SDKs do) must not be gated with 503.
+		let (addr, _server) = common::start_server(StartServerArguments {
+			wait_is_ready: false,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+		let client = Client::builder().build()?;
+		let status_url = format!("http://{addr}/status");
+
+		// Wait only for the listener to bind — not for readiness.
+		let mut bound = false;
+		for _ in 0..150 {
+			if let Ok(res) = client.get(&status_url).send().await
+				&& res.status() == 200
+			{
+				bound = true;
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert!(bound, "server did not bind its listener");
+
+		// `ready` is set synchronously before binding for a no-import server, so
+		// `/ready` is already 200 and queries are served the moment it binds.
+		assert_eq!(
+			client.get(format!("http://{addr}/ready")).send().await?.status(),
+			200,
+			"a no-import server should be ready as soon as it binds"
+		);
+		let sql = client
+			.post(format!("http://{addr}/sql"))
+			.basic_auth(USER, Some(PASS))
+			.header(header::ACCEPT, "application/json")
+			.body("INFO FOR ROOT")
+			.send()
+			.await?;
+		assert_eq!(
+			sql.status(),
+			200,
+			"queries should be served immediately for a no-import server"
+		);
 
 		Ok(())
 	}

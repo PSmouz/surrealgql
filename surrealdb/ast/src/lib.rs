@@ -507,6 +507,7 @@ ast_type! {
 ast_type! {
 	pub struct Relate{
 		pub only: bool,
+		pub or_update: bool,
 		pub from: NodeId<Expr>,
 		pub through: NodeId<Expr>,
 		pub to: NodeId<Expr>,

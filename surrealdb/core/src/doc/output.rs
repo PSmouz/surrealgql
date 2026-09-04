@@ -323,24 +323,41 @@ impl Document {
 		if !ctx.check_perms(opt, Action::View)? {
 			return Ok(());
 		}
-		// Loop through all field statements
+		// Apply each field's select permission to the PROJECTED output.
+		// `reduce_document` already filtered the stored fields, so this
+		// post-projection pass must be IDEMPOTENT. SECURITY: read `each`
+		// and the `$value` pick from a stable snapshot of `out` (not the
+		// un-reduced `self.current`) so array-element paths stay aligned
+		// with the array we cut — otherwise a denied element is removed a
+		// second time at a shifted index, dropping a permitted sibling
+		// (issue #7356). Cuts accumulate on `out`; the snapshot is cloned
+		// lazily so tables with no element-bearing permissions pay nothing.
+		let mut snapshot: Option<Value> = None;
 		for fd in self.doc_ctx.fd()?.iter() {
 			// SECURITY: apply the field's AUTH LIMIT before evaluating
 			// PERMISSIONS FOR select so the predicate runs under the
 			// definer's downgraded auth, not the caller's. Mirrors the
 			// pluck.rs / field.rs paths.
 			let opt = AuthLimit::try_from(&fd.auth_limit)?.limit_opt(opt);
-			// Loop over each field in document
-			for k in out.each(&fd.name).iter() {
-				// Process the field permissions
-				match &fd.select_permission {
-					Permission::Full => (),
-					Permission::None => out.cut(k),
-					Permission::Specific(e) => {
-						// Disable permissions
-						let opt = &opt.new_with_perms(false);
-						// Get the current value
-						let val = Arc::new(self.current.doc.as_ref().pick(k));
+			// Process the field permissions
+			match &fd.select_permission {
+				Permission::Full => (),
+				Permission::None => {
+					let original = snapshot.get_or_insert_with(|| out.clone());
+					// SECURITY: iterate in reverse so `Value::cut`'s `Vec::remove`
+					// shift doesn't invalidate the pending array indices (#7356).
+					for k in original.each(&fd.name).iter().rev() {
+						out.cut(k);
+					}
+				}
+				Permission::Specific(e) => {
+					let original = snapshot.get_or_insert_with(|| out.clone());
+					// SECURITY: iterate in reverse (see the None arm above, #7356).
+					for k in original.each(&fd.name).iter().rev() {
+						// Disable permission recursion and block side effects
+						let opt = &opt.new_for_permission_predicate();
+						// Get the projected value from the snapshot
+						let val = Arc::new(original.pick(k));
 						// Configure the context
 						let mut child_ctx = Context::new_child(ctx);
 						child_ctx.add_value("value", val);

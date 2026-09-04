@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "GraphQL bulk delete mutation removes matching records and returns the count"
+
+[[test.results]]
+value = "{ deletePosts: 2 }"
+*/
+mutation {
+	deletePosts(where: { published: { eq: true } })
+}

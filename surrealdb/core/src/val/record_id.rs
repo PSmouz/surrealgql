@@ -196,8 +196,9 @@ impl_kv_value_revisioned!(RecordIdKey);
 impl RecordIdKey {
 	/// Generate a new random ID
 	pub fn rand() -> Self {
-		let mut rng = rand::rng();
-		let id: String = (0..20).map(|_| *ID_CHARS[..].choose(&mut rng).unwrap_or(&'0')).collect();
+		let id: String = crate::rnd::with_rng(|rng| {
+			(0..20).map(|_| *ID_CHARS[..].choose(&mut *rng).unwrap_or(&'0')).collect()
+		});
 		Self::String(id.into())
 	}
 	/// Generate a new random ULID
@@ -411,13 +412,6 @@ impl RecordId {
 		RecordId {
 			table,
 			key: key.into(),
-		}
-	}
-
-	pub fn random_for_table(table: TableName) -> Self {
-		RecordId {
-			table,
-			key: RecordIdKey::rand(),
 		}
 	}
 

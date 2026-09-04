@@ -113,6 +113,13 @@ pub struct EvalContext<'a> {
 	/// otherwise be infinite recursion (e.g. `$this.id.prop` on a record
 	/// whose computed field accesses `$this.id.prop`).
 	pub computing_record: Option<RecordId>,
+
+	/// Expression-nesting depth recorded at plan time for a re-entry node (an
+	/// `eval` / user-defined-function body). Carries the planner's depth across
+	/// the analyse→execute→re-analyse boundary so that lazily-planned bodies and
+	/// re-planned `eval` strings continue counting toward `max_computation_depth`
+	/// instead of resetting to 0. Zero for ordinary per-row evaluation.
+	pub plan_depth: u32,
 }
 
 impl<'a> EvalContext<'a> {
@@ -128,6 +135,7 @@ impl<'a> EvalContext<'a> {
 			document_root: None,
 			skip_fetch_perms: exec_ctx.root().skip_fetch_perms,
 			computing_record: None,
+			plan_depth: 0,
 		}
 	}
 
@@ -141,6 +149,7 @@ impl<'a> EvalContext<'a> {
 			document_root: self.document_root,
 			skip_fetch_perms: self.skip_fetch_perms,
 			computing_record: self.computing_record.clone(),
+			plan_depth: self.plan_depth,
 		}
 	}
 
@@ -156,6 +165,7 @@ impl<'a> EvalContext<'a> {
 			document_root: Some(value),
 			skip_fetch_perms: self.skip_fetch_perms,
 			computing_record: self.computing_record.clone(),
+			plan_depth: self.plan_depth,
 		}
 	}
 
@@ -169,6 +179,7 @@ impl<'a> EvalContext<'a> {
 			document_root: self.document_root,
 			skip_fetch_perms: self.skip_fetch_perms,
 			computing_record: self.computing_record.clone(),
+			plan_depth: self.plan_depth,
 		}
 	}
 

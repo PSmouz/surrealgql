@@ -21,7 +21,8 @@ use crate::expr::{
 	Base, Expr, FlowResultExt, Idiom, Kind, KindLiteral, Literal, Part, RecordIdKeyLit,
 };
 use crate::iam::{Action, AuthLimit, ResourceKind};
-use crate::kvs::Transaction;
+use crate::idx::planner::ScanDirection;
+use crate::kvs::{NORMAL_BATCH_SIZE, Transaction};
 use crate::val::{TableName, Value};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
@@ -161,6 +162,15 @@ impl DefineFieldStatement {
 		// Allowed to run?
 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Field, Base::Db)?;
 
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			return Err(Error::PermissionClauseNotReadonly {
+				kind: "field",
+				name: definition.name.to_sql(),
+			}
+			.into());
+		}
+
 		// Validate any GRAPHQL_ALIAS at definition time so typos surface here
 		// rather than silently falling back at schema-generation time.
 		super::validate_graphql_alias(&self.graphql_alias, "field")?;
@@ -182,7 +192,7 @@ impl DefineFieldStatement {
 		self.disallow_mismatched_types(ctx, ns, db, &definition).await?;
 
 		// Validate id field restrictions
-		self.validate_id_restrictions(&definition)?;
+		validate_id_field_restrictions(&definition)?;
 
 		// Validate FLEXIBLE restrictions
 		self.validate_flexible_restrictions(ctx, ns, db, &definition).await?;
@@ -198,12 +208,13 @@ impl DefineFieldStatement {
 		// path silently overwrites the first.
 		let fd = definition.name.to_raw_string();
 		// Check if the definition exists
-		if let Some(fd) = txn.get_tb_field(ns, db, &tb.name, &fd, None).await? {
+		let existing = txn.get_tb_field(ns, db, &tb.name, &fd, None).await?;
+		if let Some(existing) = &existing {
 			match self.kind {
 				DefineKind::Default => {
 					if !opt.import {
 						bail!(Error::FdAlreadyExists {
-							name: fd.name.to_sql(),
+							name: existing.name.to_sql(),
 						});
 					}
 				}
@@ -216,6 +227,18 @@ impl DefineFieldStatement {
 
 		// Process the statement
 		txn.put_tb_field(ns, db, &tb.name, &definition).await?;
+
+		// Overwriting an existing reference field can drop target tables it used
+		// to reference (the REFERENCE clause removed, or the record kind narrowed
+		// or changed); purge the now-stranded reference keys so the DELETE
+		// reference-purge gate stays sound. Skipped during import, which restores
+		// reference keys verbatim.
+		if !opt.import
+			&& let Some(existing) = &existing
+		{
+			purge_dropped_reference_keys(&txn, ns, db, &tb.name, existing, Some(&definition))
+				.await?;
+		}
 
 		// Refresh the table cache
 		let mut tb = TableDefinition {
@@ -597,38 +620,6 @@ impl DefineFieldStatement {
 		Ok(())
 	}
 
-	pub(crate) fn validate_id_restrictions(
-		&self,
-		definition: &catalog::FieldDefinition,
-	) -> Result<()> {
-		if definition.name.is_id() {
-			// Ensure no `VALUE` clause is specified
-			ensure!(self.value.is_none(), Error::IdFieldKeywordConflict("VALUE".into()));
-
-			// Ensure no `REFERENCE` clause is specified
-			ensure!(self.reference.is_none(), Error::IdFieldKeywordConflict("REFERENCE".into()));
-
-			// Ensure no `COMPUTED` clause is specified
-			ensure!(self.computed.is_none(), Error::IdFieldKeywordConflict("COMPUTED".into()));
-
-			// Ensure no `DEFAULT` clause is specified
-			ensure!(
-				matches!(self.default, DefineDefault::None),
-				Error::IdFieldKeywordConflict("DEFAULT".into())
-			);
-
-			// Ensure the field is not a record type
-			if let Some(ref kind) = self.field_kind {
-				ensure!(
-					RecordIdKeyLit::kind_supported(kind),
-					Error::IdFieldUnsupportedKind(kind.to_sql())
-				);
-			}
-		}
-
-		Ok(())
-	}
-
 	pub(crate) async fn validate_flexible_restrictions(
 		&self,
 		ctx: &FrozenContext,
@@ -654,4 +645,123 @@ impl DefineFieldStatement {
 
 		Ok(())
 	}
+}
+
+/// Purge the reference keys a field wrote under target tables it no longer
+/// references after a schema change (`REMOVE FIELD`, `ALTER FIELD`, or
+/// `DEFINE FIELD ... OVERWRITE`).
+///
+/// Reference keys are stored under the *referenced* (target) record's range,
+/// keyed by the referencing `(table, field)` rather than under the field's own
+/// definition (see `Document::process_reference_clause`). So when a field's
+/// `REFERENCE` clause is dropped, or its record kind is narrowed or changed,
+/// the keys it wrote for the now-unreachable target tables are not removed by
+/// rewriting the field definition. Left behind they are orphaned: a later
+/// `DELETE` of a referenced record skips the purge scan (because
+/// `table_may_have_incoming_references` reports that no current field can
+/// target that table), so on record-id reuse or re-definition the stale key
+/// could resurface in a `<~` reference lookup or drive the wrong `ON DELETE`
+/// action. Cleaning them at the schema change keeps that DELETE purge gate
+/// sound: "no current reference field can target this table" then truly
+/// implies "no reference keys exist for it".
+///
+/// `old` is the field definition before the change; `new` is the definition
+/// after it (`None` when the field is being removed). Only target tables that
+/// `old` could reference but `new` cannot are scanned. This runs on rare DDL,
+/// so scanning the candidate target ranges is acceptable and avoids
+/// maintaining a reverse index.
+/// Enforce the clauses that are not permitted on the `id` field. Shared by
+/// DEFINE FIELD and ALTER FIELD so both reject the same set on `id`: `VALUE`,
+/// `REFERENCE`, `COMPUTED`, `DEFAULT ALWAYS`, `READONLY`, `FLEXIBLE`, and any
+/// `TYPE` that is not a valid record-id key kind.
+///
+/// A plain `DEFAULT` and an `ASSERT` are allowed: both are applied to the
+/// record-id key at key-generation time in `Document::generate_record_id`
+/// (the `ASSERT` binds the key to `$key`). Operates on the catalog definition
+/// so DEFINE and ALTER validate the same resolved state.
+pub(crate) fn validate_id_field_restrictions(def: &catalog::FieldDefinition) -> Result<()> {
+	if !def.name.is_id() {
+		return Ok(());
+	}
+	// `VALUE`, `REFERENCE`, and `COMPUTED` are meaningless or unsafe on an
+	// immutable primary key.
+	ensure!(def.value.is_none(), Error::IdFieldKeywordConflict("VALUE".into()));
+	ensure!(def.reference.is_none(), Error::IdFieldKeywordConflict("REFERENCE".into()));
+	ensure!(def.computed.is_none(), Error::IdFieldKeywordConflict("COMPUTED".into()));
+	// A plain `DEFAULT` supplies the id when none is given; `DEFAULT ALWAYS`
+	// would recompute it on every update, which is nonsensical for an
+	// immutable id.
+	ensure!(
+		!matches!(def.default, catalog::DefineDefault::Always(_)),
+		Error::IdFieldKeywordConflict("DEFAULT ALWAYS".into())
+	);
+	// The id is implicitly immutable (`READONLY` is redundant) and a record-id
+	// key is not an object (`FLEXIBLE` is meaningless).
+	ensure!(!def.readonly, Error::IdFieldKeywordConflict("READONLY".into()));
+	ensure!(!def.flexible, Error::IdFieldKeywordConflict("FLEXIBLE".into()));
+	// The declared `TYPE` must be representable as a record-id key.
+	if let Some(ref kind) = def.field_kind {
+		ensure!(RecordIdKeyLit::kind_supported(kind), Error::IdFieldUnsupportedKind(kind.to_sql()));
+	}
+	Ok(())
+}
+
+pub(crate) async fn purge_dropped_reference_keys(
+	txn: &Transaction,
+	ns: NamespaceId,
+	db: DatabaseId,
+	ft: &TableName,
+	old: &FieldDefinition,
+	new: Option<&FieldDefinition>,
+) -> Result<()> {
+	// Only a field that previously declared a REFERENCE wrote reference keys.
+	if old.reference.is_none() {
+		return Ok(());
+	}
+	// `ff` is the referencing field name exactly as `process_reference_clause`
+	// encoded it into each key's `ff` slot.
+	let ff = old.name.to_sql();
+	let old_kind = old.field_kind.as_ref();
+	for target in txn.all_tb(ns, db, None).await?.iter() {
+		let target = &target.name;
+		// Reference keys live under their target table, so only tables the old
+		// kind could hold a record of can carry this field's keys (an untyped
+		// `record` could target any table).
+		let old_can_target = old_kind.is_none_or(|k| k.reference_can_target(target));
+		if !old_can_target {
+			continue;
+		}
+		// Keep the keys the new definition still references.
+		let new_can_target = new.is_some_and(|n| {
+			n.reference.is_some()
+				&& n.field_kind.as_ref().is_none_or(|k| k.reference_can_target(target))
+		});
+		if new_can_target {
+			continue;
+		}
+		// Collect the matching keys first, then delete them, so the range is
+		// never mutated while the cursor is still scanning it.
+		let beg = crate::key::r#ref::prefix_tb(ns, db, target)?;
+		let end = crate::key::r#ref::suffix_tb(ns, db, target)?;
+		let mut orphaned: Vec<Vec<u8>> = Vec::new();
+		let mut cursor = txn.open_keys_cursor(beg..end, ScanDirection::Forward, 0, None).await?;
+		loop {
+			let batch = cursor.next_batch(NORMAL_BATCH_SIZE).await?;
+			if batch.is_empty() {
+				break;
+			}
+			for raw in batch.iter() {
+				let key = crate::key::r#ref::Ref::decode_key(raw)?;
+				if key.ft.as_ref() == ft && key.ff.as_ref() == ff.as_str() {
+					orphaned.push(raw.to_vec());
+				}
+			}
+		}
+		drop(cursor);
+		for raw in &orphaned {
+			let key = crate::key::r#ref::Ref::decode_key(raw)?;
+			txn.del(&key).await?;
+		}
+	}
+	Ok(())
 }

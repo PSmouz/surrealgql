@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (PR-B): a multi-hop fully-unlabeled pattern whose only bound variable is its FAR node would require walking the chain in reverse from a bound far node, which the PR-B planner does not do (it only reverses a single hop). Rejected cleanly with 'not supported yet' instead of a planner internal error (V2_DESIGN §6). (No schema import: a lowering rejection is evaluated before any data.)"
+
+[test.results]
+parsing-error = """
+This MATCH pattern shape is not supported yet
+  --> [15:40]
+   |
+15 | MATCH (a:person)-[:knows]->(b:person), (c)-[]->(d)-[]->(b) RETURN a.name AS a
+   |                                        ^^^ anchor the pattern on a labelled start node `(n:label)`, a single labelled edge, or a node variable bound by an earlier pattern used as the pattern's start
+"""
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (c)-[]->(d)-[]->(b) RETURN a.name AS a

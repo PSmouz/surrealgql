@@ -64,8 +64,41 @@ pub fn init(dbs: Arc<Datastore>, canceller: CancellationToken, opts: &EngineOpti
 	let task5 = spawn_task_index_compaction(Arc::clone(&dbs), canceller.clone(), opts);
 	let task6 = spawn_task_event_processing(Arc::clone(&dbs), canceller.clone(), opts);
 	let task7 = spawn_task_tikv_gc(Arc::clone(&dbs), canceller.clone(), opts);
-	let task8 = spawn_task_tikv_lock_cleanup(dbs, canceller, opts);
-	Tasks(vec![task1, task2, task3, task4, task5, task6, task7, task8])
+	let task8 = spawn_task_tikv_lock_cleanup(Arc::clone(&dbs), canceller.clone(), opts);
+	let task9 = spawn_task_reclaim_tombstones(Arc::clone(&dbs), canceller.clone(), opts);
+	let task10 = spawn_task_resume_index_builds(Arc::clone(&dbs), canceller.clone(), opts);
+	let task11 = spawn_task_live_query_router(dbs, canceller, opts);
+	Tasks(vec![task1, task2, task3, task4, task5, task6, task7, task8, task9, task10, task11])
+}
+
+/// Spawns the per-node live-query router task.
+///
+/// Under the `Router` live-query engine this tails the dedicated `lqe` keyspace
+/// and delivers notifications off the write path; under the default `Inline`
+/// engine each tick is a cheap no-op (the datastore method returns immediately).
+/// The cadence bounds steady-state delivery latency, so it ticks frequently.
+fn spawn_task_live_query_router(
+	dbs: Arc<Datastore>,
+	canceller: CancellationToken,
+	opts: &EngineOptions,
+) -> Task {
+	let interval = opts.live_query_router_interval;
+	Box::pin(spawn(async move {
+		trace!("Running the live-query router every {interval:?}");
+		let mut ticker = interval_ticker(interval).await;
+		loop {
+			tokio::select! {
+				biased;
+				_ = canceller.cancelled() => break,
+				Some(_) = ticker.next() => {
+					if let Err(e) = dbs.live_query_router_process().await {
+						error!("Error running the live-query router: {e}");
+					}
+				}
+			}
+		}
+		trace!("Background task exited: Running the live-query router");
+	}))
 }
 
 fn spawn_task_node_membership_refresh(
@@ -250,6 +283,94 @@ fn spawn_task_index_compaction(
 			}
 		}
 		trace!("Background task exited: Running index compaction");
+	}))
+}
+
+/// Spawns the periodic task that resumes stalled index builds.
+///
+/// A `CONCURRENTLY` index build is a detached task, so if its owning node dies
+/// mid-build the durable build state is stranded in `Building`/`Closing` and the
+/// index reports `status: indexing` with a frozen counter forever. This task
+/// periodically adopts such builds (once the owner lease has expired) and drives
+/// them to completion. An interval of `Duration::ZERO` disables it so operators
+/// can recover stalled builds manually with `REBUILD INDEX`.
+fn spawn_task_resume_index_builds(
+	dbs: Arc<Datastore>,
+	canceller: CancellationToken,
+	opts: &EngineOptions,
+) -> Task {
+	let interval = opts.index_build_resume_interval;
+	Box::pin(spawn(async move {
+		if interval.is_zero() {
+			trace!("Index build resume task disabled (interval=0)");
+			return;
+		}
+		trace!("Resuming stalled index builds every {interval:?}");
+		let mut ticker = interval_ticker(interval).await;
+		loop {
+			tokio::select! {
+				biased;
+				_ = canceller.cancelled() => break,
+				Some(_) = ticker.next() => {
+					if let Err(e) = dbs.resume_stalled_index_builds(interval, canceller.clone()).await {
+						if canceller.is_cancelled() {
+							break;
+						}
+						error!("Error resuming stalled index builds: {e}");
+					}
+				}
+			}
+		}
+		trace!("Background task exited: Resuming stalled index builds");
+	}))
+}
+
+/// Spawns the periodic background reclaim of tombstoned data.
+///
+/// `REMOVE NAMESPACE/DATABASE/INDEX` delete only the catalog definition and
+/// enqueue the data prefix for reclaim; this task periodically destroys the
+/// orphaned data out-of-band (via `unsafe_destroy_range` on TiKV or a
+/// transactional prefix delete on other backends), so the `REMOVE` statement
+/// returns immediately. The task runs at `opts.reclaim_interval`.
+fn spawn_task_reclaim_tombstones(
+	dbs: Arc<Datastore>,
+	canceller: CancellationToken,
+	opts: &EngineOptions,
+) -> Task {
+	// Get the delay interval and snapshot-safety grace from the config.
+	let interval = opts.reclaim_interval;
+	// Clamp the grace up to at least the TiKV GC lifetime: on TiKV,
+	// `unsafe_destroy_range` bypasses MVCC, so data must not be reclaimed while a
+	// snapshot older than the GC safepoint (`now - tikv_gc_lifetime`) could still
+	// read it. Deriving the effective grace here means a longer `--tikv-gc-lifetime`
+	// can never be undercut by leaving `--reclaim-grace` at its default.
+	let grace = opts.reclaim_grace.max(opts.tikv_gc_lifetime);
+	// Spawn a future
+	Box::pin(spawn(async move {
+		// Log the interval frequency
+		trace!("Running tombstone reclaim every {interval:?} (grace {grace:?})");
+		// Create a new time-based interval ticket
+		let mut ticker = interval_ticker(interval).await;
+		// Loop continuously until the task is cancelled
+		loop {
+			tokio::select! {
+				biased;
+				// Check if this has shutdown
+				_ = canceller.cancelled() => break,
+				// Receive a notification on the channel
+				Some(_) = ticker.next() => {
+					if let Err(e) =
+						Datastore::reclaim_tombstones(Arc::clone(&dbs), interval, grace, canceller.clone()).await
+					{
+						if canceller.is_cancelled() {
+							break;
+						}
+						error!("Error running tombstone reclaim: {e}");
+					}
+				}
+			}
+		}
+		trace!("Background task exited: Running tombstone reclaim");
 	}))
 }
 

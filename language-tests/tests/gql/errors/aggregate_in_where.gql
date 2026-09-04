@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: aggregate functions may not appear in a WHERE predicate."
+
+[test.results]
+parsing-error = """
+Aggregate functions are only allowed in RETURN items and ORDER BY keys
+  --> [15:24]
+   |
+15 | MATCH (n:person) WHERE count(n) > 0 RETURN n
+   |                        ^^^^^^^^ an aggregate cannot appear in WHERE, GROUP BY, or inside another aggregate
+"""
+*/
+
+MATCH (n:person) WHERE count(n) > 0 RETURN n

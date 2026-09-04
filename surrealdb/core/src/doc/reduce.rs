@@ -168,17 +168,25 @@ impl Document {
 			// PERMISSIONS FOR select so the predicate runs under the
 			// definer's downgraded auth, not the caller's.
 			let opt = AuthLimit::try_from(&fd.auth_limit)?.limit_opt(opt);
+			// SECURITY: `each` yields paths in ascending array-index order, and
+			// `Value::cut` removes an element via `Vec::remove`, which shifts
+			// every later index down. Cutting in forward order would make each
+			// removal invalidate the remaining indices, leaking the odd-indexed
+			// elements (issue #7356). Iterate in reverse so a higher index is
+			// always removed before any lower index that is still pending.
+			// Predicates read from `original` (immutable), so evaluation order
+			// is irrelevant.
 			match &fd.select_permission {
 				Permission::Full => (),
 				Permission::None => {
-					for k in original.doc.as_ref().each(&fd.name).iter() {
+					for k in original.doc.as_ref().each(&fd.name).iter().rev() {
 						doc.doc.to_mut().cut(k);
 					}
 				}
 				Permission::Specific(e) => {
-					for k in original.doc.as_ref().each(&fd.name).iter() {
-						// Disable permissions
-						let opt = &opt.new_with_perms(false);
+					for k in original.doc.as_ref().each(&fd.name).iter().rev() {
+						// Disable permission recursion and block side effects
+						let opt = &opt.new_for_permission_predicate();
 						// Get the computed value
 						let val = Arc::new(original.doc.as_ref().pick(k));
 						// Configure the context
@@ -222,15 +230,21 @@ impl Document {
 			// definer's downgraded auth, not the caller's. Mirrors the
 			// pluck.rs / field.rs paths.
 			let opt = AuthLimit::try_from(&fd.auth_limit)?.limit_opt(opt);
-			// Loop over each field in document
-			for k in reduced.as_ref().each(&fd.name).iter() {
+			// Loop over each field in document. SECURITY: iterate in reverse —
+			// `each` yields ascending array indices and `Value::cut` removes via
+			// `Vec::remove` (shifting later indices down), so a forward pass
+			// would let each removal invalidate the pending indices and leak the
+			// odd-indexed elements (issue #7356). Removing higher indices first
+			// keeps the not-yet-processed lower indices valid; predicates read
+			// from the immutable `full`, so evaluation order is irrelevant.
+			for k in reduced.as_ref().each(&fd.name).iter().rev() {
 				// Process the field permissions
 				match &fd.select_permission {
 					Permission::Full => (),
 					Permission::None => reduced.to_mut().cut(k),
 					Permission::Specific(e) => {
-						// Disable permissions
-						let opt = &opt.new_with_perms(false);
+						// Disable permission recursion and block side effects
+						let opt = &opt.new_for_permission_predicate();
 						// Get the initial value
 						let val = Arc::new(full.doc.as_ref().pick(k));
 						// Configure the context

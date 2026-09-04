@@ -287,8 +287,8 @@ impl<'a> BucketController<'a> {
 				}
 				Permission::Full => (),
 				Permission::Specific(e) => {
-					// Disable permissions
-					let opt = &self.opt.new_with_perms(false);
+					// Disable permission recursion and block side effects
+					let opt = &self.opt.new_for_permission_predicate();
 
 					// Add $action, $file and $target to context
 					let mut ctx = Context::new_child(self.ctx);

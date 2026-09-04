@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "E8 through GQL: an ordering comparison on a missing property is UNKNOWN and excludes the row (person:3 has no age), unlike raw SurrealQL where NONE < 25 is true."
+
+[[test.results]]
+value = "[{ name: 'B' }]"
+*/
+
+MATCH (n:person) WHERE n.age < 25 RETURN n.name AS name ORDER BY name

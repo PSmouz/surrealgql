@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Reverse-anchored selective search: the search pattern is bound on its far node `b` (= Z) and its start `a` is free, so the traversal runs the segment backwards from Z. Per-endpoint grouping and path length are symmetric, so `ANY SHORTEST` still yields one shortest path per (a, Z) endpoint pair — `a` binds to the pattern's start (X/Y1/Y2/Y3/Y4 all reach Z). The operator flips the path/group back to written order; here only the endpoints are projected."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Z' }, { an: 'Y1', bn: 'Z' }, { an: 'Y2', bn: 'Z' }, { an: 'Y3', bn: 'Z' }, { an: 'Y4', bn: 'Z' }]"
+*/
+
+MATCH (b:wp WHERE b.name = 'Z'), ANY SHORTEST (a)-[:road]->+(b)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

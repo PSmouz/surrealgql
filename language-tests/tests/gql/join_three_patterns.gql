@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Three comma-separated patterns chained on shared nodes (a-b, b-c, c-d) in ONE MATCH statement: the planner equi-joins pattern 2 onto pattern 1 on `b`, then pattern 3 on `c`. DIFFERENT EDGES (R2) spans all three edges of the single statement, so every surviving row uses three pairwise-distinct knows edges. Over the person->person knows graph (k12:A->B, k21:B->A, k23:B->C, k31:C->A) the 3-hop chains with three distinct edges are A->B->C->A, B->A->B->C, B->C->A->B, C->A->B->A, C->A->B->C; chains that would reuse an edge (e.g. A->B->A->B reusing k12) are dropped. Returning the (a,d) endpoints gives (A,A),(B,B),(B,C),(C,A),(C,C)."
+
+[[test.results]]
+value = "[{ a: 'A', d: 'A' }, { a: 'B', d: 'B' }, { a: 'B', d: 'C' }, { a: 'C', d: 'A' }, { a: 'C', d: 'C' }]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person), (b)-[:knows]->(c:person), (c)-[:knows]->(d:person)
+RETURN a.name AS a, d.name AS d ORDER BY a, d

@@ -1,7 +1,4 @@
 [env]
-RUSTFLAGS = { value = "--cfg tokio_unstable", condition = { env_not_set = [
-    "RUSTFLAGS",
-] } }
 BENCH_WORKER_THREADS = { value = "1", condition = { env_not_set = [
     "BENCH_WORKER_THREADS",
 ] } }
@@ -200,7 +197,7 @@ args = [
     "surrealdb-server",
     "--each-feature",
     "--exclude-features",
-    "storage-indxdb",
+    "storage-indxdb,tokio-console",
     "--include-features",
     "storage-mem",
     "--exclude-no-default-features",
@@ -348,7 +345,6 @@ args = [
     "ml_integration",
     "--",
     "ml_integration",
-    "--nocapture",
 ]
 
 [tasks.ci-graphql-integration]
@@ -368,12 +364,30 @@ args = [
     "graphql_integration",
     "--",
     "graphql_integration",
-    "--nocapture",
+]
+
+[tasks.ci-gql-integration]
+category = "CI - INTEGRATION TESTS"
+description = "Run GQL integration tests"
+command = "cargo"
+env = { RUST_BACKTRACE = 1, RUST_LOG = { value = "cli_integration::common=debug", condition = { env_not_set = [
+    "RUST_LOG",
+] } } }
+args = [
+    "test",
+    "--locked",
+    "--features",
+    "storage-mem",
+    "--workspace",
+    "--test",
+    "gql_integration",
+    "--",
+    "gql_integration",
 ]
 
 [tasks.ci-integration-all]
 category = "CI - INTEGRATION TESTS"
-description = "Single compile: CLI, HTTP, WS, ML, and GraphQL integration suites"
+description = "Single compile: CLI, HTTP, WS, ML, GraphQL, and GQL integration suites"
 command = "cargo"
 env = { RUST_BACKTRACE = 1 }
 args = [
@@ -383,8 +397,7 @@ args = [
     "--workspace",
     "--no-default-features",
     "--features",
-    "storage-mem,storage-surrealkv,http,scripting,jwks,cli,ml,graphql",
-    "--nocapture",
+    "storage-mem,storage-surrealkv,http,scripting,jwks,cli,ml,graphql,gql",
     "--test",
     "cli_integration",
     "--test",
@@ -395,6 +408,8 @@ args = [
     "ml_integration",
     "--test",
     "graphql_integration",
+    "--test",
+    "gql_integration",
 ]
 
 # --------------------------------------------------
@@ -573,10 +588,10 @@ script = """
     else
         cargo build
     fi
-    if [ "${_TEST_API_ENGINE}" = "surrealkv" ] || [ "${_TEST_API_ENGINE}" = "rocksdb" ] || [ "${_TEST_API_ENGINE}" = "tikv" ]; then
+    if [ "${_TEST_API_ENGINE}" = "tikv" ]; then
         ./target/debug/surrealql-test --color always run --no-wip --jobs 1 --backend ${_TEST_API_ENGINE}
     else
-        ./target/debug/surrealql-test --color always run --no-wip --jobs 3 --backend ${_TEST_API_ENGINE}
+        ./target/debug/surrealql-test --color always run --no-wip --jobs 12 --backend ${_TEST_API_ENGINE}
     fi
 """
 
@@ -644,7 +659,7 @@ category = "CI - LANGUAGE TESTS"
 description = "Run SurrealQL language upgrade tests, hopping through adjacent version pairs"
 script = """
 #!/bin/bash -ex
-# Override _TEST_LANG_UPGRADE_JOBS to tune per-runner concurrency (default 4).
+# Override _TEST_LANG_UPGRADE_JOBS to tune per-runner concurrency (default 12).
 cd language-tests
 cargo build --features "${_TEST_LANG_FEATURES}"
 IFS=',' read -ra V <<< "${LANG_UPGRADE_VERSIONS}"
@@ -654,7 +669,7 @@ for ((i=0; i<${#V[@]}-1; i++)); do
         --from "${V[$i]}" --to "${V[$((i+1))]}" \\
         --backend "${_TEST_API_ENGINE}" \\
         --allow-download --no-wip \\
-        --jobs "${_TEST_LANG_UPGRADE_JOBS:-4}"
+        --jobs "${_TEST_LANG_UPGRADE_JOBS:-12}"
 done
 """
 
@@ -686,14 +701,13 @@ dependencies = [
 category = "CI - WORKSPACE TESTS"
 description = "Run workspace library tests"
 command = "cargo"
-env = { CARGO_BUILD_JOBS = "8" }
 args = [
     "nextest",
     "run",
     "--locked",
     "--no-default-features",
     "--features",
-    "allocator,allocation-tracking,storage-mem,storage-rocksdb,scripting,http,jwks,surrealism",
+    "allocator,allocation-tracking,storage-mem,storage-rocksdb,scripting,http,jwks,surrealism,gql",
     "--workspace",
     "--exclude", "demo",
     "--exclude", "surrealdb-profiling",
@@ -704,6 +718,7 @@ args = [
     "--skip", "ws_integration",
     "--skip", "ml_integration",
     "--skip", "graphql_integration",
+    "--skip", "gql_integration",
     "--skip", "database_upgrade",
 ]
 
@@ -721,7 +736,7 @@ args = [
     "--locked",
     "--no-default-features",
     "--features",
-    "allocator,allocation-tracking,storage-mem,scripting,http,jwks,cli,graphql",
+    "allocator,allocation-tracking,storage-mem,scripting,http,jwks,cli,graphql,gql",
     "--workspace",
 ]
 

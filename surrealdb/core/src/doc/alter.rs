@@ -4,48 +4,100 @@ use anyhow::{Result, bail, ensure};
 use reblessive::tree::Stk;
 use surrealdb_types::ToSql;
 
-use crate::catalog::{LATEST_EDGE_VARIANT, RecordType};
+use crate::catalog::{DefineDefault, LATEST_EDGE_VARIANT, RecordType};
 use crate::ctx::{Context, FrozenContext};
 use crate::dbs::{Options, Statement};
-use crate::doc::{Document, Extras};
+use crate::doc::{CursorDoc, Document, Extras};
 use crate::err::Error;
 use crate::expr::data::Data;
 use crate::expr::paths::{ID, IN, OUT};
-use crate::expr::{AssignOperator, FlowResultExt, Idiom, Part};
-use crate::val::{RecordId, Value};
+use crate::expr::{AssignOperator, FlowResultExt, Idiom, Kind, KindLiteral, Part};
+use crate::iam::AuthLimit;
+use crate::val::{RecordId, RecordIdKey, TableName, Value};
 
 impl Document {
-	/// Generate a record ID for CREATE, UPSERT, and UPDATE statements
+	/// Generate (or finalise) a record ID for CREATE, UPSERT, RELATE, and
+	/// INSERT statements.
 	///
 	/// This method handles record ID generation from various sources:
 	/// - Existing document IDs
 	/// - Data clause specified IDs (including function calls and expressions)
-	/// - Randomly generated IDs when no ID is specified
+	/// - The `id` field's `DEFAULT` expression when no ID is specified
+	/// - Synthesised IDs (UUID / random string / singleton literal) by kind
+	/// - Explicit record-id targets (e.g. `CREATE foo:bar`)
 	///
-	/// The method ensures that all expressions are properly evaluated before
-	/// being used as record IDs.
-	pub(super) fn generate_record_id(&mut self) -> Result<()> {
-		// Check if we need to generate a record id
-		if let Some(tb) = &self.r#gen {
-			// This is a CREATE, UPSERT, UPDATE, RELATE statement
-			// Check if the document already has an ID from the current data
-			let existing_id = self.current.doc.as_ref().pick(&ID);
-			let id = if existing_id.is_some() {
-				// The document already has an ID, use it
-				existing_id.generate(tb.clone(), false)?
-			} else {
-				// Fetch the record id if specified
-				match &self.input_data {
-					// There is a data clause so fetch a record id
-					Some(data) => match data.pick(ID.as_ref()) {
-						Value::None => RecordId::random_for_table(tb.clone()),
-						// Generate a new id from the id field
-						id => id.generate(tb.clone(), false)?,
-						// Generate a new random table id
-					},
-					// There is no data clause so create a record id
-					None => RecordId::random_for_table(tb.clone()),
+	/// In every case the resulting key is validated and coerced against the
+	/// declared kind of the `id` field, if one is defined. The method ensures
+	/// that all expressions are properly evaluated before being used as record
+	/// IDs.
+	pub(super) async fn generate_record_id(
+		&mut self,
+		stk: &mut Stk,
+		ctx: &FrozenContext,
+		opt: &Options,
+	) -> Result<()> {
+		// This is a CREATE, UPSERT, RELATE, or INSERT statement.
+		//
+		// Locate the precomputed `id` field definition (if any). Its declared
+		// kind constrains the key (so auto-generated keys conform and supplied
+		// keys are coerced); its `DEFAULT` supplies the key when none is given.
+		// The lookup is O(1) per write — the field index is found once when the
+		// table context is built, never rescanned per record.
+		let id_field = self.doc_ctx.id_field()?;
+		let id_kind = id_field.and_then(|fd| fd.field_kind.as_ref());
+		// Evaluate the `id` field's `DEFAULT` with the field's auth-level clamp
+		// applied — as the regular field pipeline does for every field — so a
+		// lower-privileged definer's DEFAULT cannot run with the caller's
+		// broader privileges.
+		let id_opt;
+		let opt = if let Some(fd) = id_field {
+			id_opt = AuthLimit::try_from(&fd.auth_limit)?.limit_opt(opt);
+			&id_opt
+		} else {
+			opt
+		};
+		// A table target (e.g. `CREATE foo`) means the id may need to be derived
+		// from the data clause, produced by the id field's `DEFAULT`, or
+		// synthesised; an explicit record-id target (e.g. `CREATE foo:bar`) is
+		// already on `self.id` and only needs coercing.
+		if let Some(tb) = self.r#gen.clone() {
+			// An id already present in the current data takes precedence, then
+			// an explicit id in the data clause (e.g. `SET id = …`).
+			let supplied = {
+				let existing = self.current.doc.as_ref().pick(&ID);
+				if existing.is_some() {
+					existing
+				} else {
+					self.input_data
+						.as_ref()
+						.map(|data| data.pick(ID.as_ref()))
+						.unwrap_or(Value::None)
 				}
+			};
+			let id = if supplied.is_some() {
+				// A concrete id was supplied; use it.
+				supplied.generate(tb, false)?
+			} else if let Some(DefineDefault::Set(expr)) = id_field.map(|fd| &fd.default) {
+				// No id supplied, but the `id` field declares a `DEFAULT`:
+				// evaluate it and use the result as the record id. Session
+				// params (`$auth`), functions (`time::now()`), and references to
+				// the record's own fields all resolve. For INSERT the row data
+				// is not yet merged into `self.current` (the id must be known
+				// before `process_merge_data` stamps and merges it), so evaluate
+				// against the insert payload directly to keep field references
+				// consistent with CREATE.
+				let insert_doc;
+				let doc = if let Extras::Insert(v) = &self.extras {
+					insert_doc = CursorDoc::from(v.as_ref().clone());
+					Some(&insert_doc)
+				} else {
+					Some(&self.current)
+				};
+				let value = stk.run(|stk| expr.compute(stk, ctx, opt, doc)).await.catch_return()?;
+				value.generate(tb, false)?
+			} else {
+				// No id and no `DEFAULT`: synthesise one for the declared kind.
+				Self::generate_typed_id(&tb, id_kind)?
 			};
 			// The id field can not be a record range
 			ensure!(
@@ -54,11 +106,82 @@ impl Document {
 					value: id.to_sql(),
 				}
 			);
+			// Coerce the key to the declared `id` kind. For generated keys this
+			// is a no-op; for supplied or `DEFAULT`-produced keys it validates
+			// against the declared type (e.g. rejecting a string key on a
+			// `TYPE uuid` id, or a non-int element on a `TYPE array<int>` id).
+			let id = Self::coerce_id_key(id, id_kind)?;
 			// Set the document id
 			self.id = Some(Arc::new(id));
+		} else if id_kind.is_some() {
+			// An explicit record id was supplied as the statement target (e.g.
+			// `CREATE foo:bar`); there is nothing to generate, but the supplied
+			// key must still be validated against the declared kind, exactly as
+			// a key derived from the data clause would be. Range targets never
+			// reach here — they are diverted to range handling and rejected in
+			// `Iterator::prepare_range` for create/upsert/relate/insert.
+			if let Some(existing) = self.id.take() {
+				let id = Self::coerce_id_key(RecordId::clone(&existing), id_kind)?;
+				self.id = Some(Arc::new(id));
+			}
 		}
-		//
 		Ok(())
+	}
+
+	/// Synthesise a fresh record id whose key conforms to the declared `id`
+	/// field kind. With no declared kind (or an unconstrained / string kind)
+	/// this reproduces the historic behaviour of a random string key.
+	fn generate_typed_id(tb: &TableName, kind: Option<&Kind>) -> Result<RecordId> {
+		let key = match kind {
+			// No declared kind, or an unconstrained / string id: random string.
+			None | Some(Kind::Any | Kind::String) => RecordIdKey::rand(),
+			// A uuid id: a fresh, time-ordered UUIDv7.
+			Some(Kind::Uuid) => RecordIdKey::uuid(),
+			// A singleton scalar literal id (e.g. `TYPE 123`, `TYPE 'foo'`) has
+			// exactly one valid value, so synthesise it directly.
+			Some(Kind::Literal(KindLiteral::Integer(i))) => RecordIdKey::Number(*i),
+			Some(Kind::Literal(KindLiteral::String(s))) => RecordIdKey::String(s.clone()),
+			// Anything else (int, number, array, object, a union, or a literal
+			// that is not a single concrete scalar) cannot be synthesised
+			// without an explicit value or sequence.
+			Some(other) => bail!(Error::IdFieldGenerateUnsupported {
+				table: tb.to_string(),
+				kind: other.to_sql(),
+			}),
+		};
+		Ok(RecordId {
+			table: tb.clone(),
+			key,
+		})
+	}
+
+	/// Coerce a record id key to the declared `id` field kind. Returns the id
+	/// unchanged when there is no declared kind or the kind constrains the
+	/// outer record rather than the key. Otherwise the key is converted to a
+	/// value, coerced to the kind, and converted back via the same path used
+	/// for user-supplied ids.
+	fn coerce_id_key(id: RecordId, kind: Option<&Kind>) -> Result<RecordId> {
+		let Some(kind) = kind else {
+			return Ok(id);
+		};
+		// Record-typed id kinds constrain the outer record, not the key value.
+		if kind.is_record() {
+			return Ok(id);
+		}
+		// Coerce a clone of the key so the original `id` stays intact for the
+		// error context, which is formatted (`to_sql`) only on failure rather
+		// than eagerly on every typed-id write.
+		match id.key.clone().into_value().coerce_to_kind(kind) {
+			// Rebuild the record id from the coerced value using the robust
+			// conversion that handles ints, uuids, arrays, and objects.
+			Ok(coerced) => coerced.generate(id.table, false),
+			Err(error) => Err(Error::FieldCoerce {
+				record: id.to_sql(),
+				field_name: "id".to_string(),
+				error: Box::new(error),
+			}
+			.into()),
+		}
 	}
 
 	/// Clears all of the content of this document.

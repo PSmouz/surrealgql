@@ -20,7 +20,7 @@
 //! haystack rather than the needle, which is not byte-comparable without
 //! decoding the literal anew, so the wire path bails on that case.
 
-use revision::optimised::tag::{SizeClass, Tag, read_tag};
+use revision::optimised::tag::{SizeClass, Tag};
 
 use super::Evidence;
 use super::wire_literal::{LiteralSet, LiteralWire, NumberSubVariant};
@@ -50,18 +50,37 @@ struct ValuePeek<'r> {
 /// Peek the rev prefix and optimised tag of a rev-2 [`Value`] wire without
 /// advancing the original slice. Returns the consumed length and the parsed
 /// header so callers can locate the payload.
+///
+/// **Slice-direct fast path.** This runs once per row per leaf comparison
+/// on table scans, so it indexes the two header bytes directly instead of
+/// going through the `u16` varint + [`read_tag`] `io::Read` machinery.
+/// Under the default (non-`fixed-width-encoding`) codec, `2` is the only
+/// first byte of a canonically-encoded rev-2 prefix — multi-byte varints
+/// start at `251` — so the eager byte test is equivalent to the full
+/// varint decode for every serialiser-produced wire. A non-canonical
+/// multi-byte encoding of rev 2 (which the serialiser never emits) fails
+/// the test and returns [`None`], i.e. it bails to the full-decode
+/// fallback like any other unsupported wire — never a wrong rejection.
+/// `peek_value_matches_reader_path_for_rev2_wires` differentially checks
+/// this parse against the reader-based one over serialiser-produced wires
+/// of every size class, so codec drift fails a named test; the sibling
+/// `peek_value_bails_*` tests pin the rejection classes (rev 1, truncated,
+/// non-canonical varint, reserved size class).
+///
+/// [`read_tag`]: revision::optimised::tag::read_tag
 fn peek_value(bytes: &[u8]) -> Option<ValuePeek<'_>> {
-	let mut r: &[u8] = bytes;
-	let rev = <u16 as revision::DeserializeRevisioned>::deserialize_revisioned(&mut r).ok()?;
-	if rev != 2 {
+	let [rev_byte, tag_byte, payload @ ..] = bytes else {
+		return None;
+	};
+	if *rev_byte != 2 {
 		return None;
 	}
-	let tag = read_tag(&mut r).ok()?;
+	let tag = Tag(*tag_byte);
 	let size_class = tag.size_class().ok()?;
 	Some(ValuePeek {
 		tag,
 		size_class,
-		payload: r,
+		payload,
 	})
 }
 
@@ -541,6 +560,84 @@ mod tests {
 		assert_eq!(Tag(s[1]).variant_id(), variant_id::STRING);
 		assert_eq!(Tag(n[1]).variant_id(), variant_id::NUMBER);
 		assert_eq!(Tag(r[1]).variant_id(), variant_id::REGEX);
+	}
+
+	#[test]
+	fn peek_value_matches_reader_path_for_rev2_wires() {
+		// Differential guard for the slice-direct fast path in
+		// `peek_value`: for serialiser-produced wires across the size
+		// classes (inline, fixed, varlen), the two header bytes must
+		// parse identically to the `u16` varint + `read_tag` reader
+		// path. If the rev-prefix or tag encoding ever drifts, this is
+		// the test that fails.
+		use std::str::FromStr;
+
+		use crate::val::{Datetime, Duration, Regex, Uuid};
+		let values = [
+			Value::None,
+			Value::Null,
+			Value::Bool(true),
+			Value::Bool(false),
+			Value::Number(Number::Int(21)),
+			Value::Number(Number::Float(1.5)),
+			Value::Number(Number::Decimal("1.5".parse().unwrap())),
+			Value::String(Strand::from("")),
+			Value::String(Strand::from("hello")),
+			Value::Duration(Duration::from_secs(5)),
+			Value::Datetime(Datetime::MIN_UTC),
+			Value::Uuid(Uuid::nil()),
+			Value::Regex(Regex::from_str("/x/").unwrap()),
+			Value::Array(vec![Value::Number(Number::Int(1))].into()),
+		];
+		for v in values {
+			let wire = encoded(&v);
+			let peek = peek_value(&wire)
+				.unwrap_or_else(|| panic!("fast path must parse serialiser output for {v:?}"));
+			let mut r: &[u8] = &wire;
+			let rev =
+				<u16 as revision::DeserializeRevisioned>::deserialize_revisioned(&mut r).unwrap();
+			assert_eq!(rev, 2, "serialiser rev drifted for {v:?}");
+			let tag = revision::optimised::tag::read_tag(&mut r).unwrap();
+			assert_eq!(peek.tag, tag, "tag mismatch for {v:?}");
+			assert_eq!(peek.size_class, tag.size_class().unwrap(), "size class mismatch for {v:?}");
+			assert_eq!(peek.payload.len(), r.len(), "payload offset mismatch for {v:?}");
+		}
+	}
+
+	#[test]
+	fn peek_value_bails_on_non_rev2_prefix() {
+		let mut wire = encoded(&Value::Bool(true));
+		// Rewrite the rev prefix to the varint `1`.
+		wire[0] = 1;
+		assert!(peek_value(&wire).is_none());
+	}
+
+	#[test]
+	fn peek_value_bails_on_truncated_wire() {
+		assert!(peek_value(&[]).is_none());
+		assert!(peek_value(&[2]).is_none());
+	}
+
+	#[test]
+	fn peek_value_bails_on_non_canonical_rev_varint() {
+		// `[251, 2, 0]` decodes to rev 2 under the reader path, but the
+		// serialiser only emits multi-byte varints for values >= 251, so
+		// the fast path treats the padded form as unsupported and bails
+		// to the full-decode fallback — a deliberate divergence (None
+		// falls through to decode; it can never wrongly reject).
+		let canonical = encoded(&Value::Bool(true));
+		let mut wire = vec![251u8, 2, 0];
+		wire.extend_from_slice(&canonical[1..]);
+		let mut r: &[u8] = &wire;
+		let rev = <u16 as revision::DeserializeRevisioned>::deserialize_revisioned(&mut r).unwrap();
+		assert_eq!(rev, 2, "reader path should accept the padded varint");
+		assert!(peek_value(&wire).is_none());
+	}
+
+	#[test]
+	fn peek_value_bails_on_reserved_size_class_tag() {
+		// Size-class bits `0b11` (tag bits 5..=6) are reserved.
+		assert!(peek_value(&[2, 0b0110_0000]).is_none());
 	}
 
 	/// Static-shape guard for [`peek_number_sub_variant`]. The fast path reads

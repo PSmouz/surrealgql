@@ -14,7 +14,6 @@ value = "[4]"
 value = "[1, 1, 1]"
 
 [[test.results]]
-# TODO: Look into why this test succeeded with `CONSTAINSALL`, invalid syntax and `$results` the wrong parameter.
 match = "$result CONTAINSALL [1,2,'text',3,4]"
 error = false
 */

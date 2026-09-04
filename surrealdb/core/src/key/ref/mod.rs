@@ -41,6 +41,40 @@ impl<'a> Prefix<'a> {
 	}
 }
 
+/// A table-level prefix covering every reference key whose *target* record
+/// lives in `tb`, across all target record ids. Used by `REMOVE FIELD` to find
+/// and purge the reference keys a removed reference field wrote (which are
+/// keyed by the target record, not by the referencing field).
+#[derive(Clone, Debug, Eq, PartialEq, Encode, BorrowDecode)]
+#[storekey(format = "()")]
+struct PrefixTb<'a> {
+	__: u8,
+	_a: u8,
+	pub ns: NamespaceId,
+	_b: u8,
+	pub db: DatabaseId,
+	_c: u8,
+	pub tb: Cow<'a, TableName>,
+	_d: u8,
+}
+
+impl_kv_key_storekey!(PrefixTb<'_> => Vec<u8>);
+
+impl<'a> PrefixTb<'a> {
+	fn new(ns: NamespaceId, db: DatabaseId, tb: &'a TableName) -> Self {
+		Self {
+			__: b'/',
+			_a: b'*',
+			ns,
+			_b: b'*',
+			db,
+			_c: b'*',
+			tb: Cow::Borrowed(tb),
+			_d: b'&',
+		}
+	}
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Encode, BorrowDecode)]
 #[storekey(format = "()")]
 struct PrefixFt<'a> {
@@ -192,6 +226,20 @@ pub fn suffix(
 	Ok(k)
 }
 
+/// Start of the range covering every reference key targeting a record in `tb`.
+pub fn prefix_tb(ns: NamespaceId, db: DatabaseId, tb: &TableName) -> Result<Vec<u8>> {
+	let mut k = PrefixTb::new(ns, db, tb).encode_key()?;
+	k.extend_from_slice(&[0x00]);
+	Ok(k)
+}
+
+/// End of the range covering every reference key targeting a record in `tb`.
+pub fn suffix_tb(ns: NamespaceId, db: DatabaseId, tb: &TableName) -> Result<Vec<u8>> {
+	let mut k = PrefixTb::new(ns, db, tb).encode_key()?;
+	k.extend_from_slice(&[0xff]);
+	Ok(k)
+}
+
 pub fn ftprefix(
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -327,5 +375,44 @@ mod tests {
 			enc,
 			b"/*\x00\x00\x00\x01*\x00\x00\x00\x02*testtb\x00&\x03testid\0othertb\0test.*\0\x03otherid\0"
 		);
+	}
+
+	#[test]
+	fn prefix_tb_bounds_table_refs() {
+		let id = RecordIdKey::String(Strand::new_static("testid"));
+		let fk = RecordIdKey::String(Strand::new_static("otherid"));
+		let tb_a: TableName = "aaa".into();
+		let tb_b: TableName = "bbb".into();
+		let ft: TableName = "ref_from".into();
+
+		let enc_a = Ref::encode_key(&Ref::new_impl(
+			NamespaceId(1),
+			DatabaseId(2),
+			&tb_a,
+			&id,
+			&ft,
+			"field",
+			&fk,
+		))
+		.unwrap();
+		let enc_b = Ref::encode_key(&Ref::new_impl(
+			NamespaceId(1),
+			DatabaseId(2),
+			&tb_b,
+			&id,
+			&ft,
+			"field",
+			&fk,
+		))
+		.unwrap();
+
+		let beg = prefix_tb(NamespaceId(1), DatabaseId(2), &tb_a).unwrap();
+		let end = suffix_tb(NamespaceId(1), DatabaseId(2), &tb_a).unwrap();
+
+		// A reference key whose target record is in `aaa` sorts within `aaa`'s
+		// table-level range, so a range scan of [beg, end) finds it...
+		assert!(beg.as_slice() < enc_a.as_slice() && enc_a.as_slice() < end.as_slice());
+		// ...while a key whose target is in another table does not.
+		assert!(!(beg.as_slice() < enc_b.as_slice() && enc_b.as_slice() < end.as_slice()));
 	}
 }

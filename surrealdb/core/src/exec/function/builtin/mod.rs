@@ -12,6 +12,7 @@ mod crypto;
 mod crypto_async;
 mod duration;
 mod encoding;
+mod eval;
 mod file;
 mod geo;
 mod http;
@@ -47,6 +48,7 @@ pub fn register_all(registry: &mut FunctionRegistry) {
 	crypto_async::register(registry);
 	duration::register(registry);
 	encoding::register(registry);
+	eval::register(registry);
 	file::register(registry);
 	geo::register(registry);
 	http::register(registry);

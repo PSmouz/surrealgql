@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R4: an edge variable under a quantifier is a GROUP variable — an ordered list of the traversed edge records, one row per path. Returning `g` surfaces that list of full edge objects in path order. On the triangle `{1,2}` each source yields a depth-1 path (single-edge group) and a depth-2 path (two-edge group). Hand-derived: D->E grp=[l45]; D->F grp=[l45,l56]; E->D grp=[l56,l64]; E->F grp=[l56]; F->D grp=[l64]; F->E grp=[l64,l45]. 6 rows; the group is `[]` only for a zero-length path (covered by the zero-length tests)."
+
+[[test.results]]
+value = "[{ an: 'D', bn: 'E', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }, { an: 'D', bn: 'F', grp: [{ id: link:l45, in: hub:4, out: hub:5, since: 2014 }, { id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'E', bn: 'D', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }, { id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'E', bn: 'F', grp: [{ id: link:l56, in: hub:5, out: hub:6, since: 2015 }] }, { an: 'F', bn: 'D', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }] }, { an: 'F', bn: 'E', grp: [{ id: link:l64, in: hub:6, out: hub:4, since: 2016 }, { id: link:l45, in: hub:4, out: hub:5, since: 2014 }] }]"
+*/
+
+MATCH (a:hub)-[g:link]->{1,2}(b:hub) RETURN a.name AS an, b.name AS bn, g AS grp ORDER BY an, bn

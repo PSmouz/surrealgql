@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A later OPTIONAL anchored on an EARLIER optional's binding (R3, chained left-to-right): block #1 `(b)->(c)` expands off `b`, which block #0 may have left as Null. When `b` is Null the OptionalExpand sees a null source and propagates a null `c` (it does not drop the row); when `b` matched (person:1's city) but the second hop finds nothing, `c` is still null-filled. The mandatory `a` is preserved throughout."
+
+[[test.results]]
+value = "[{ city: 'London', friend: NONE, name: 'A' }, { city: NONE, friend: NONE, name: 'B' }, { city: NONE, friend: NONE, name: 'C' }]"
+*/
+
+MATCH (a:person) OPTIONAL MATCH (a)-[:knows]->(b:city) OPTIONAL MATCH (b)-[:knows]->(c:person) RETURN a.name AS name, b.name AS city, c.name AS friend ORDER BY name

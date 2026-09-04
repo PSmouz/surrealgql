@@ -52,6 +52,21 @@ impl Set {
 		self.0.iter().nth(index)
 	}
 
+	/// Get a mutable reference to the first value in the set
+	pub fn first_mut(&mut self) -> Option<&mut Value> {
+		self.0.first_mut()
+	}
+
+	/// Get a mutable reference to the last value in the set
+	pub fn last_mut(&mut self) -> Option<&mut Value> {
+		self.0.last_mut()
+	}
+
+	/// Get a mutable reference to the nth value in the set
+	pub fn nth_mut(&mut self, index: usize) -> Option<&mut Value> {
+		self.0.get_mut(index)
+	}
+
 	/// Get an iterator over the values in the set
 	pub fn iter(&self) -> impl Iterator<Item = &Value> {
 		self.0.iter()

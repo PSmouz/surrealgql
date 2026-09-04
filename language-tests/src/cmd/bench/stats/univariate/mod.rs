@@ -9,12 +9,10 @@ pub mod outliers;
 
 use std::cmp;
 
-use crate::cmd::bench::stats::tuple::{Tuple, TupledDistributionsBuilder};
-
-use self::resamples::Resamples;
-
 pub use self::percentiles::Percentiles;
+use self::resamples::Resamples;
 pub use self::sample::Sample;
+use crate::cmd::bench::stats::tuple::{Tuple, TupledDistributionsBuilder};
 
 /// Performs a two-sample bootstrap
 #[allow(clippy::cast_lossless)]

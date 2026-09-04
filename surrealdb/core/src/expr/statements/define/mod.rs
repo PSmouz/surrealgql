@@ -24,7 +24,10 @@ pub(crate) use bucket::DefineBucketStatement;
 pub(crate) use config::DefineConfigStatement;
 pub(crate) use database::DefineDatabaseStatement;
 pub(crate) use event::DefineEventStatement;
-pub(crate) use field::{DefineDefault, DefineFieldStatement};
+pub(crate) use field::{
+	DefineDefault, DefineFieldStatement, purge_dropped_reference_keys,
+	validate_id_field_restrictions,
+};
 pub(crate) use function::DefineFunctionStatement;
 pub(crate) use index::DefineIndexStatement;
 pub(in crate::expr::statements) use index::run_indexing;

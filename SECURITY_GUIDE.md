@@ -154,7 +154,15 @@ Flag for detailed review when changes touch:
 - Reference cascade operations (ON DELETE CASCADE, UNSET, CUSTOM) must only modify
   records reachable through explicitly defined REFERENCE relationships.
 - Permission expressions (WHERE clause in PERMISSIONS) must not produce observable
-  side effects (writes, deletes, event triggers).
+  side effects (writes, deletes, event triggers). This is enforced in two layers
+  (GHSA-66r2-5gwj-gxm2): definition-time rejection of clauses that directly contain
+  a data-modifying statement (`Permissions::has_direct_write`, checked in every
+  `DEFINE` that stores permissions), and a runtime guard that rejects any mutating
+  statement reached while a predicate is evaluated. Predicate evaluation always
+  uses `Options::new_for_permission_predicate` (legacy path) or carries
+  `skip_fetch_perms` (streaming path), both of which set `Options::permission_predicate`
+  so `Expr::compute` blocks CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT and DDL —
+  including writes reached through custom-function bodies.
 - The Auth context within Options must not be mutated by user-controlled operations.
   Only system-internal mechanisms (AuthLimit) may produce derived Options with
   modified auth, and these must never broaden permissions.
@@ -307,6 +315,8 @@ Flag when changes touch:
 - WebSocket upgrade handlers, buffer-size or message-limit config
 - `client_ip` module (header sources, proxy validation)
 - GraphQL service, schema construction, or executor configuration
+- The `/gql` GQL endpoint (`ntw/gql.rs`: route, body-size limit, and the
+  `RouteTarget::Gql` / `ExperimentalTarget::Gql` capability gates)
 - Error formatting or `ResponseError` implementation
 - Authentication middleware (which endpoints are gated)
 - Body-size limit constants or `RequestBodyLimitLayer` application
@@ -349,6 +359,8 @@ Flag when changes touch:
 - CBOR deserialization path, JSON parsing, or FlatBuffers decoding
 - WebSocket serve/read/handle_message functions
 - RPC dispatch table (new methods, modified signatures)
+- The `gql` RPC method (GQL: must keep `allows_query_by_subject` and the
+  `ExperimentalTarget::Gql` gate in `Datastore::parse_gql`)
 - Transaction methods (begin/commit/cancel) or transaction map
 - Notification routing or LiveQueries map structure
 - HTTP RPC handler session management
@@ -521,6 +533,25 @@ Surrealism/WASM
   canonicalized for capability checking.
 - WASM/Surrealism capabilities must be validated before instantiation. WASI context
   configuration (especially `inherit_env`) must be reviewed for secret exposure.
+- The `eval::surql` / `eval::gql` functions (`fnc/eval.rs`) evaluate a runtime
+  query string in the caller's transaction. They must remain gated by **all** of:
+  the function-family capability (enforced by the engine before dispatch), the
+  arbitrary-query subject gate (`Capabilities::allows_query` — an `eval` call *is*
+  an arbitrary query, so it cannot bypass the front-door gate from inside a
+  `DEFINE FUNCTION` / `DEFINE API` body), and the dedicated eval subject gate
+  (`Capabilities::allows_eval_query`, `EvalQueryTarget`), which defaults to denied
+  for every subject even under `Capabilities::all()` / `--allow-all`. `eval::gql`
+  additionally inherits the `gql` experimental gate via
+  `gql::parse_with_capabilities`.
+- The eval subject must be derived from the *current execution* auth. This is
+  safe because `Auth::new_limited` (the auth-limiting applied to user-defined
+  function bodies) never raises the subject class — a record/guest caller is
+  returned unchanged and a system caller is only ever narrowed. A record-scoped
+  user invoking an owner-defined function that calls `eval` is therefore still
+  seen as `record` and remains denied.
+- eval must reject transaction-control and session-level top-level statements
+  (BEGIN/CANCEL/COMMIT/USE/LIVE/KILL/OPTION/SHOW/access), bound the nesting depth
+  (`MAX_EVAL_DEPTH`), and honour `PROTECTED_PARAM_NAMES` for caller bindings.
 
 ### Review Triggers
 
@@ -533,6 +564,8 @@ Flag when changes touch:
 - HTTP client pooling, DNS resolution, or redirect handling
 - New experimental features with function-level gating
 - Authority model for stored function execution
+- The `eval::*` functions, the `EvalQueryTarget` capability, or how the eval
+  subject gates derive the subject from execution auth
 - Resource limit defaults or enforcement
 
 ---
@@ -634,7 +667,7 @@ Flag when changes touch:
 
 ## 15. Query Parser
 
-**Files**: `syn/`, `sql/`, parser entry points, expression construction
+**Files**: `syn/`, `sql/`, `gql/`, parser entry points, expression construction
 
 ### Invariants
 
@@ -659,6 +692,151 @@ Flag when changes touch:
 - Parser buffer management or allocation strategy
 - Entry points that accept untrusted input strings
 - AST node construction for security-relevant statements (DEFINE, OPTION, USE)
+- The GQL front-end (`gql/` parsing and lowering, the `gql` RPC method,
+  the `/gql` HTTP route)
+
+---
+
+## 15a. GQL (experimental ISO GQL surface)
+
+**Files**: `gql/` (lexer, parser, `lower/`), `expr/match_plan.rs`,
+the binding-table operators — `exec/operators/graph/` (`expand.rs`, `endpoint.rs`,
+`path_expand.rs`, `distinct_edges.rs`), `exec/operators/join/hash_join.rs`,
+`exec/operators/{bind.rs, distinct.rs}`, and the FieldState-aware fetch helper
+`exec/operators/scan/fetch.rs` —
+`exec/planner/match_plan.rs`, `kvs/ds.rs` (`parse_gql` / `process_gql` /
+`execute_gql`), `rpc/protocol.rs` (`gql` method, `QueryForm::Plan`),
+`ntw/gql.rs` (`/gql` route)
+
+GQL is a second query language lowered to a `MatchPlan` IR and executed by
+the streaming engine. The lowering constructs only a single top-level
+`Expr::Match` (never any other `Expr`, and never a `sql::Ast`). It supports reads
+(`MATCH … RETURN`) and the four ISO data-modifying statements (`INSERT`, `SET`,
+`REMOVE`, `DELETE`), which the `MatchPlan` carries as trailing mutation stages
+executed through the native document pipeline. Its security posture rests on five
+invariants.
+
+### Invariants
+
+- **Binding-fetch equivalence (the central data-leak boundary).** Every binding
+  row's contents must be exactly what a `SELECT` on that table would return for
+  the same caller. All fetched node/edge bindings (Expand targets and edges,
+  EndpointBind nodes, PathExpand intermediate and terminal nodes/edges) must go
+  through the FieldState-aware helper in `exec/operators/scan/fetch.rs`
+  (`resolve_with_field_state`), which applies, in order: table-level SELECT
+  permission (deny ⇒ record dropped, neither existence nor contents leak),
+  computed-field evaluation, and field-level SELECT permission (unreadable fields
+  cut). The bare `scan::common::resolve_record_batch` must **not** be substituted
+  — it applies only the table-level permission and skips the field-level
+  machinery, which would leak restricted fields into binding rows.
+- **Layered gate chain.** Reaching the GQL executor must require, in order: the
+  `gql` cargo feature compiled in; for HTTP, the `RouteTarget::Gql` capability
+  on the `/gql` route; the `ExperimentalTarget::Gql` experimental capability
+  (checked in `Datastore::parse_gql` *and* `gql::parse_with_capabilities`
+  — the language gates itself, not relying on the caller); `allows_query_by_subject`
+  for the session's auth subject (the `gql` RPC method); and a valid, non-anonymous
+  session under the namespace/database authorization context. Removing or
+  reordering any layer is a regression.
+- **Resource bounds.** The path-expansion and join operators must enforce row-count
+  ceilings: `SURREAL_GQL_MAX_PATH_ROWS` (default 1,000,000) bounds live+emitted
+  rows in `PathExpand` **per source row** (the counter resets for each input row,
+  so it caps the genuinely dangerous single-source combinatorial explosion and
+  keeps live DFS memory at `O(longest_path × fan-out)`; the aggregate output is
+  bounded by `N_source_rows × SURREAL_GQL_MAX_PATH_ROWS`, where `N_source_rows` is
+  itself bounded by the anchor scan's cardinality — size the knob with that
+  per-source ceiling in mind), `SURREAL_GQL_MAX_JOIN_BUILD_ROWS` (default
+  1,000,000) bounds the `HashJoin` build side (and the `Distinct` seen-set), and
+  `SURREAL_GQL_MAX_OUTPUT_ROWS` (default 1,000,000) bounds the cumulative rows
+  *emitted* by `HashJoin` and single-hop `Expand` — a distinct axis, because a
+  `Cross` product or high-fan-out join emits far more rows than either side
+  holds while the build set stays small. Exceeding any must abort the query with
+  an error naming the knob — quantifiers, multi-pattern joins, cartesian (no
+  shared variable) joins, and variable-length paths are amplification vectors and
+  must stay bounded.
+- **Cancellation.** The match operators do heavy work without pulling fresh
+  upstream batches (`HashJoin` fully drains its build side then fans out the
+  probe; `PathExpand` runs a per-source DFS; `Expand` scans a vertex's whole
+  adjacency), so upstream cancellation cannot propagate through them. Each must
+  poll `ctx.cancellation()` in its hot loops (the streaming buffer/monitor
+  wrappers inject none) or a long-running MATCH ignores client disconnect / query
+  timeout — a DoS. Dropping a poll is a regression.
+- **Streaming-only execution & no serialization.** The `MatchPlan` must run only under the
+  streaming engine; its compute-only arm is a hard error (`Expr::Match` `compute()` returns
+  *"GQL MATCH requires the streaming execution engine; it cannot run under the
+  compute-only planner strategy"*). `Expr::Match` must never enter a `sql::Ast`,
+  the catalog, or `Revisioned` serialization — the `From<expr::Expr> for sql::Expr`
+  conversion logs, `debug_assert!`s, and emits a placeholder rather than
+  round-tripping it. A mutation-bearing plan reports `read_only() == false`
+  (`MatchPlan::has_mutations`), so the executor opens a write transaction.
+- **Mutation safety.** GQL mutations must execute through the native document pipeline via
+  `exec/plan_or_compute::legacy_compute` — a synthetic core `Create`/`Update`/`Delete`/`Relate`
+  statement per resolved record id — never by writing the KV store directly, so record/field
+  permissions, field validation, events, indexes, references, and live-query notifications all
+  apply exactly as for a native mutation. The mutation operators (`exec/operators/mutate.rs`)
+  must stay pipeline breakers: they fully drain their input before any write (avoiding the
+  Halloween problem of a still-open scan re-observing a freshly written row), then apply per
+  row in textual order (row-scoped, last-write-wins on a fan-out). A `RETURN` after a mutation
+  must re-bind only the permission-filtered
+  post-mutation image (the value the native mutation returns), never raw fields the caller
+  cannot read. `NODETACH DELETE` (the ISO default) must probe for connected edges and error if
+  any exist (native `DELETE` always cascades = `DETACH`); that integrity probe (`has_connected_edges`)
+  must **peek the record's graph-key range directly off the transaction** — the same
+  permission-independent check the native cascade uses (`doc::purge::purge_edges`), NOT a
+  SELECT/idiom read — so it reflects the record's actual adjacency, not the caller's SELECT
+  visibility. Otherwise a record-scoped user who cannot see the incident edges would slip past the
+  guard and trigger a silent cascade. Per-property `SET a.p` and the `SET a = {…}` surface both
+  reject the reserved keys (`id`, edge `in`/`out`), since the native write path silently re-stamps
+  them. Label mutations are rejected (one table per record).
+- **Read-after-write ordering.** A `MATCH`/`OPTIONAL` clause that follows a mutation must observe
+  that mutation's writes (read-your-writes within the one transaction), and must never race them.
+  The streaming engine's read-only buffering (`buffer.rs` `spawn_buffered`) opens scan cursors
+  *eagerly* at stream-construction time for pipeline parallelism; that eager read is buried
+  throughout a subtree (every read-only operator buffers its child), so it cannot be defeated by
+  buffering choices at the join level alone. `HashJoin` (the operator that joins a read clause onto
+  the accumulated bindings) handles this by ensuring **the writing side drains before the reading
+  side is constructed**, and which side mutates depends on the fold: `fold_mandatory` puts the
+  mutating accumulator on the **build** side (then DEFER the probe's construction until the build
+  drains), while `fold_optional`'s left-join puts it on the **probe** side (then PRE-DRAIN the probe
+  — a pipeline breaker, so draining executes its writes — before constructing the build, and replay
+  the buffered probe rows). Both directions are load-bearing: reverting either to eager construction
+  silently reintroduces stale reads (a `MATCH`/`OPTIONAL` after `SET`/`DELETE`/`INSERT` seeing
+  pre-write data). Pure-read joins keep eager construction on both sides (one shared snapshot;
+  overlap is safe and faster).
+
+### Review Triggers
+
+Flag when changes touch:
+
+- `exec/operators/scan/fetch.rs` or any binding-fetch call site (a switch to
+  `resolve_record_batch`, or a new fetch path that bypasses FieldState, is a
+  field-permission leak)
+- The gate chain: `ExperimentalTarget::Gql`, `RouteTarget::Gql`,
+  `allows_query_by_subject` in the `gql` RPC method, or the experimental check in
+  `Datastore::parse_gql`
+- `SURREAL_GQL_MAX_PATH_ROWS` / `SURREAL_GQL_MAX_JOIN_BUILD_ROWS` /
+  `SURREAL_GQL_MAX_OUTPUT_ROWS` defaults or their enforcement in `PathExpand` /
+  `HashJoin` / `Expand` / `Distinct`, or removal of a `ctx.cancellation()` poll
+  from any match operator's hot loop
+- The `HashJoin` residual (`on`) predicate or `fold_optional`'s routing of a
+  correlated OPTIONAL-block predicate into it — a correlated predicate that
+  becomes a post-join `Filter` instead silently turns an OPTIONAL into an inner
+  join (drops rows that must be null-filled)
+- `HashJoin::execute`'s build-vs-probe construction order — both the deferred-probe
+  branch (build mutates ⇒ construct the probe only after the build drains) and the
+  pre-drain branch (probe mutates ⇒ drain the probe, executing its writes, before
+  constructing the build) are load-bearing for read-after-write correctness in
+  interleaved `MATCH … SET/DELETE/INSERT … MATCH/OPTIONAL …` programs (see Mutation
+  safety, above); `fold_mandatory` vs `fold_optional` decide which side mutates
+- The lowering's surface (any path that would let GQL construct an `Expr` other
+  than a top-level `Expr::Match`)
+- The mutation pipeline: `exec/operators/mutate.rs` (a write that bypasses
+  `legacy_compute`, a dropped pipeline-breaker drain, a re-bound RETURN image that
+  is not permission-filtered, or a `NODETACH` path that skips the edge probe),
+  `gql/lower/mutation.rs` (a dropped rejection — label mutation, group/path or
+  unbound target, reserved `id`/`in`/`out` keys), and `Expr::Match` `read_only()`
+  in `expr/expression.rs` (a mutation plan that reports read-only would run in a
+  read transaction)
+- The `Expr::Match` compute-arm error or the `sql::Expr` conversion guard
 
 ---
 

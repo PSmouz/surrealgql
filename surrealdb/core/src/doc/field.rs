@@ -15,7 +15,6 @@ use crate::expr::data::Data;
 use crate::expr::idiom::{Idiom, IdiomTrie, IdiomTrieContains};
 use crate::expr::kind::{Kind, KindLiteral};
 use crate::iam::{Action, AuthLimit};
-use crate::val::value::CoerceError;
 use crate::val::value::every::ArrayBehaviour;
 use crate::val::{RecordId, Value};
 
@@ -505,47 +504,23 @@ impl FieldEditContext<'_> {
 	async fn process_type_clause(&self, val: Value) -> Result<Value> {
 		// Check for a TYPE clause
 		if let Some(kind) = &self.def.field_kind {
-			// Check if this is the `id` field
+			// The `id` field is validated and coerced against its declared
+			// kind at record-id generation time in
+			// `Document::generate_record_id`, where the result becomes the
+			// authoritative storage key. Re-checking it here is redundant, and
+			// mutating it would desync the in-memory value from the key, so we
+			// leave it untouched and only type-check ordinary fields.
 			if self.def.name.is_id() {
-				// Ensure that the outer value is a record
-				if let Value::RecordId(ref id) = val {
-					// See if we should check the inner type
-					if !kind.is_record() {
-						// Get the value of the ID only
-						let inner = id.key.clone().into_value();
-
-						// Check the type of the ID part
-						inner.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
-							record: self.rid.to_sql(),
-							field_name: self.def.name.to_sql(),
-							error: Box::new(e),
-						})?;
-					}
-				}
-				// The outer value should be a record
-				else {
-					// There was a field check error
-					bail!(Error::FieldCoerce {
-						record: self.rid.to_sql(),
-						field_name: "id".to_string(),
-						error: Box::new(CoerceError::InvalidKind {
-							from: val,
-							into: "record".to_string(),
-						}),
-					});
-				}
-			}
-			// This is not the `id` field
-			else {
-				// Check the type of the field value
-				let val = val.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
-					record: self.rid.to_sql(),
-					field_name: self.def.name.to_sql(),
-					error: Box::new(e),
-				})?;
-				// Return the modified value
 				return Ok(val);
 			}
+			// Check the type of the field value
+			let val = val.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
+				record: self.rid.to_sql(),
+				field_name: self.def.name.to_sql(),
+				error: Box::new(e),
+			})?;
+			// Return the modified value
+			return Ok(val);
 		}
 		// Return the original value
 		Ok(val)
@@ -731,8 +706,8 @@ impl FieldEditContext<'_> {
 					let now = Arc::new(val.clone());
 					// Get the current document
 					let doc = Some(&self.doc.current);
-					// Disable permissions
-					let opt = &self.opt.new_with_perms(false);
+					// Disable permission recursion and block side effects
+					let opt = &self.opt.new_for_permission_predicate();
 					// Configure the context
 					// Configure the context
 					let ctx = match self.context.take() {

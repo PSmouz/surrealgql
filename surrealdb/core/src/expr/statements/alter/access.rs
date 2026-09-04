@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use reblessive::tree::Stk;
 use surrealdb_types::{SqlFormat, ToSql};
 use tracing::instrument;
@@ -64,7 +64,7 @@ impl AlterAccessStatement {
 		}
 	}
 
-	fn apply(&self, ac: &mut catalog::AccessDefinition) {
+	fn apply(&self, ac: &mut catalog::AccessDefinition) -> Result<()> {
 		match self.authenticate {
 			AlterKind::Set(ref v) => ac.authenticate = Some(v.clone()),
 			AlterKind::Drop => ac.authenticate = None,
@@ -90,6 +90,13 @@ impl AlterAccessStatement {
 			AlterKind::Drop => ac.comment = None,
 			AlterKind::None => {}
 		}
+		// Mirrors the check in `DefineAccessStatement::to_definition`: tokens
+		// issued by record-access methods must expire, so reject ALTER paths
+		// that would leave the resulting `token_duration` as NONE.
+		if matches!(ac.access_type, catalog::AccessType::Record(_)) && ac.token_duration.is_none() {
+			bail!(Error::AccessRecordTokenDurationRequired);
+		}
+		Ok(())
 	}
 
 	async fn compute_root(&self, ctx: &FrozenContext, name: &str) -> Result<Value> {
@@ -106,7 +113,7 @@ impl AlterAccessStatement {
 				.into());
 			}
 		};
-		self.apply(&mut ac);
+		self.apply(&mut ac)?;
 		let key = crate::key::root::ac::new(name);
 		txn.set(&key, &ac).await?;
 		txn.clear_cache();
@@ -129,7 +136,7 @@ impl AlterAccessStatement {
 				.into());
 			}
 		};
-		self.apply(&mut ac);
+		self.apply(&mut ac)?;
 		let key = crate::key::namespace::ac::new(ns, name);
 		txn.set(&key, &ac).await?;
 		txn.clear_cache();
@@ -154,7 +161,7 @@ impl AlterAccessStatement {
 				.into());
 			}
 		};
-		self.apply(&mut ac);
+		self.apply(&mut ac)?;
 		let key = crate::key::database::ac::new(ns, db, name);
 		txn.set(&key, &ac).await?;
 		txn.clear_cache();

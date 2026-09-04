@@ -1,127 +1,87 @@
-use std::str::FromStr;
-use std::sync::Arc;
+//! Experimental ISO GQL (ISO/IEC 39075) query endpoint. Accepts a raw GQL
+//! query via `POST /gql` and executes it through the same session, capability,
+//! and output-negotiation plumbing as the `/sql` endpoint. The language itself
+//! is gated by the `gql` experimental capability at the datastore layer,
+//! so requests fail with a clear error unless the server is started with
+//! `--allow-experimental gql`.
 
-use async_graphql::Data;
-use async_graphql::http::{ALL_WEBSOCKET_PROTOCOLS, WebSocketProtocols, WsMessage};
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::http::HeaderMap;
-use axum::http::header::SEC_WEBSOCKET_PROTOCOL;
-use axum::response::IntoResponse;
-use axum::routing::get;
+use std::collections::BTreeMap;
+
+use anyhow::Context;
+use axum::extract::{DefaultBodyLimit, Query};
+use axum::routing::options;
 use axum::{Extension, Router};
-use futures_util::{SinkExt, StreamExt, future};
+use axum_extra::TypedHeader;
+use bytes::Bytes;
 use surrealdb_core::dbs::Session;
 use surrealdb_core::dbs::capabilities::RouteTarget;
-use surrealdb_core::gql::cache::GraphQLSchemaCache;
-use tracing::instrument;
+use surrealdb_types::{Array, SurrealValue, Value, Variables};
+use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::gql::GraphQLService;
-use crate::ntw::AppState;
+use super::AppState;
+use super::error::ResponseError;
+use super::headers::Accept;
+use super::output::Output;
+use crate::cnf::HTTP_MAX_GQL_BODY_SIZE;
 use crate::ntw::error::Error as NetError;
-use crate::rpc::RpcState;
+use crate::ntw::input::bytes_to_utf8;
 
-pub fn router() -> Router<Arc<RpcState>> {
-	let service = GraphQLService::new();
-	let cache = service.cache();
-	Router::new().route("/graphql", get(ws_handler).post_service(service)).layer(Extension(cache))
+pub fn router<S>() -> Router<S>
+where
+	S: Clone + Send + Sync + 'static,
+{
+	Router::new()
+		.route("/gql", options(|| async {}).post(post_handler))
+		.route_layer(DefaultBodyLimit::disable())
+		.layer(RequestBodyLimitLayer::new(*HTTP_MAX_GQL_BODY_SIZE))
 }
 
-#[instrument(skip_all)]
-async fn ws_handler(
-	ws: WebSocketUpgrade,
-	headers: HeaderMap,
+async fn post_handler(
 	Extension(state): Extension<AppState>,
 	Extension(session): Extension<Session>,
-	Extension(cache): Extension<GraphQLSchemaCache>,
-	State(rpc_state): State<Arc<RpcState>>,
-) -> impl IntoResponse {
-	let datastore = &state.datastore;
-
-	if !datastore.allows_http_route(&RouteTarget::GraphQL) {
-		warn!(
-			"Capabilities denied HTTP route request attempt, target: '{}'",
-			&RouteTarget::GraphQL
-		);
-		return NetError::ForbiddenRoute(RouteTarget::GraphQL.to_string()).into_response();
+	output: Option<TypedHeader<Accept>>,
+	Query(params): Query<BTreeMap<String, String>>,
+	gql: Bytes,
+) -> Result<Output, ResponseError> {
+	let vars = Variables::from(params);
+	// Get a database reference
+	let db = &state.datastore;
+	// Check if capabilities allow querying the requested HTTP route
+	if !db.allows_http_route(&RouteTarget::Gql) {
+		warn!("Capabilities denied HTTP route request attempt, target: '{}'", &RouteTarget::Gql);
+		return Err(NetError::ForbiddenRoute(RouteTarget::Gql.to_string()).into());
 	}
-
-	if session.ns.is_none() {
-		info!("GraphQL WebSocket rejected: no namespace specified");
-		return NetError::Request.into_response();
+	// Check if the user is allowed to query
+	if !db.allows_query_by_subject(session.au.as_ref()) {
+		return Err(NetError::ForbiddenRoute(RouteTarget::Gql.to_string()).into());
 	}
-	if session.db.is_none() {
-		info!("GraphQL WebSocket rejected: no database specified");
-		return NetError::Request.into_response();
-	}
-
-	let schema = match cache.get_schema(datastore, &session).await {
-		Ok(schema) => schema,
-		Err(err) => {
-			info!(?err, "error generating GraphQL schema for websocket");
-			return NetError::Request.into_response();
-		}
-	};
-
-	let mut data = Data::default();
-	data.insert(Arc::clone(datastore));
-	data.insert(Arc::new(session));
-	data.insert(Arc::clone(&rpc_state.notification_router));
-
-	let protocol = select_ws_protocol(&headers);
-
-	ws.protocols(ALL_WEBSOCKET_PROTOCOLS).on_upgrade(move |socket| async move {
-		serve_graphql_ws(socket, schema, protocol, data).await;
-	})
-}
-
-fn select_ws_protocol(headers: &HeaderMap) -> WebSocketProtocols {
-	headers
-		.get(SEC_WEBSOCKET_PROTOCOL)
-		.and_then(|value| value.to_str().ok())
-		.and_then(|protocols| {
-			protocols
-				.split(',')
-				.find_map(|protocol| WebSocketProtocols::from_str(protocol.trim()).ok())
-		})
-		// Default to graphql-transport-ws when no explicit protocol is supplied.
-		.unwrap_or(WebSocketProtocols::GraphQLWS)
-}
-
-#[instrument(skip_all)]
-async fn serve_graphql_ws(
-	socket: WebSocket,
-	schema: async_graphql::dynamic::Schema,
-	protocol: WebSocketProtocols,
-	data: Data,
-) {
-	let (mut sink, stream) = socket.split();
-
-	let input = stream
-		.take_while(|res| future::ready(res.is_ok()))
-		.map(Result::unwrap)
-		.filter_map(|msg| {
-			if let Message::Text(_) | Message::Binary(_) = msg {
-				future::ready(Some(msg))
-			} else {
-				future::ready(None)
+	// Convert the received gql query
+	let gql = bytes_to_utf8(&gql).context("Non UTF-8 request body").map_err(ResponseError)?;
+	// Execute the received gql query
+	match db.execute_gql(gql, &session, Some(vars)).await {
+		Ok(res) => match output.as_deref() {
+			// Simple serialization
+			None | Some(Accept::ApplicationJson) => {
+				let v = Value::Array(Array::from(
+					res.into_iter().map(|x| x.into_value()).collect::<Vec<Value>>(),
+				));
+				Ok(Output::json_value(&v))
 			}
-		})
-		.map(Message::into_data);
-
-	let mut stream = async_graphql::http::WebSocket::new(schema, input, protocol)
-		.connection_data(data)
-		.map(|msg| match msg {
-			WsMessage::Text(text) => Message::Text(text.into()),
-			WsMessage::Close(code, status) => Message::Close(Some(CloseFrame {
-				code,
-				reason: status.into(),
-			})),
-		});
-
-	while let Some(item) = stream.next().await {
-		if sink.send(item).await.is_err() {
-			break;
-		}
+			Some(Accept::ApplicationCbor) => {
+				let v = Value::Array(Array::from(
+					res.into_iter().map(|x| x.into_value()).collect::<Vec<Value>>(),
+				));
+				Ok(Output::cbor(v))
+			}
+			// Internal serialization
+			Some(Accept::ApplicationFlatbuffers) => {
+				let v = res.into_value();
+				Ok(Output::flatbuffers(&v))
+			}
+			// An unsupported content-type was requested
+			Some(_) => Err(NetError::InvalidType.into()),
+		},
+		// There was an error when executing the query
+		Err(err) => Err(ResponseError(err.into())),
 	}
 }

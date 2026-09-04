@@ -146,7 +146,7 @@ impl ExecOperator for ExternalSortByKey {
 
 				for value in batch.values {
 					let keys: Vec<Value> =
-						sort_keys.iter().map(|k| k.path.extract(&value)).collect();
+						sort_keys.iter().map(|k| k.path.extract(&value).into_owned()).collect();
 
 					let keyed = KeyedValue {
 						keys,

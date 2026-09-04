@@ -10,7 +10,7 @@
 #![allow(private_bounds, private_interfaces)]
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::ops::{Deref, Range};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,9 @@ use tracing::Instrument;
 use uuid::Uuid;
 use web_time::Instant;
 
-use super::api::{KeysBatch, ScanCursorKeys, ScanCursorVals, ScanLimit, ValsBatch};
+use super::api::{
+	KeyVisitor, KeysBatch, ScanChunkStats, ScanCursorKeys, ScanCursorVals, ValVisitor, ValsBatch,
+};
 use super::batch::Batch;
 use super::{Key, LockType, TransactionFactory, TransactionType, Val, util};
 use crate::catalog::providers::{
@@ -66,6 +68,7 @@ use crate::kvs::{
 	BoxTimeStamp, BoxTimeStampImpl, Direction, Error as KvsError, KVKey, KVValue, Transactor,
 	cache, is_retryable_transaction_conflict,
 };
+use crate::lq::writer::LiveEventBuffer;
 use crate::observe::{
 	ExecutionObserver, Outcome, TenantIdentity, TransactionEvent, TransactionEventSafe,
 	TransactionMetrics,
@@ -120,6 +123,8 @@ pub struct Transaction {
 	sequences: Sequences,
 	/// The changefeed buffer.
 	changefeed: OnceLock<Changefeed>,
+	/// The live-query event buffer (dedicated keyspace, Router engine).
+	live_events: OnceLock<LiveEventBuffer>,
 	/// Async event trigger
 	async_event_trigger: Arc<Notify>,
 	/// Do we have to trigger async events after the commit?
@@ -440,16 +445,7 @@ impl IndexBuildReservationRelease {
 				return Ok(());
 			}
 
-			match tx
-				.tr
-				.keys(
-					bg_range_start.clone()..bg_range_end.clone(),
-					crate::kvs::ScanLimit::Count(1),
-					0,
-					None,
-				)
-				.await
-			{
+			match tx.tr.keys(bg_range_start.clone()..bg_range_end.clone(), 1, 0, None).await {
 				Ok(res) if !res.keys.is_empty() => {
 					let _ = tx.tr.cancel().await;
 					return Ok(());
@@ -631,10 +627,20 @@ impl<'a> MeteredKeysCursor<'a> {
 	/// The returned `KeysBatch` borrows from the cursor; the borrow
 	/// checker forbids calling `next_batch` again while the previous
 	/// batch is still in scope.
-	pub async fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> Result<KeysBatch<'s>> {
+	pub async fn next_batch<'s>(&'s mut self, limit: u32) -> Result<KeysBatch<'s>> {
 		let batch = self.inner.next_batch(limit).await.map_err(Error::from)?;
 		self.metrics.record_scan(batch.len() as u64, batch.key_bytes, 0);
 		Ok(batch)
+	}
+
+	/// Drive the cursor, invoking `f` per key borrowed directly from the
+	/// cursor (zero-copy on backends that override `for_each`). Records this
+	/// chunk's keys/bytes against the transaction's scan metrics in a single
+	/// `record_scan` call, matching `next_batch`'s metric granularity.
+	pub async fn for_each(&mut self, limit: u32, f: &mut dyn KeyVisitor) -> Result<ScanChunkStats> {
+		let stats = self.inner.for_each(limit, f).await.map_err(Error::from)?;
+		self.metrics.record_scan(stats.rows, stats.key_bytes, 0);
+		Ok(stats)
 	}
 }
 
@@ -650,14 +656,108 @@ pub struct MeteredValsCursor<'a> {
 impl<'a> MeteredValsCursor<'a> {
 	/// Advance the cursor and return up to `limit` `(key, value)` pairs
 	/// borrowed from the cursor's internal buffer.
-	pub async fn next_batch<'s>(&'s mut self, limit: ScanLimit) -> Result<ValsBatch<'s>> {
+	pub async fn next_batch<'s>(&'s mut self, limit: u32) -> Result<ValsBatch<'s>> {
 		let batch = self.inner.next_batch(limit).await.map_err(Error::from)?;
 		self.metrics.record_scan(batch.len() as u64, batch.key_bytes, batch.value_bytes);
 		Ok(batch)
 	}
+
+	/// Drive the cursor, invoking `f` per `(key, value)` borrowed directly from
+	/// the cursor (zero-copy on backends that override `for_each`). Records this
+	/// chunk's keys/bytes against the transaction's scan metrics in a single
+	/// `record_scan` call, matching `next_batch`'s metric granularity.
+	pub async fn for_each(&mut self, limit: u32, f: &mut dyn ValVisitor) -> Result<ScanChunkStats> {
+		let stats = self.inner.for_each(limit, f).await.map_err(Error::from)?;
+		self.metrics.record_scan(stats.rows, stats.key_bytes, stats.value_bytes);
+		Ok(stats)
+	}
+}
+
+/// Database-wide summary of which tables any `REFERENCE` field can target,
+/// memoized per transaction for the DELETE reference-purge gate
+/// ([`Transaction::table_may_have_incoming_references`]).
+struct ReferenceTargets {
+	/// Some reference field can hold a record of *any* table (an untyped
+	/// `record`), so every table must be treated as potentially referenced.
+	any: bool,
+	/// The concrete set of tables that typed reference fields can target.
+	tables: HashSet<TableName>,
+}
+
+impl ReferenceTargets {
+	fn can_target(&self, table: &TableName) -> bool {
+		self.any || self.tables.contains(table)
+	}
 }
 
 impl Transaction {
+	/// Returns `true` if any `DEFINE FIELD ... REFERENCE` in this database could
+	/// target a record in `table` (so a record in `table` may have incoming
+	/// reference keys).
+	///
+	/// A reference key is only ever written under a record's range while some
+	/// reference field can hold a record id of that record's table, so when no
+	/// reference field can target `table` there can be no reference keys for any
+	/// record in it. The DELETE purge path uses this to skip the per-record
+	/// reference range scan entirely in that case — on a distributed backend
+	/// that scan is a read round-trip per deleted record.
+	///
+	/// The per-database answer is derived from the (transaction-cached) table
+	/// and field catalog and memoized for the transaction, so a batch delete
+	/// computes it at most once regardless of how many records or tables it
+	/// touches. It is conservative: any reference field whose kind is not
+	/// provably unable to hold a record of `table` keeps the scan, so a record
+	/// that genuinely needs its references cleaned is never skipped.
+	pub(crate) async fn table_may_have_incoming_references(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		table: &TableName,
+	) -> Result<bool> {
+		Ok(self.database_reference_targets(ns, db).await?.can_target(table))
+	}
+
+	/// Compute, or fetch the memoized, [`ReferenceTargets`] summary for a
+	/// database. Invalidated alongside field definitions (see `put_tb_field`
+	/// and the `clear_cache` on ALTER/REMOVE FIELD).
+	async fn database_reference_targets(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+	) -> Result<Arc<ReferenceTargets>> {
+		let qey = cache::tx::Lookup::DbReferenceTargets(ns, db);
+		if let Some(entry) = self.cache.get(&qey) {
+			return entry.try_into_type::<ReferenceTargets>();
+		}
+		let mut any = false;
+		let mut tables = HashSet::new();
+		for tb in self.all_tb(ns, db, None).await?.iter() {
+			for fd in self.all_tb_fields(ns, db, &tb.name, None).await?.iter() {
+				// Only reference fields write reference keys.
+				if fd.reference.is_none() {
+					continue;
+				}
+				match &fd.field_kind {
+					Some(kind) => {
+						if kind.collect_reference_target_tables(&mut tables) {
+							any = true;
+						}
+					}
+					// A reference field always has a record-like kind (enforced
+					// at DEFINE FIELD time); treat a missing kind as able to
+					// target anything, erring towards running the scan.
+					None => any = true,
+				}
+			}
+		}
+		let targets = Arc::new(ReferenceTargets {
+			any,
+			tables,
+		});
+		self.cache.insert(qey, cache::tx::Entry::Any(targets.clone()));
+		Ok(targets)
+	}
+
 	/// Create a new transaction.
 	///
 	/// `observer` is dispatched to on commit/cancel; pass
@@ -682,6 +782,7 @@ impl Transaction {
 			cache: TransactionCache::new(config.transaction_cache_size),
 			sequences,
 			changefeed: OnceLock::new(),
+			live_events: OnceLock::new(),
 			async_event_trigger,
 			trigger_async_event: AtomicBool::new(false),
 			pending_index_build_reservations: Mutex::new(Vec::new()),
@@ -812,6 +913,7 @@ impl Transaction {
 	/// a specific `next_mutation_seq`. Used by overflow regression tests so
 	/// the failure mode can be exercised without running `u32::MAX` lookups.
 	#[cfg(test)]
+	#[cfg_attr(not(feature = "kv-mem"), allow(dead_code))]
 	pub(crate) async fn seed_cached_index_build_reservation_for_test(
 		&self,
 		key: CachedIndexBuildReservationKey,
@@ -951,6 +1053,10 @@ impl Transaction {
 		// Clear any buffered changefeed entries
 		if let Some(changefeed) = self.changefeed.get() {
 			changefeed.clear();
+		}
+		// Clear any buffered live-query events
+		if let Some(live_events) = self.live_events.get() {
+			live_events.clear();
 		}
 		// Cancel the underlying transactor. Emit a transaction event on
 		// either outcome so counters and durations are always reported
@@ -1259,6 +1365,147 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Remove a namespace's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// Unlike [`crate::catalog::providers::NamespaceProvider::del_ns`], this
+	/// does **not** delete the (potentially huge) `/*{ns}` data prefix inside
+	/// the transaction. Only the catalog name→id entry is removed, so the
+	/// namespace is immediately unreachable; a reclaim job is enqueued and
+	/// [`crate::kvs::Datastore::reclaim_tombstones`] destroys the data later.
+	/// Because both writes are staged in this transaction, a rollback undoes
+	/// the removal and never destroys data.
+	pub(crate) async fn del_ns_deferred(
+		&self,
+		ns: &str,
+		expunge: bool,
+	) -> Result<Option<NamespaceId>> {
+		let Some(ns_def) = self.get_ns_by_name(ns, None).await? else {
+			return Ok(None);
+		};
+		// Delete only the catalog definition; defer the data deletion.
+		let key = crate::key::root::ns::new(&ns_def.name);
+		if expunge {
+			self.clr(&key).await?;
+		} else {
+			self.del(&key).await?;
+		}
+		// Enqueue background reclaim of the namespace data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::namespace(
+			ns_def.namespace_id,
+			expunge,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate cached namespace lookups so the removal is observed.
+		self.cache.remove(&cache::tx::Lookup::Nss);
+		self.cache.remove(&cache::tx::Lookup::NsByName(&ns_def.name));
+		Ok(Some(ns_def.namespace_id))
+	}
+
+	/// Remove a database's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// The deferred companion to
+	/// [`crate::catalog::providers::DatabaseProvider::del_db`] used by
+	/// `REMOVE DATABASE`: the `/*{ns}*{db}` prefix is destroyed later by
+	/// [`crate::kvs::Datastore::reclaim_tombstones`], not in this transaction.
+	pub(crate) async fn del_db_deferred(
+		&self,
+		ns: &str,
+		db: &str,
+		expunge: bool,
+	) -> Result<Option<DatabaseId>> {
+		let Some(db_def) = self.get_db_by_name(ns, db, None).await? else {
+			return Ok(None);
+		};
+		// Delete only the catalog definition; defer the data deletion.
+		let key = crate::key::namespace::db::new(db_def.namespace_id, &db_def.name);
+		if expunge {
+			self.clr(&key).await?;
+		} else {
+			self.del(&key).await?;
+		}
+		// Enqueue background reclaim of the database data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::database(
+			db_def.namespace_id,
+			db_def.database_id,
+			expunge,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate cached database lookups so the removal is observed.
+		self.cache.remove(&cache::tx::Lookup::Dbs(db_def.namespace_id));
+		self.cache.remove(&cache::tx::Lookup::DbByName(ns, &db_def.name));
+		Ok(Some(db_def.database_id))
+	}
+
+	/// Remove an index's catalog definition and enqueue its data prefix for
+	/// asynchronous background reclaim.
+	///
+	/// The deferred companion to
+	/// [`crate::catalog::providers::TableProvider::del_tb_index`] used by
+	/// `REMOVE INDEX`. The catalog definition and id→name lookup are removed
+	/// immediately so the index stops being maintained and used; the
+	/// `/*{ns}*{db}*{tb}+{ix}` data prefix is destroyed later by
+	/// [`crate::kvs::Datastore::reclaim_tombstones`].
+	///
+	/// Safe against index recreation because index ids are never reused: a new
+	/// `DEFINE INDEX` of the same name allocates a fresh id (the old definition
+	/// is already gone), so its data prefix is disjoint from the one queued for
+	/// reclaim here.
+	pub(crate) async fn del_tb_index_deferred(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		tb: &TableName,
+		ix: &str,
+	) -> Result<()> {
+		let Some(ix_def) = self.get_tb_index(ns, db, tb, ix, None).await? else {
+			return Ok(());
+		};
+		// Delete the catalog definition; defer the index data deletion.
+		let key = crate::key::table::ix::new(ns, db, tb, &ix_def.name);
+		self.del(&key).await?;
+		// Delete the id-to-name lookup.
+		let name_lookup_key =
+			crate::key::table::ix::IndexNameLookupKey::new(ns, db, tb, ix_def.index_id);
+		self.del(&name_lookup_key).await?;
+		// Enqueue background reclaim of the index data prefix.
+		let rc = crate::key::root::rc::ReclaimKey::index(
+			ns,
+			db,
+			std::borrow::Cow::Borrowed(tb),
+			ix_def.index_id,
+			false,
+			Uuid::now_v7(),
+		);
+		self.set(
+			&rc,
+			&crate::key::root::rc::ReclaimState {
+				observed_ms: 0,
+			},
+		)
+		.await?;
+		// Invalidate the cached list of all indexes for this table.
+		self.cache.remove(&cache::tx::Lookup::Ixs(ns, db, tb.as_ref()));
+		// Invalidate the cached index entry.
+		self.cache.remove(&cache::tx::Lookup::Ix(ns, db, tb.as_ref(), &ix_def.name));
+		Ok(())
+	}
+
 	/// Insert or update a key in the datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
 	pub async fn set<K>(&self, key: &K, val: &K::ValueType) -> Result<()>
@@ -1380,7 +1627,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.keys(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.keys.len() as u64, res.key_bytes, 0);
 		Ok(res.keys)
@@ -1403,7 +1649,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.keysr(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.keys.len() as u64, res.key_bytes, 0);
 		Ok(res.keys)
@@ -1426,7 +1671,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.scan(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.values.len() as u64, res.key_bytes, res.value_bytes);
 		Ok(res.values)
@@ -1449,7 +1693,6 @@ impl Transaction {
 	{
 		let beg = rng.start.encode_key()?;
 		let end = rng.end.encode_key()?;
-		let limit = limit.into();
 		let res = self.tr.scanr(beg..end, limit, skip, version).await.map_err(Error::from)?;
 		self.metrics.record_scan(res.values.len() as u64, res.key_bytes, res.value_bytes);
 		Ok(res.values)
@@ -1609,6 +1852,38 @@ impl Transaction {
 		Ok(self.tr.timestamp().await.map_err(Error::from)?)
 	}
 
+	/// Get the current safe (closed) watermark timestamp — the versionstamp at or
+	/// below which every committed transaction is final and visible. The
+	/// live-query router uses this so it never advances past a commit that could
+	/// still become visible with a lower versionstamp. Defaults to
+	/// [`Self::timestamp`]; distributed backends override it.
+	pub async fn safe_timestamp(&self) -> Result<BoxTimeStamp> {
+		Ok(self.tr.safe_timestamp().await.map_err(Error::from)?)
+	}
+
+	/// Returns `true` if the table has at least one durable live-query
+	/// subscription row, read within this transaction's snapshot.
+	///
+	/// This is the Router-engine change-capture gate. It deliberately reads the
+	/// committed `key::table::lq` rows — the cluster-wide source of truth — rather
+	/// than any node-local in-memory cache: on a shared/replicated store the
+	/// per-node caches have no cross-node invalidation, so a cache could miss a
+	/// subscription created on another node and the write would fail to capture an
+	/// event that subscriber needs (a loss that can never be replayed). Reading
+	/// within the write's own snapshot makes the gate consistent and cluster-wide.
+	/// It is a limit-1 key scan, so the cost is independent of the subscriber
+	/// count on the table.
+	pub(crate) async fn table_has_live_query(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		tb: &TableName,
+	) -> Result<bool> {
+		let beg = crate::key::table::lq::prefix(ns, db, tb)?;
+		let end = crate::key::table::lq::suffix(ns, db, tb)?;
+		Ok(!self.keys(beg..end, 1, 0, None).await?.is_empty())
+	}
+
 	/// Returns the implementation of timestamp that this transaction uses.
 	pub fn timestamp_impl(&self) -> BoxTimeStampImpl {
 		self.tr.timestamp_impl()
@@ -1655,6 +1930,29 @@ impl Transaction {
 		)
 	}
 
+	/// Records a record change into the dedicated live-query event buffer.
+	///
+	/// Independent of the changefeed: it always retains full before/after values
+	/// and is flushed to the `lqe` keyspace at commit (see [`Self::store_changes`]).
+	pub(crate) fn live_event_buffer_record_change(
+		&self,
+		ns: NamespaceId,
+		db: DatabaseId,
+		tb: &TableName,
+		id: &RecordId,
+		previous: CursorRecord,
+		current: CursorRecord,
+	) {
+		self.live_events.get_or_init(LiveEventBuffer::new).buffer_record_change(
+			ns,
+			db,
+			tb,
+			id.clone(),
+			previous.into_owned(),
+			current.into_owned(),
+		)
+	}
+
 	/// complete_changes will complete the changefeed recording for the given
 	/// namespace and database.
 	///
@@ -1669,31 +1967,43 @@ impl Transaction {
 	///
 	/// This function should be called immediately before calling the commit function
 	/// to ensure the timestamp reflects the actual commit time.
+	///
+	/// The changefeed versionstamp is taken from [`Self::timestamp`] (the backend timestamp
+	/// oracle). It is process-local-monotonic on mem/rocksdb/surrealkv and globally monotonic
+	/// only on backends with a coordinated oracle (TiKV TSO) — so cross-node changefeed ordering
+	/// is a property of the backend, not of this engine.
 	pub(crate) async fn store_changes(&self) -> Result<()> {
-		// If no changefeed writer, there are no changes
-		let Some(changefeed) = self.changefeed.get() else {
-			return Ok(());
+		// Gather buffered changefeed entries (if any).
+		let cf_changes = match self.changefeed.get() {
+			Some(changefeed) => changefeed.changes()?,
+			None => Vec::new(),
 		};
-		// Get the changes from the changefeed
-		let changes = changefeed.changes()?;
-		// For zero-length changes, return early
-		if changes.is_empty() {
+		// Gather buffered live-query events (if any).
+		let lqe_changes = match self.live_events.get() {
+			Some(live_events) => live_events.changes()?,
+			None => Vec::new(),
+		};
+		// Nothing buffered in either keyspace -> nothing to do.
+		if cf_changes.is_empty() && lqe_changes.is_empty() {
 			return Ok(());
 		}
-		// Get the current transaction timestamp
+		// Both keyspaces share this commit's versionstamp.
 		let buf = &mut [0u8; _];
 		let ts = self.timestamp().await?.encode(buf);
-		// Collect all changefeed write operations as futures
-		let futures = changes.into_iter().map(|(ns, db, tb, value)| async move {
-			// Create the changefeed key with the current timestamp
+		// Write the changefeed entries.
+		let cf_futures = cf_changes.into_iter().map(|(ns, db, tb, value)| async move {
 			let key = crate::key::change::new(ns, db, ts, &tb).encode_key()?;
-			// Write the changefeed entry using the raw transactor API
 			self.tr.set(key, value).await.map_err(Error::from)?;
-			// Everything succeeded
 			Ok::<(), anyhow::Error>(())
 		});
-		// Execute all write operations concurrently
-		try_join_all(futures).await?;
+		try_join_all(cf_futures).await?;
+		// Write the live-query event entries to the dedicated keyspace.
+		let lqe_futures = lqe_changes.into_iter().map(|(ns, db, tb, value)| async move {
+			let key = crate::key::lqe::new(ns, db, ts, &tb).encode_key()?;
+			self.tr.set(key, value).await.map_err(Error::from)?;
+			Ok::<(), anyhow::Error>(())
+		});
+		try_join_all(lqe_futures).await?;
 		// All good
 		Ok(())
 	}
@@ -2071,33 +2381,6 @@ impl NamespaceProvider for Transaction {
 	) -> BoxProviderFut<'a, Result<NamespaceId>> {
 		Box::pin(async move { self.sequences.next_namespace_id(ctx).await })
 	}
-
-	fn del_ns<'a>(&'a self, ns: &'a str, expunge: bool) -> BoxProviderFut<'a, Result<Option<()>>> {
-		Box::pin(async move {
-			let Some(ns_def) = self.get_ns_by_name(ns, None).await? else {
-				return Ok(None);
-			};
-			let key = crate::key::root::ns::new(&ns_def.name);
-			let namespace_root = crate::key::namespace::all::new(ns_def.namespace_id);
-			if expunge {
-				self.clr(&key).await?;
-				self.clrp(&namespace_root).await?;
-			} else {
-				self.del(&key).await?;
-				self.delp(&namespace_root).await?;
-			};
-
-			// Invalidate the cached list of all namespaces
-			let list_key = cache::tx::Lookup::Nss;
-			self.cache.remove(&list_key);
-
-			// Invalidate the cached namespace entry
-			let ns_key = cache::tx::Lookup::NsByName(&ns_def.name);
-			self.cache.remove(&ns_key);
-
-			Ok(Some(()))
-		})
-	}
 }
 
 // --------------------------------------------------
@@ -2265,38 +2548,6 @@ impl DatabaseProvider for Transaction {
 			self.cache.insert(qey, entry);
 
 			Ok(cached_db)
-		})
-	}
-
-	fn del_db<'a>(
-		&'a self,
-		ns: &'a str,
-		db: &'a str,
-		expunge: bool,
-	) -> BoxProviderFut<'a, Result<Option<()>>> {
-		Box::pin(async move {
-			let Some(db) = self.get_db_by_name(ns, db, None).await? else {
-				return Ok(None);
-			};
-			let key = crate::key::namespace::db::new(db.namespace_id, &db.name);
-			let database_root = crate::key::database::all::new(db.namespace_id, db.database_id);
-			if expunge {
-				self.clr(&key).await?;
-				self.clrp(&database_root).await?;
-			} else {
-				self.del(&key).await?;
-				self.delp(&database_root).await?
-			};
-
-			// Invalidate the cached list of all databases for this namespace
-			let list_key = cache::tx::Lookup::Dbs(db.namespace_id);
-			self.cache.remove(&list_key);
-
-			// Invalidate the cached database entry
-			let db_key = cache::tx::Lookup::DbByName(ns, &db.name);
-			self.cache.remove(&db_key);
-
-			Ok(Some(()))
 		})
 	}
 
@@ -2654,7 +2905,7 @@ impl DatabaseProvider for Transaction {
 				if version.is_some() {
 					let key = crate::key::database::fc::new(ns, db, fc);
 					let val = self.get(&key, version).await?.ok_or_else(|| Error::FcNotFound {
-						name: fc.to_owned(),
+						name: format!("fn::{fc}"),
 					})?;
 					return Ok(Arc::new(val));
 				}
@@ -2664,7 +2915,7 @@ impl DatabaseProvider for Transaction {
 					None => {
 						let key = crate::key::database::fc::new(ns, db, fc);
 						let val = self.get(&key, None).await?.ok_or_else(|| Error::FcNotFound {
-							name: fc.to_owned(),
+							name: format!("fn::{fc}"),
 						})?;
 						let val = Arc::new(val);
 						let entry = cache::tx::Entry::Any(val.clone());
@@ -3413,6 +3664,13 @@ impl TableProvider for Transaction {
 			let list_key = cache::tx::Lookup::Fds(ns, db, tb.as_ref());
 			self.cache.remove(&list_key);
 
+			// Defining a field can add (or change) a REFERENCE, so the
+			// database-wide reference-target summary memoized for the DELETE
+			// purge gate may now be stale. Drop it so it is recomputed on next
+			// use. (ALTER/REMOVE FIELD instead clear the whole transaction
+			// cache, which covers this entry too.)
+			self.cache.remove(&cache::tx::Lookup::DbReferenceTargets(ns, db));
+
 			// Set the entry in the cache
 			let qey = cache::tx::Lookup::Fd(ns, db, tb, &name);
 			let entry = cache::tx::Entry::Any(Arc::new(fd.clone()));
@@ -3541,7 +3799,7 @@ impl TableProvider for Transaction {
 
 	/// Fetch a specific record value.
 	///
-	/// This function will return a new default initialized record if non exists.
+	/// This function will return a new default initialized record if it does not exist.
 	fn get_record<'a>(
 		&'a self,
 		ns: NamespaceId,

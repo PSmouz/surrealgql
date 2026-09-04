@@ -17,7 +17,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use surrealdb_core::CommunityComposer;
 use surrealdb_core::kvs::Direction::Forward;
 use surrealdb_core::kvs::LockType::Optimistic;
-use surrealdb_core::kvs::{Datastore, ScanLimit, TransactionType, Transactor};
+use surrealdb_core::kvs::{Datastore, TransactionType, Transactor};
 use temp_dir::TempDir;
 use tokio::runtime::Runtime;
 
@@ -80,7 +80,7 @@ fn bench_nested_edge(c: &mut Criterion) {
 						let rng = prefix_range(&format!("p_{p:06}/"));
 						let mut cursor =
 							tr.open_keys_cursor(rng, Forward, 0u32, None).await.unwrap();
-						let batch = cursor.next_batch(ScanLimit::Count(10)).await.unwrap();
+						let batch = cursor.next_batch(10).await.unwrap();
 						count += batch.len() as u64;
 						drop(cursor);
 					}
@@ -109,7 +109,7 @@ fn bench_bulk_scan(c: &mut Criterion) {
 				let mut cursor = tr.open_keys_cursor(rng, Forward, 0u32, None).await.unwrap();
 				let mut total = 0u64;
 				while total < count {
-					let batch = cursor.next_batch(ScanLimit::Count(2000)).await.unwrap();
+					let batch = cursor.next_batch(2000).await.unwrap();
 					if batch.is_empty() {
 						break;
 					}
@@ -137,7 +137,7 @@ fn bench_bulk_scan(c: &mut Criterion) {
 					let mut cursor = tr.open_keys_cursor(rng, Forward, 0u32, None).await.unwrap();
 					let mut total = 0u64;
 					while total < count {
-						let batch = cursor.next_batch(ScanLimit::Count(2000)).await.unwrap();
+						let batch = cursor.next_batch(2000).await.unwrap();
 						if batch.is_empty() {
 							break;
 						}

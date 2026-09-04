@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["./_no_config.surql"]
+
+[test]
+reason = "Without DEFINE CONFIG GRAPHQL, executing any GraphQL query reports that GraphQL is not configured"
+
+[[test.results]]
+error = "GraphQL has not been configured for this database"
+*/
+query {
+	persons {
+		name
+	}
+}

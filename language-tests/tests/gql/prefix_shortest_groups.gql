@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `SHORTEST k GROUP(S)`: every path in the k smallest distinct lengths per endpoint pair. Anchored X→Z the lengths are {2, 2, 3}; `SHORTEST 1 GROUP` keeps only the smallest length group (the two length-2 paths) — two rows, vs three for `SHORTEST 3`."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH SHORTEST 1 GROUP (a:wp WHERE a.name = 'X')-[:road]->+(b:wp WHERE b.name = 'Z')
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

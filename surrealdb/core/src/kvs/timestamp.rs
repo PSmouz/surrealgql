@@ -202,6 +202,11 @@ impl HlcTimeStamp {
 	/// returned timestamp. If the system clock goes backwards, it continues from the last known
 	/// good timestamp. If more than 65,535 timestamps are requested within the same millisecond,
 	/// it will spin-wait until the next millisecond.
+	///
+	/// Note: the atomic counter is **process-local**, so this monotonicity holds only within a
+	/// single process. Distributed/cross-node changefeed ordering must come from the storage
+	/// backend's timestamp oracle (see `TiKVStampImpl`); the mem/rocksdb/surrealkv HLC is
+	/// single-node for changefeed-ordering purposes.
 	pub fn next() -> Self {
 		use std::sync::atomic::{AtomicU64, Ordering};
 

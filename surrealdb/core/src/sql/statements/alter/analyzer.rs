@@ -2,6 +2,7 @@ use surrealdb_types::{SqlFormat, ToSql, write_sql};
 
 use super::AlterKind;
 use crate::fmt::{CoverStmts, Fmt, QuoteStr};
+use crate::sql::analyzer_function::fmt_analyzer_function;
 use crate::sql::filter::Filter;
 use crate::sql::tokenizer::{Tokenizer, write_tokenizers_sql};
 use crate::sql::{Expr, Literal};
@@ -33,7 +34,6 @@ impl Default for AlterAnalyzerStatement {
 
 impl ToSql for AlterAnalyzerStatement {
 	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
-		use crate::fmt::EscapeKwFreeIdent;
 		write_sql!(f, fmt, "ALTER ANALYZER");
 		if self.if_exists {
 			write_sql!(f, fmt, " IF EXISTS");
@@ -41,13 +41,7 @@ impl ToSql for AlterAnalyzerStatement {
 		write_sql!(f, fmt, " {}", CoverStmts(&self.name));
 
 		match self.function {
-			AlterKind::Set(ref v) => {
-				f.push_str(" FUNCTION fn");
-				for x in v.split("::") {
-					f.push_str("::");
-					EscapeKwFreeIdent(x).fmt_sql(f, fmt);
-				}
-			}
+			AlterKind::Set(ref v) => fmt_analyzer_function(f, fmt, v),
 			AlterKind::Drop => f.push_str(" DROP FUNCTION"),
 			AlterKind::None => {}
 		}

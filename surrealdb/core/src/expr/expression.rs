@@ -87,6 +87,15 @@ pub(crate) enum Expr {
 		analyze: bool,
 		statement: Box<Expr>,
 	},
+	/// An GQL `MATCH` query, lowered to its declarative binding-table plan.
+	///
+	/// Only constructed by the GQL lowering at top level. It runs exclusively
+	/// under the streaming execution planner; see the `compute` and
+	/// `From<expr::Expr> for sql::Expr` arms for the invariants it relies on.
+	// Constructed by the GQL lowering, which lands as a sibling piece of PR-A.
+	#[cfg(feature = "gql")]
+	#[allow(dead_code)]
+	Match(Box<crate::expr::match_plan::MatchPlan>),
 }
 
 impl Expr {
@@ -130,6 +139,10 @@ impl Expr {
 				..
 			} => statement.read_only(),
 			Expr::Closure(_) => true,
+			// A GQL query is read-only unless it carries mutation stages; a
+			// mutation-bearing plan must run under a write transaction.
+			#[cfg(feature = "gql")]
+			Expr::Match(plan) => !plan.has_mutations(),
 			Expr::Create(_)
 			| Expr::Update(_)
 			| Expr::Delete(_)
@@ -140,6 +153,64 @@ impl Expr {
 			| Expr::Rebuild(_)
 			| Expr::Upsert(_)
 			| Expr::Alter(_) => false,
+		}
+	}
+
+	/// Check whether this expression's own tree *directly* contains a
+	/// data-modifying statement (CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT or
+	/// DDL).
+	///
+	/// Used to reject side-effecting `PERMISSIONS` clauses at definition time
+	/// (GHSA-66r2-5gwj-gxm2). Unlike [`Expr::read_only`], a function or closure
+	/// *call* is treated as opaque — a custom function may itself write, but
+	/// that is enforced at runtime via [`crate::dbs::Options::new_for_permission_predicate`]
+	/// — so common read-only helper predicates such as
+	/// `PERMISSIONS WHERE fn::is_owner()` remain valid. Writes buried inside a
+	/// subquery or idiom are likewise left to the runtime guard.
+	pub(crate) fn has_direct_write(&self) -> bool {
+		match self {
+			// Data-modifying statements: a direct write.
+			Expr::Create(_)
+			| Expr::Update(_)
+			| Expr::Delete(_)
+			| Expr::Relate(_)
+			| Expr::Insert(_)
+			| Expr::Define(_)
+			| Expr::Remove(_)
+			| Expr::Rebuild(_)
+			| Expr::Upsert(_)
+			| Expr::Alter(_) => true,
+
+			// Combinators: recurse into nested expressions.
+			Expr::Prefix {
+				expr,
+				..
+			}
+			| Expr::Postfix {
+				expr,
+				..
+			}
+			| Expr::Throw(expr) => expr.has_direct_write(),
+			Expr::Binary {
+				left,
+				right,
+				..
+			} => left.has_direct_write() || right.has_direct_write(),
+			Expr::Return(s) => s.what.has_direct_write(),
+			Expr::Let(s) => s.what.has_direct_write(),
+			Expr::Block(block) => block.has_direct_write(),
+			Expr::IfElse(s) => s.has_direct_write(),
+			Expr::Foreach(s) => s.has_direct_write(),
+			Expr::Explain {
+				statement,
+				..
+			} => statement.has_direct_write(),
+			// Call arguments are evaluated in place, so inspect them; the callee
+			// body is opaque and handled by the runtime guard.
+			Expr::FunctionCall(function) => function.arguments.iter().any(|x| x.has_direct_write()),
+
+			// Leaves, closures, subqueries and idioms contain no *direct* write.
+			_ => false,
 		}
 	}
 
@@ -322,6 +393,9 @@ impl Expr {
 			| Expr::Explain {
 				..
 			} => false,
+			// GQL MATCH reads from the datastore, so it is never static.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => false,
 		}
 	}
 
@@ -348,6 +422,29 @@ impl Expr {
 		doc: Option<&CursorDoc>,
 	) -> FlowResult<Value> {
 		let opt = opt.dive(1).map_err(anyhow::Error::new)?;
+
+		// While evaluating a PERMISSIONS predicate (which runs with permission
+		// enforcement disabled) no statement may modify data — otherwise a
+		// stored permission expression could perform unauthorized writes during
+		// a permission check (GHSA-66r2-5gwj-gxm2). This catches writes reached
+		// directly, through nested subqueries, or through function/closure
+		// bodies, on both the legacy and streaming execution paths.
+		if opt.permission_predicate
+			&& matches!(
+				self,
+				Expr::Create(_)
+					| Expr::Update(_)
+					| Expr::Upsert(_)
+					| Expr::Delete(_)
+					| Expr::Relate(_)
+					| Expr::Insert(_)
+					| Expr::Define(_)
+					| Expr::Remove(_)
+					| Expr::Rebuild(_)
+					| Expr::Alter(_)
+			) {
+			return Err(ControlFlow::Err(anyhow::Error::new(Error::PermissionPredicateSideEffect)));
+		}
 
 		match self {
 			Expr::Literal(literal) => literal.compute(stk, ctx, &opt, doc).await,
@@ -456,6 +553,12 @@ impl Expr {
 				..
 			} => Err(ControlFlow::Err(anyhow::Error::new(Error::InvalidStatement(
 				"EXPLAIN is only supported with the new execution model".to_string(),
+			)))),
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => Err(ControlFlow::Err(anyhow::Error::new(Error::InvalidStatement(
+				"GQL MATCH requires the streaming execution engine; it cannot run under the \
+				 compute-only planner strategy"
+					.to_string(),
 			)))),
 		}
 	}
@@ -765,6 +868,11 @@ impl Expr {
 				..
 			} => true,
 
+			// GQL MATCH renders as a multi-clause statement; parenthesize it
+			// when nested.
+			#[cfg(feature = "gql")]
+			Expr::Match(_) => true,
+
 			Expr::Literal(_)
 			| Expr::Param(_)
 			| Expr::Idiom(_)
@@ -788,6 +896,14 @@ impl Expr {
 
 impl ToSql for Expr {
 	fn fmt_sql(&self, f: &mut String, fmt: SqlFormat) {
+		// `Expr::Match` cannot round-trip through `sql::Expr` (it has no SurrealQL
+		// surface). Render it directly via the dedicated `MatchPlan` renderer
+		// before the conversion would replace it with a placeholder.
+		#[cfg(feature = "gql")]
+		if let Expr::Match(plan) = self {
+			plan.fmt_sql(f, fmt);
+			return;
+		}
 		let sql_expr: crate::sql::Expr = self.clone().into();
 		sql_expr.fmt_sql(f, fmt);
 	}
@@ -810,6 +926,23 @@ impl SerializeRevisioned for Expr {
 		&self,
 		writer: &mut W,
 	) -> Result<(), revision::Error> {
+		// `Expr::Match` renders GQL-ish text via `to_sql()`, which the
+		// SurrealQL-only `deserialize_revisioned` path below cannot round-trip.
+		// The invariant (V2_DESIGN §2; SECURITY_GUIDE §15a) is that `Expr::Match`
+		// is only ever the top-level expr of a `PreparedGqlQuery` consumed
+		// directly by the planner — it never nests into a `sql::Ast`, the
+		// catalog, or a cached/revisioned `Expr`, so this path is unreachable by
+		// construction. Mirror the `From<expr::Expr> for sql::Expr` arm and fail
+		// loud (in debug) rather than silently emit unparseable bytes, so a
+		// future regression that nests `Expr::Match` is caught here.
+		#[cfg(feature = "gql")]
+		if matches!(self, Expr::Match(_)) {
+			tracing::error!(
+				"Expr::Match reached Revisioned serialization; it must never enter a \
+				 sql::Ast, the catalog, or Revisioned serialization"
+			);
+			debug_assert!(false, "Expr::Match must not be Revisioned-serialized");
+		}
 		SerializeRevisioned::serialize_revisioned(&self.to_sql(), writer)
 	}
 }
@@ -827,6 +960,7 @@ impl DeserializeRevisioned for Expr {
 				// So it should be relatively safe to parse this without a limit.
 				object_recursion_limit: usize::MAX,
 				query_recursion_limit: usize::MAX,
+				expr_recursion_limit: usize::MAX,
 				..Default::default()
 			},
 			async |p, stk| p.parse_expr(stk).await,

@@ -35,6 +35,9 @@ value = "[]"
 
 [[test.results]]
 value = "[]"
+
+[[test.results]]
+value = "[]"
 */
 
 -- Table permissions deny SELECT, so THROW in WHERE must never execute.
@@ -70,5 +73,11 @@ UPSERT accounts SET x = THROW 'leaked: ' + secret WHERE true;
 -- fallback. The insert_update path must still block via update permission.
 INSERT INTO accounts { id: accounts:1, x: 0 } ON DUPLICATE KEY UPDATE x = secret;
 
--- RELATE on an existing edge exercises the relate_update path
+-- RELATE on an existing edge still routes through `relate_update` (only
+-- INSERT RELATION with an explicit id became create-only), so the table-level
+-- update permission check must run before the SET THROW expression.
 RELATE accounts:1 -> friends:1 -> accounts:2 SET x = THROW 'leaked: ' + secret;
+
+-- UPDATE on the same existing relation record covers the generic update
+-- path's permission ordering for completeness.
+UPDATE friends:1 SET x = THROW 'leaked: ' + secret;

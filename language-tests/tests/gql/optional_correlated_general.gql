@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "REGRESSION (correlated OPTIONAL, general / LeftJoin path): the optional pattern `(x:person)-[:knows]->(y:person)` self-roots on its own labelled `x` (neither `x` nor `y` is bound in the accumulator), so it misses the OptionalExpand fast path and takes the general plan_optional_block + HashJoin{Left} path. Its inline `WHERE x.age > a.age` references the OUTER mandatory binding `a`, so it is deferred out of the standalone block subplan and must be applied as the left-join residual (ON condition) — NOT dropped (which silently happened before: debug panic / release wrong-results) and NOT a post-join Filter (which would drop the null-filled rows). Hand-derived over the person->person knows graph (A->B; B->A, B->C; C->A), ages A=30, B=20, C=(none): for a=A need x.age>30 -> none -> null-fill (friend=NONE); a=B need x.age>20 -> x=A(30) via A->B -> friend='A'; a=C `x.age > none` is 3VL-false for all -> null-fill (friend=NONE). Every mandatory `a` is preserved."
+
+[[test.results]]
+value = "[{ name: 'A', friend: NONE }, { name: 'B', friend: 'A' }, { name: 'C', friend: NONE }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (x:person)-[:knows]->(y:person) WHERE x.age > a.age RETURN a.name AS name, x.name AS friend ORDER BY name, friend

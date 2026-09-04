@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (new, R2): an edge variable may not be reused across patterns — under DIFFERENT EDGES an edge cannot bind twice, so the join is always empty."
+
+[test.results]
+parsing-error = """
+Edge variable `k` cannot be repeated
+  --> [15:53]
+   |
+15 | ...:person)-[k:knows]->(d:person) RETURN a
+   |              ^ under DIFFERENT EDGES an edge cannot bind twice, so the join is always empty
+"""
+*/
+
+MATCH (a:person)-[k:knows]->(b:person), (c:person)-[k:knows]->(d:person) RETURN a

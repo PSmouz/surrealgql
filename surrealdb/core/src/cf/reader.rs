@@ -60,6 +60,9 @@ pub async fn read(
 	let mut buf: Vec<TableMutations> = Vec::new();
 	// Create an empty buffer for the final changesets
 	let mut res = Vec::<ChangeSet>::new();
+	// Debug-only guard: the scan is ascending so versionstamps must be monotonic.
+	#[cfg(debug_assertions)]
+	let mut prev_ts: Option<Vec<u8>> = None;
 
 	// iterate over _x and put decoded elements to r
 	for (k, v) in tx.scan(beg..end, limit, 0, None).await? {
@@ -68,6 +71,20 @@ pub async fn read(
 
 		// Decode the changefeed entry key
 		let key = crate::key::change::Cf::decode_key(&k)?;
+
+		// Invariant: scan order is ascending, so each entry's versionstamp must be
+		// >= the previous one. Process-local HLC stamping is monotonic within a node;
+		// cross-node ordering is provided by the backend timestamp oracle.
+		#[cfg(debug_assertions)]
+		{
+			if let Some(p) = &prev_ts {
+				assert!(
+					key.ts.as_ref() >= p.as_slice(),
+					"changefeed scan returned out-of-order versionstamps"
+				);
+			}
+			prev_ts = Some(key.ts.to_vec());
+		}
 
 		// Check the change is for the desired table
 		if tb.is_some_and(|tb| *tb != *key.tb) {

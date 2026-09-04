@@ -1,0 +1,13 @@
+/**
+[env]
+imports = ["gql/_perm_hidden_edge_import.surql"]
+auth = { namespace = "test", database = "test", access = "user", rid = "person:1" }
+
+[test]
+reason = "SECURITY: an anonymous (id-only) edge in a MATCH still gates traversal on the edge table's SELECT permission. `knows` is `PERMISSIONS NONE` for the record user, so `MATCH (a:person)-[:knows]->(b:person)` must surface no targets even though `person` is fully selectable — mirroring `SELECT ->knows->person` which returns `[]` under the same session. Regression for the new-format adjacency-key Expand IdOnly leak."
+
+[[test.results]]
+value = "[]"
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN a.name AS an, b.name AS bn ORDER BY an, bn

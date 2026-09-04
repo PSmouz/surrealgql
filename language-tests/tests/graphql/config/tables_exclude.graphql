@@ -1,0 +1,15 @@
+/**
+[env]
+imports = ["./_tables_exclude.surql"]
+
+[test]
+reason = "TABLES EXCLUDE removes the listed tables from the schema; querying one errors"
+
+[[test.results]]
+error = 'Unknown field "events" on type "Query".'
+*/
+query {
+	events {
+		label
+	}
+}

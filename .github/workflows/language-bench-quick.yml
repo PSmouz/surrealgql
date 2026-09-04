@@ -1,0 +1,136 @@
+name: Language bench (PR)
+
+# Benchmarks a labelled PR and compares it against the latest nightly `main`
+# baseline. On open, every PR gets a sticky comment explaining how to opt in;
+# adding the `benchmark` label benchmarks the PR head and updates that comment,
+# re-running on every push while the label is set.
+#
+# `main` is NOT benchmarked here — it comes from the nightly run (full, same
+# `runner-arm-bench` pool), which `--save`s to the shared bench datastore. This
+# job runs read-only against that store: the harness `fetch_latest`es the `main`
+# baseline and compares this PR's `--quick` run against it. `--quick` trades
+# statistical power for speed (the full suite takes ~2h) — it reliably surfaces
+# large regressions but is too coarse for small drift. So pushes only build and
+# benchmark the PR, and the baseline refreshes whenever nightly re-runs.
+
+on:
+  pull_request:
+    types: [opened, reopened, labeled, synchronize]
+
+concurrency:
+  # One run per PR; a new push cancels the in-flight run so the comment tracks
+  # the latest commit.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  MARKER: "<!-- lang-bench-quick -->"
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  # sccache → S3 compile cache (read by setup-environment); fail-open if the
+  # backend is unreachable. Same block as ci.yml.
+  SCCACHE_BUCKET: ${{ secrets.AWS_S3_SCCACHE_BUCKET_NAME }}
+  SCCACHE_REGION: us-east-1
+  SCCACHE_S3_KEY_PREFIX: ${{ github.repository }}
+  SCCACHE_IDLE_TIMEOUT: "0"
+  AWS_ACCESS_KEY_ID: ${{ secrets.AMAZON_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AMAZON_SECRET_KEY }}
+
+jobs:
+  # Post the opt-in instructions on open/reopen when the label isn't set yet.
+  announce:
+    name: Announce
+    runs-on: ubuntu-latest
+    if: >
+      (github.event.action == 'opened' || github.event.action == 'reopened') &&
+      !contains(github.event.pull_request.labels.*.name, 'benchmark')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Post instructions comment
+        run: |
+          python3 .github/scripts/render_bench_comment.py \
+            --status instructions --base "${{ github.event.pull_request.base.ref }}" \
+            > "$RUNNER_TEMP/comment.md"
+          bash .github/scripts/upsert_pr_comment.sh \
+            "${{ github.event.pull_request.number }}" "$MARKER" "$RUNNER_TEMP/comment.md"
+
+  bench:
+    name: Benchmark PR
+    runs-on: runner-arm-bench
+    timeout-minutes: 120
+    # Run when the `benchmark` label is added, and on every push / reopen / open
+    # while the label is present. Adding an unrelated label does not trigger a run.
+    if: >
+      (github.event.action == 'labeled' && github.event.label.name == 'benchmark') ||
+      ((github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'opened') &&
+       contains(github.event.pull_request.labels.*.name, 'benchmark'))
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Benchmark the PR's own commit (not the merge ref), so the comparison
+          # is this branch's code vs nightly `main`.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure paths
+        run: echo "RESULTS=$RUNNER_TEMP/results.json" >> "$GITHUB_ENV"
+
+      - name: Open running comment
+        run: |
+          python3 .github/scripts/render_bench_comment.py \
+            --status running --phase "Building & benchmarking this PR (vs latest nightly \`${{ github.event.pull_request.base.ref }}\`)…" \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --base "${{ github.event.pull_request.base.ref }}" --run-url "$RUN_URL" \
+            > "$RUNNER_TEMP/comment.md"
+          bash .github/scripts/upsert_pr_comment.sh \
+            "${{ github.event.pull_request.number }}" "$MARKER" "$RUNNER_TEMP/comment.md"
+
+      - name: Setup environment (toolchain + sccache + cache)
+        uses: ./.github/actions/setup-environment
+        with:
+          workspaces: language-tests
+
+      - name: Build benchmark suite
+        run: cargo build --release --features bench,bench-remote-store --manifest-path language-tests/Cargo.toml
+
+      - name: Benchmark PR head (compare vs nightly main in the shared store)
+        run: |
+          # Read-only against the shared store (NO --save): the harness fetches the
+          # latest `main` measurement (written by the nightly run) and compares this
+          # PR's `--quick` run against it. quiet_system.py mirrors the nightly run's
+          # environment so the two are measured the same way.
+          sudo ./.github/scripts/quiet_system.py \
+            language-tests/target/release/surrealql-test bench \
+            --store-url ${{ secrets.BENCH_DS_URL }} \
+            --store-user ${{ secrets.BENCH_DS_USER }} \
+            --store-password ${{ secrets.BENCH_DS_PASS }} \
+            run --quick --path language-tests/tests --json "$RESULTS"
+
+      - name: Post results
+        run: |
+          python3 .github/scripts/render_bench_comment.py \
+            --status done --sha "${{ github.event.pull_request.head.sha }}" \
+            --base "${{ github.event.pull_request.base.ref }}" --run-url "$RUN_URL" \
+            --results "$RESULTS" > "$RUNNER_TEMP/comment.md"
+          bash .github/scripts/upsert_pr_comment.sh \
+            "${{ github.event.pull_request.number }}" "$MARKER" "$RUNNER_TEMP/comment.md"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          python3 .github/scripts/render_bench_comment.py \
+            --status failed --sha "${{ github.event.pull_request.head.sha }}" \
+            --base "${{ github.event.pull_request.base.ref }}" --run-url "$RUN_URL" \
+            > "$RUNNER_TEMP/comment.md"
+          bash .github/scripts/upsert_pr_comment.sh \
+            "${{ github.event.pull_request.number }}" "$MARKER" "$RUNNER_TEMP/comment.md"

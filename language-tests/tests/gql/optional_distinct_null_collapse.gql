@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "R3 + DISTINCT interaction: an uncorrelated OPTIONAL whose block matches nothing null-fills `y` for EVERY mandatory `a` anchor (person:1/2/3), so the three rows are identical `{ y: NONE }`. RETURN DISTINCT must collapse them to a single row. The only city edges are person->city, so `(x:city)-[:knows]->(y:person)` is empty (cf. optional_uncorrelated.gql). Pipeline: HashJoin{Left} empty-keys -> Project -> Distinct; the three NULL-bound rows dedup to one. Exercises Distinct over null optional bindings, an untested pairing."
+
+[[test.results]]
+value = "[{ y: NONE }]"
+
+*/
+
+MATCH (a:person) OPTIONAL MATCH (x:city)-[:knows]->(y:person) RETURN DISTINCT y.name AS y ORDER BY y

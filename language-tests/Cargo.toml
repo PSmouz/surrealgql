@@ -18,8 +18,11 @@ bench-remote-store = ["bench","tokio-tungstenite", "tokio-tungstenite/native-tls
 
 [dependencies]
 # Crates for running surrealdb.
-surrealdb-core = { path = "../surrealdb/core", default-features = false, features = ["scripting", "kv-mem"] }
+surrealdb-core = { path = "../surrealdb/core", default-features = false, features = ["scripting", "kv-mem", "graphql", "gql"] }
 surrealdb-types = { path = "../surrealdb/types" }
+# Used to execute GraphQL (.graphql) test cases against the dynamic schema.
+# Same version as the root workspace pins for surrealdb-core.
+async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"] }
 reblessive = { version = "0.4.3" }
 rust_decimal = { version = "1.41.0", features = ["maths", "serde-str"] }
 
@@ -54,3 +57,16 @@ serde_json = "1.0.149"
 # Use for caching in benches
 sha2 = { version = "0.10.9", optional = true }
 oorandom = { version = "11", optional = true }
+
+# `language-tests` is its own workspace (see `[workspace]` above), so it does not
+# inherit the profiles defined in the root SurrealDB workspace. The `profiling`
+# profile below mirrors the root one: an optimised (release-like) build that
+# keeps frame symbolication for `samply`/`perf`/flamegraphs while rebuilding far
+# faster than full LTO. Used by `scripts/bench/profile.sh`.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+panic = "unwind"
+lto = "thin"
+codegen-units = 16

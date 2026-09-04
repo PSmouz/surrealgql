@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
+use ahash::HashSet;
 use anyhow::{Result, bail};
-use radix_trie::Trie;
 use surrealdb_types::ToSql;
 
 use crate::catalog::{DatabaseId, IndexDefinition, IndexId, NamespaceId, Record};
@@ -948,7 +948,7 @@ struct JoinThingIterator {
 	current_remote: Option<RecordIterator>,
 	current_remote_batch: VecDeque<IndexItemRecord>,
 	current_local: Option<RecordIterator>,
-	distinct: Trie<Key, bool>,
+	distinct: HashSet<Key>,
 }
 
 impl JoinThingIterator {
@@ -1012,7 +1012,9 @@ impl JoinThingIterator {
 				let record = r.record_id();
 				let value: Value = Value::from(record.clone());
 				let k: Key = revision::to_vec(record)?;
-				if self.distinct.insert(k, true).is_none() {
+				// `insert` returns true when the key was not already present,
+				// i.e. this is a distinct record we have not yet emitted.
+				if self.distinct.insert(k) {
 					self.current_local = Some(new_iter(self.ns, self.db, &self.ix, value)?);
 					return Ok(true);
 				}

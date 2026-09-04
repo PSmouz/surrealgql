@@ -24,27 +24,24 @@
 //! the read-only-tx guard, reintroduces the race described in
 //! [issue #7318](https://github.com/surrealdb/surrealdb/issues/7318).
 
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use ahash::{HashSet, HashSetExt};
 use anyhow::Result;
-use diskann::error::ErrorExt;
 use diskann::graph::glue::{
-	CopyIds, DefaultPostProcessor, ExpandBeam, InsertStrategy, PruneStrategy, SearchExt,
-	SearchStrategy,
+	CopyIds, DefaultPostProcessor, HybridPredicate, InsertStrategy, PruneAccessor, PruneStrategy,
+	SearchAccessor, SearchStrategy,
 };
 use diskann::graph::{AdjacencyList, workingset};
 use diskann::provider::{
-	Accessor, BuildDistanceComputer, BuildQueryComputer, DataProvider, DelegateNeighbor, Delete,
-	ElementStatus, ExecutionContext, HasId, NeighborAccessor, NeighborAccessorMut, NoopGuard,
-	SetElement,
+	DataProvider, Delete, ElementStatus, ExecutionContext, HasId, NeighborAccessor,
+	NeighborAccessorMut, NoopGuard, SetElement,
 };
 use diskann::utils::VectorRepr;
 use diskann::{ANNError, ANNResult, default_post_processor};
-use diskann_utils::future::AssertSend;
-use diskann_vector::Half;
 use diskann_vector::distance::Metric;
+use diskann_vector::{Half, PreprocessedDistanceFunction};
 use tracing::warn;
 
 use crate::catalog::{DatabaseId, IndexId, NamespaceId, TableId};
@@ -368,7 +365,7 @@ impl DiskAnnProvider {
 		let cache_misses = !context.tx.writeable();
 		loop {
 			let batch = cursor
-				.next_batch(crate::kvs::ScanLimit::Count(crate::kvs::NORMAL_BATCH_SIZE))
+				.next_batch(crate::kvs::NORMAL_BATCH_SIZE)
 				.await
 				.map_err(|e| ANNError::log_index_error(e.to_string()))?;
 			if batch.is_empty() {
@@ -568,70 +565,66 @@ impl Delete for DiskAnnProvider {
 	}
 }
 
-/// Typed vector accessor used by DiskANN distance computation and pruning.
-pub(super) struct DiskAnnAccessor<'a, T> {
+/// Search accessor used by DiskANN greedy graph search.
+///
+/// Holds the query distance computer, preprocessed once from the query vector at
+/// construction, plus a reusable scratch buffer for decoding persisted vectors into typed
+/// slices during distance evaluation.
+pub(super) struct DiskAnnSearchAccessor<'a, T: DiskAnnVectorElement> {
 	/// Provider that owns KV/cache access.
 	provider: &'a DiskAnnProvider,
 	/// Transaction/key context for the current DiskANN operation.
 	context: &'a DiskAnnProviderContext,
+	/// Query distance computer, preprocessed from the search/insert query vector.
+	query: <T as VectorRepr>::QueryDistance,
 	/// Reusable scratch buffer for converting persisted vectors into typed slices.
 	buffer: Box<[T]>,
-	/// Ties the accessor to the vector element type without storing values of that type.
-	_marker: PhantomData<T>,
 }
 
-impl<'a, T> DiskAnnAccessor<'a, T>
+impl<'a, T> DiskAnnSearchAccessor<'a, T>
 where
 	T: DiskAnnVectorElement,
 {
-	fn new(provider: &'a DiskAnnProvider, context: &'a DiskAnnProviderContext) -> Self {
-		Self {
+	fn new(
+		provider: &'a DiskAnnProvider,
+		context: &'a DiskAnnProviderContext,
+		query: &[T],
+	) -> Result<Self, ANNError> {
+		if query.len() != provider.dim {
+			return Err(vector_len_mismatch(query.len(), provider.dim));
+		}
+		Ok(Self {
 			provider,
 			context,
+			query: T::query_distance(query, provider.metric),
 			buffer: vec![T::default(); provider.dim].into_boxed_slice(),
-			_marker: PhantomData,
-		}
+		})
+	}
+
+	/// Decodes `element` into the scratch buffer and returns its distance to the query.
+	fn distance_to(&mut self, element: &DiskAnnElement) -> ANNResult<f32> {
+		T::copy_from_serialized(&element.vector, &mut self.buffer)?;
+		Ok(self.query.evaluate_similarity(&self.buffer))
 	}
 }
 
-impl<T> HasId for DiskAnnAccessor<'_, T> {
+impl<T: DiskAnnVectorElement> HasId for DiskAnnSearchAccessor<'_, T> {
 	type Id = ElementId;
 }
 
-impl<T> Accessor for DiskAnnAccessor<'_, T>
+impl<T> SearchAccessor for DiskAnnSearchAccessor<'_, T>
 where
 	T: DiskAnnVectorElement,
 {
-	type Element<'a>
-		= &'a [T]
-	where
-		Self: 'a;
-	type ElementRef<'a> = &'a [T];
-	type GetError = ANNError;
-
-	async fn get_element(&mut self, id: ElementId) -> Result<&[T], ANNError> {
-		// Delegated through the batched path so the cache-population invariant only lives in one
-		// place. `read_elements(&[id])` uses `getm` on a 1-element vec, which is a no-cost call.
-		let mut elements = self
-			.provider
-			.read_elements(self.context, std::slice::from_ref(&id))
-			.await
-			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
-		let Some(element) = elements.pop().flatten() else {
-			return Err(ANNError::log_index_error(format!("DiskANN element {id} is missing")));
-		};
-		T::copy_from_serialized(&element.vector, &mut self.buffer)?;
-		Ok(&self.buffer)
+	async fn starting_points(&self) -> ANNResult<Vec<ElementId>> {
+		self.provider.valid_starting_points(self.context).await
 	}
 
-	/// Batches element reads requested by DiskANN's distance-computation path.
-	async fn on_elements_unordered<Itr, F>(&mut self, itr: Itr, mut f: F) -> Result<(), ANNError>
+	async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
 	where
-		Self: Sync,
-		Itr: Iterator<Item = Self::Id> + Send,
-		F: Send + for<'a> FnMut(Self::ElementRef<'a>, Self::Id),
+		F: FnMut(ElementId, f32) + Send,
 	{
-		let ids: Vec<_> = itr.collect();
+		let ids = self.provider.valid_starting_points(self.context).await?;
 		let elements = self
 			.provider
 			.read_elements(self.context, &ids)
@@ -639,82 +632,32 @@ where
 			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
 		for (id, element) in ids.into_iter().zip(elements) {
 			let Some(element) = element else {
-				return Err(ANNError::log_index_error(format!("DiskANN element {id} is missing")));
+				return Err(ANNError::log_index_error(format!(
+					"DiskANN start point {id} is missing"
+				)));
 			};
-			T::copy_from_serialized(&element.vector, &mut self.buffer)?;
-			f(&self.buffer, id);
+			let distance = self.distance_to(&element)?;
+			f(id, distance);
 		}
 		Ok(())
 	}
-}
 
-impl<'a, T> DelegateNeighbor<'a> for DiskAnnAccessor<'_, T>
-where
-	T: DiskAnnVectorElement,
-{
-	type Delegate = DiskAnnNeighborAccessor<'a>;
-
-	fn delegate_neighbor(&'a mut self) -> Self::Delegate {
-		DiskAnnNeighborAccessor {
-			provider: self.provider,
-			context: self.context,
-		}
-	}
-}
-
-impl<T> BuildQueryComputer<&[T]> for DiskAnnAccessor<'_, T>
-where
-	T: DiskAnnVectorElement,
-{
-	type QueryComputerError = ANNError;
-	type QueryComputer = <T as VectorRepr>::QueryDistance;
-
-	fn build_query_computer(&self, from: &[T]) -> Result<Self::QueryComputer, ANNError> {
-		Ok(T::query_distance(from, self.provider.metric))
-	}
-}
-
-impl<T> BuildDistanceComputer for DiskAnnAccessor<'_, T>
-where
-	T: DiskAnnVectorElement,
-{
-	type DistanceComputerError = ANNError;
-	type DistanceComputer = <T as VectorRepr>::Distance;
-
-	fn build_distance_computer(&self) -> Result<Self::DistanceComputer, ANNError> {
-		Ok(T::distance(self.provider.metric, Some(self.provider.dim)))
-	}
-}
-
-impl<T> SearchExt for DiskAnnAccessor<'_, T>
-where
-	T: DiskAnnVectorElement,
-{
-	async fn starting_points(&self) -> ANNResult<Vec<ElementId>> {
-		self.provider.valid_starting_points(self.context).await
-	}
-}
-
-impl<T> ExpandBeam<&[T]> for DiskAnnAccessor<'_, T>
-where
-	T: DiskAnnVectorElement,
-{
-	/// Expands one search beam using batched adjacency-list reads and batched candidate distances.
+	/// Expands one search beam using batched adjacency-list reads and batched candidate reads.
 	///
-	/// The default DiskANN implementation fetches neighbors one node at a time. This override keeps
-	/// predicate semantics intact, deduplicates candidates before distance calculation, and lets
-	/// `distances_unordered` batch the vector reads behind the candidate ids.
+	/// The default DiskANN implementation walks neighbors and fetches vectors one node at a
+	/// time. This override reads every adjacency list for `ids` in a single `getm`, keeps the
+	/// candidates the predicate admits (`eval_mut` both filters and deduplicates), then reads
+	/// their vectors in a second `getm` before computing query distances.
 	async fn expand_beam<Itr, P, F>(
 		&mut self,
 		ids: Itr,
-		computer: &Self::QueryComputer,
 		mut pred: P,
 		mut on_neighbors: F,
 	) -> ANNResult<()>
 	where
-		Itr: Iterator<Item = Self::Id> + Send,
-		P: diskann::graph::glue::HybridPredicate<Self::Id> + Send + Sync,
-		F: FnMut(f32, Self::Id) + Send,
+		Itr: Iterator<Item = ElementId> + Send,
+		P: HybridPredicate<ElementId> + Send + Sync,
+		F: FnMut(ElementId, f32) + Send,
 	{
 		let ids: Vec<_> = ids.collect();
 		let nodes = self
@@ -722,26 +665,130 @@ where
 			.read_nodes(self.context, &ids)
 			.await
 			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
-		// `distances_unordered` does not depend on input order, so a single dedup pass via
-		// `HashSet::insert` is sufficient — we no longer need a parallel `Vec` of candidates.
-		let candidate_capacity = nodes.iter().flatten().map(|node| node.neighbors.len()).sum();
-		let mut seen = HashSet::with_capacity(candidate_capacity);
+		// A well-behaved predicate never re-admits an id it has already yielded, so filtering
+		// the neighbors with `eval_mut` also deduplicates the surviving candidates.
+		let mut candidates = Vec::new();
 		for node in nodes.iter().flatten() {
 			for &id in &node.neighbors {
-				if pred.eval(&id) {
-					seen.insert(id);
+				if pred.eval_mut(&id) {
+					candidates.push(id);
 				}
 			}
 		}
-		self.distances_unordered(seen.into_iter(), computer, |distance, id| {
-			if pred.eval_mut(&id) {
-				on_neighbors(distance, id);
+		let elements = self
+			.provider
+			.read_elements(self.context, &candidates)
+			.await
+			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
+		for (id, element) in candidates.into_iter().zip(elements) {
+			// A candidate whose element was compacted away mid-search is dropped: the
+			// `expand_beam` contract tolerates skipping candidates in exceptional cases.
+			if let Some(element) = element {
+				let distance = self.distance_to(&element)?;
+				on_neighbors(id, distance);
 			}
-		})
-		.send()
-		.await
-		.allow_transient("allowing transient error in beam expansion")?;
+		}
 		Ok(())
+	}
+}
+
+/// Working-set cache of decoded vectors, reused across a prune operation's rounds.
+type DiskAnnWorkingSet<T> = workingset::Map<ElementId, Box<[T]>, workingset::map::Ref<[T]>>;
+/// Read-only view over a [`DiskAnnWorkingSet`], returned to the prune algorithm by `fill`.
+type DiskAnnWorkingSetView<'a, T> =
+	workingset::map::View<'a, ElementId, Box<[T]>, workingset::map::Ref<[T]>>;
+
+/// Prune accessor used by DiskANN index construction (insert and in-place delete).
+///
+/// Owns a bounded working-set cache that [`PruneAccessor::fill`] populates from batched KV
+/// reads, and hands the prune algorithm a view over it together with an element-to-element
+/// distance computer.
+pub(super) struct DiskAnnPruneAccessor<'a, T: DiskAnnVectorElement> {
+	/// Provider that owns KV/cache access.
+	provider: &'a DiskAnnProvider,
+	/// Transaction/key context for the current DiskANN operation.
+	context: &'a DiskAnnProviderContext,
+	/// Bounded cache of decoded vectors, reused across the operation's prune rounds.
+	set: DiskAnnWorkingSet<T>,
+}
+
+impl<'a, T> DiskAnnPruneAccessor<'a, T>
+where
+	T: DiskAnnVectorElement,
+{
+	fn new(
+		provider: &'a DiskAnnProvider,
+		context: &'a DiskAnnProviderContext,
+		set: DiskAnnWorkingSet<T>,
+	) -> Self {
+		Self {
+			provider,
+			context,
+			set,
+		}
+	}
+}
+
+impl<T: DiskAnnVectorElement> HasId for DiskAnnPruneAccessor<'_, T> {
+	type Id = ElementId;
+}
+
+impl<T> PruneAccessor for DiskAnnPruneAccessor<'_, T>
+where
+	T: DiskAnnVectorElement,
+{
+	type Neighbors<'b>
+		= DiskAnnNeighborAccessor<'b>
+	where
+		Self: 'b;
+	type ElementRef<'b> = &'b [T];
+	type View<'b>
+		= DiskAnnWorkingSetView<'b, T>
+	where
+		Self: 'b;
+	type Distance<'b>
+		= <T as VectorRepr>::Distance
+	where
+		Self: 'b;
+
+	fn neighbors(&mut self) -> Self::Neighbors<'_> {
+		DiskAnnNeighborAccessor {
+			provider: self.provider,
+			context: self.context,
+		}
+	}
+
+	/// Makes the vectors for `itr` available in the returned view alongside a distance computer.
+	///
+	/// The upstream `Map::fill` closure is synchronous, but SurrealDB reads vectors from the
+	/// transaction asynchronously. So this first batches the ids the working set does not
+	/// already cache into a single `getm`, decodes them, then feeds the prefetched vectors to
+	/// `Map::fill` through a synchronous closure. Deleted and missing elements are skipped,
+	/// which the prune algorithm tolerates.
+	async fn fill<Itr>(&mut self, itr: Itr) -> ANNResult<(Self::View<'_>, Self::Distance<'_>)>
+	where
+		Itr: ExactSizeIterator<Item = ElementId> + Clone + Send + Sync,
+	{
+		let missing: Vec<ElementId> = itr.clone().filter(|id| !self.set.contains_key(id)).collect();
+		let fetched = self
+			.provider
+			.read_elements(self.context, &missing)
+			.await
+			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
+		let mut decoded: HashMap<ElementId, Box<[T]>> = HashMap::with_capacity(missing.len());
+		for (id, element) in missing.into_iter().zip(fetched) {
+			if let Some(element) = element
+				&& !element.deleted
+			{
+				let mut buffer = vec![T::default(); self.provider.dim].into_boxed_slice();
+				T::copy_from_serialized(&element.vector, &mut buffer)?;
+				decoded.insert(id, buffer);
+			}
+		}
+		let distance = T::distance(self.provider.metric, Some(self.provider.dim));
+		let view =
+			self.set.fill(itr, |id| -> ANNResult<Option<Box<[T]>>> { Ok(decoded.remove(&id)) })?;
+		Ok((view, distance))
 	}
 }
 
@@ -760,10 +807,10 @@ impl HasId for DiskAnnNeighborAccessor<'_> {
 
 impl NeighborAccessor for DiskAnnNeighborAccessor<'_> {
 	async fn get_neighbors(
-		self,
+		&mut self,
 		id: ElementId,
 		neighbors: &mut AdjacencyList<ElementId>,
-	) -> ANNResult<Self> {
+	) -> ANNResult<()> {
 		if let Some(node) = self
 			.provider
 			.read_nodes(self.context, &[id])
@@ -777,12 +824,12 @@ impl NeighborAccessor for DiskAnnNeighborAccessor<'_> {
 		} else {
 			neighbors.clear();
 		}
-		Ok(self)
+		Ok(())
 	}
 }
 
 impl NeighborAccessorMut for DiskAnnNeighborAccessor<'_> {
-	async fn set_neighbors(self, id: ElementId, neighbors: &[ElementId]) -> ANNResult<Self> {
+	async fn set_neighbors(&mut self, id: ElementId, neighbors: &[ElementId]) -> ANNResult<()> {
 		let node = DiskAnnNode {
 			neighbors: neighbors.to_vec(),
 		};
@@ -793,10 +840,10 @@ impl NeighborAccessorMut for DiskAnnNeighborAccessor<'_> {
 			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
 		// Keep cached adjacency coherent with the persisted graph mutation.
 		self.provider.cache.insert_node(self.provider.cache_index(), id, node);
-		Ok(self)
+		Ok(())
 	}
 
-	async fn append_vector(self, id: ElementId, neighbors: &[ElementId]) -> ANNResult<Self> {
+	async fn append_vector(&mut self, id: ElementId, neighbors: &[ElementId]) -> ANNResult<()> {
 		let key = self.context.ikb.new_dn_key(id);
 		let mut node: DiskAnnNode = self
 			.provider
@@ -820,7 +867,7 @@ impl NeighborAccessorMut for DiskAnnNeighborAccessor<'_> {
 			.map_err(|e| ANNError::log_index_error(e.to_string()))?;
 		// Keep cached adjacency coherent with the persisted graph mutation.
 		self.provider.cache.insert_node(self.provider.cache_index(), id, node);
-		Ok(self)
+		Ok(())
 	}
 }
 
@@ -840,24 +887,24 @@ impl<T> Clone for DiskAnnStrategy<T> {
 	}
 }
 
-impl<T> SearchStrategy<DiskAnnProvider, &[T]> for DiskAnnStrategy<T>
+impl<'a, T> SearchStrategy<'a, DiskAnnProvider, &'a [T]> for DiskAnnStrategy<T>
 where
 	T: DiskAnnVectorElement,
 {
-	type QueryComputer = <T as VectorRepr>::QueryDistance;
 	type SearchAccessorError = ANNError;
-	type SearchAccessor<'a> = DiskAnnAccessor<'a, T>;
+	type SearchAccessor = DiskAnnSearchAccessor<'a, T>;
 
-	fn search_accessor<'a>(
+	fn search_accessor(
 		&'a self,
 		provider: &'a DiskAnnProvider,
 		context: &'a DiskAnnProviderContext,
-	) -> Result<DiskAnnAccessor<'a, T>, ANNError> {
-		Ok(DiskAnnAccessor::new(provider, context))
+		query: &'a [T],
+	) -> Result<DiskAnnSearchAccessor<'a, T>, ANNError> {
+		DiskAnnSearchAccessor::new(provider, context, query)
 	}
 }
 
-impl<T> DefaultPostProcessor<DiskAnnProvider, &[T]> for DiskAnnStrategy<T>
+impl<'a, T> DefaultPostProcessor<'a, DiskAnnProvider, &'a [T]> for DiskAnnStrategy<T>
 where
 	T: DiskAnnVectorElement,
 {
@@ -868,25 +915,21 @@ impl<T> PruneStrategy<DiskAnnProvider> for DiskAnnStrategy<T>
 where
 	T: DiskAnnVectorElement,
 {
-	type WorkingSet = workingset::Map<ElementId, Box<[T]>, workingset::map::Ref<[T]>>;
-	type DistanceComputer<'a> = <T as VectorRepr>::Distance;
-	type PruneAccessor<'a> = DiskAnnAccessor<'a, T>;
+	type PruneAccessor<'a> = DiskAnnPruneAccessor<'a, T>;
 	type PruneAccessorError = ANNError;
-
-	fn create_working_set(&self, capacity: usize) -> Self::WorkingSet {
-		workingset::map::Builder::new(workingset::map::Capacity::Default).build(capacity)
-	}
 
 	fn prune_accessor<'a>(
 		&'a self,
 		provider: &'a DiskAnnProvider,
 		context: &'a DiskAnnProviderContext,
+		capacity: usize,
 	) -> Result<Self::PruneAccessor<'a>, ANNError> {
-		Ok(DiskAnnAccessor::new(provider, context))
+		let set = workingset::map::Builder::new(workingset::map::Capacity::Default).build(capacity);
+		Ok(DiskAnnPruneAccessor::new(provider, context, set))
 	}
 }
 
-impl<T> InsertStrategy<DiskAnnProvider, &[T]> for DiskAnnStrategy<T>
+impl<'a, T> InsertStrategy<'a, DiskAnnProvider, &'a [T]> for DiskAnnStrategy<T>
 where
 	T: DiskAnnVectorElement,
 {
@@ -919,7 +962,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn diskann_accessor_batches_elements_and_reports_missing() -> Result<()> {
+	async fn diskann_provider_batches_element_reads_and_reports_missing() -> Result<()> {
 		let (provider, context) = provider_and_context().await?;
 		context
 			.tx
@@ -942,25 +985,24 @@ mod tests {
 			)
 			.await?;
 
-		let mut accessor = DiskAnnAccessor::<f32>::new(&provider, &context);
-		let mut seen = Vec::new();
-		accessor
-			.on_elements_unordered(vec![1, 2].into_iter(), |values, id| {
-				seen.push((id, values.to_vec()));
-			})
-			.await
-			.unwrap();
-
-		assert_eq!(seen, vec![(1, vec![1.0, 2.0]), (2, vec![3.0, 4.0])]);
+		// A single `getm`-backed read returns present elements in input order and `None` for a
+		// missing id.
+		let elements = provider.read_elements(&context, &[1, 2, 3]).await?;
+		assert_eq!(
+			elements[0].as_ref().map(|e| e.vector.clone()),
+			Some(SerializedVector::F32(vec![1.0, 2.0]))
+		);
+		assert_eq!(
+			elements[1].as_ref().map(|e| e.vector.clone()),
+			Some(SerializedVector::F32(vec![3.0, 4.0]))
+		);
+		assert!(elements[2].is_none());
 		// Provider reads through a writable tx must not publish into the shared cache —
 		// `tx.get` returns the writer's own buffered (possibly uncommitted) writes, and the
 		// cache is process-wide, so leaking that view to other txs is the failure mode
 		// #7318 surfaced.
 		assert!(provider.cache.get_element(provider.cache_index(), 1).is_none());
 		assert!(provider.cache.get_element(provider.cache_index(), 2).is_none());
-		assert!(
-			accessor.on_elements_unordered(vec![3].into_iter(), |_values, _id| {}).await.is_err()
-		);
 		Ok(())
 	}
 
@@ -990,7 +1032,7 @@ mod tests {
 		assert_eq!(nodes[0].as_ref().unwrap().neighbors, vec![2, 3]);
 		assert_eq!(nodes[1].as_ref().unwrap().neighbors, vec![4]);
 
-		let neighbor_accessor = DiskAnnNeighborAccessor {
+		let mut neighbor_accessor = DiskAnnNeighborAccessor {
 			provider: &provider,
 			context: &context,
 		};

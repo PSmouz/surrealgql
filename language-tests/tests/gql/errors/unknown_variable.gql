@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection: references to undeclared pattern variables are errors, not NULLs."
+
+[test.results]
+parsing-error = '''
+Unknown variable `m`
+  --> [15:25]
+   |
+15 | MATCH (n:person) RETURN m
+   |                         ^ variables must be declared in the MATCH pattern
+'''
+*/
+
+MATCH (n:person) RETURN m

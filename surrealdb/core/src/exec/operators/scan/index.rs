@@ -380,11 +380,6 @@ impl ExecOperator for IndexScan {
 			// `VersionScope` over re-evaluating `version_expr` here.
 			let version: Option<u64> = resolve_version_stamp(&ctx, version_expr.as_ref()).await?;
 
-			// Early exit if limit is 0
-			if limit_val == Some(0) {
-				return;
-			}
-
 			// Resolve table permissions: plan-time fast path or runtime fallback
 			let select_permission = if let Some(ref res) = resolved {
 				res.select_permission(check_perms)
@@ -409,6 +404,10 @@ impl ExecOperator for IndexScan {
 
 			// Early exit if denied
 			if matches!(select_permission, PhysicalPermission::Deny) {
+				return;
+			}
+
+			if limit_val == Some(0) {
 				return;
 			}
 

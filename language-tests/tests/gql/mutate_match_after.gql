@@ -1,0 +1,16 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "A MATCH after a mutation re-scans the live (post-write) state in the same transaction: setting C's age to 20 makes a later MATCH on age = 20 find both B (already 20) and the just-written C."
+
+[[test.results]]
+value = "[{ name: 'B' }, { name: 'C' }]"
+*/
+
+MATCH (n:person WHERE n.name = 'C') SET n.age = 20
+MATCH (m:person WHERE m.age = 20)
+RETURN m.name AS name ORDER BY name

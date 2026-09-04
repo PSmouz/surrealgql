@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "Path search `ANY SHORTEST`: one minimum-hop path per endpoint pair. Anchored on X over the diamond, every reachable waypoint is a terminal at its shortest depth (Y1/Y2/Y3 at 1, Y4/Z at 2), so exactly one row per terminal — five rows."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1' }, { an: 'X', bn: 'Y2' }, { an: 'X', bn: 'Y3' }, { an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ANY SHORTEST (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

@@ -1,0 +1,15 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "`ANY k` with k > 1: up to k arbitrary paths per endpoint pair (implemented as the k shortest, a valid arbitrary choice). Anchored on X, Z has three paths (lengths 2, 2, 3) but `ANY 2` keeps only two of them, while Y1/Y2/Y3/Y4 keep their single path — six rows (vs five for `ANY 1` and seven for `ALL`), exercising the per-node k = 2 cap."
+
+[[test.results]]
+value = "[{ an: 'X', bn: 'Y1' }, { an: 'X', bn: 'Y2' }, { an: 'X', bn: 'Y3' }, { an: 'X', bn: 'Y4' }, { an: 'X', bn: 'Z' }, { an: 'X', bn: 'Z' }]"
+*/
+
+MATCH ANY 2 (a:wp WHERE a.name = 'X')-[:road]->+(b:wp)
+RETURN a.name AS an, b.name AS bn ORDER BY an, bn

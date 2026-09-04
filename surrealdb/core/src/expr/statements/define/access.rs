@@ -263,6 +263,13 @@ impl DefineAccessStatement {
 			.catch_return()?
 			.cast_to::<Option<Duration>>()?
 			.map(|x| x.0);
+		// Record-access tokens authenticate end-users (signin/signup) and may be
+		// passed to third parties, so they MUST expire. The parser used to
+		// reject `DURATION FOR TOKEN NONE` statically, but parameterized
+		// durations are only known after `compute`, so the check moved here.
+		if matches!(&self.access_type, AccessType::Record(_)) && token_duration.is_none() {
+			bail!(Error::AccessRecordTokenDurationRequired);
+		}
 		let session_duration = stk
 			.run(|stk| self.duration.session.compute(stk, ctx, opt, doc))
 			.await

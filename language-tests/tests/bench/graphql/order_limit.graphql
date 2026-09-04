@@ -1,0 +1,19 @@
+/**
+[bench]
+reason = "GraphQL ordered list query (sort cost) returning the top 100 records"
+run = true
+rebuild = false
+datasets = { "10k" = "bench/util/graphql-items-10000.surql" }
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+query {
+	items(order: {desc: number}, limit: 100) {
+		number
+		label
+	}
+}

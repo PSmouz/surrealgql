@@ -1,0 +1,21 @@
+/**
+[env]
+imports = ["../_schema.surql"]
+
+[test]
+reason = "Record link fields resolve to the linked record and can be traversed"
+
+[[test.results]]
+value = "{ post: { author: { address: { city: 'London' }, name: 'Alice' }, title: 'Hello world' } }"
+*/
+query {
+	post(id: "hello") {
+		title
+		author {
+			name
+			address {
+				city
+			}
+		}
+	}
+}

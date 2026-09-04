@@ -62,6 +62,35 @@ impl Value {
 						}
 					}
 				},
+				// Current path part is a set
+				Value::Set(v) => match p {
+					Part::First => match v.first() {
+						Some(v) => v._walk(path.next(), prev.push(p.clone())),
+						None => vec![],
+					},
+					Part::Last => match v.last() {
+						Some(v) => v._walk(path.next(), prev.push(p.clone())),
+						None => vec![],
+					},
+					x => {
+						if let Some(idx) = x.as_old_index() {
+							match v.nth(idx) {
+								Some(v) => v._walk(path.next(), prev.push(p.clone())),
+								None => vec![],
+							}
+						} else {
+							v.iter()
+								.enumerate()
+								.flat_map(|(i, v)| {
+									v._walk(
+										path.next(),
+										prev.clone().push(Part::index_int(i as i64)),
+									)
+								})
+								.collect::<Vec<_>>()
+						}
+					}
+				},
 				// Ignore everything else
 				_ => match p {
 					Part::Field(_) => Value::None._walk(path.next(), prev.push(p.clone())),

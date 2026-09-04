@@ -630,6 +630,7 @@ fn statements() -> Vec<TopLevelExpr> {
 		}))),
 		TopLevelExpr::Expr(Expr::Relate(Box::new(RelateStatement {
 			only: true,
+			or_update: false,
 			through: Expr::Literal(Literal::RecordId(RecordIdLit {
 				table: "a".into(),
 				key: RecordIdKeyLit::String("b".into()),

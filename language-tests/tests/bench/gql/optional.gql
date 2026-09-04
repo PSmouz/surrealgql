@@ -1,0 +1,16 @@
+/**
+[bench]
+reason = "GQL OPTIONAL MATCH with a ~90% miss rate: every person is preserved (left-outer), but only 10% have a `bought` edge so the other 90% are null-filled. Isolates the LeftJoin null-fill cost of OptionalExpand — 5000 driving rows, ~4500 misses (p = NULL), ~500 hits."
+run = true
+rebuild = false
+imports = ["bench/gql/util/optional-90miss-5000.surql"]
+warmup = "2s"
+sample-size = 50
+measurement-time = "20s"
+
+[test]
+run = false
+*/
+MATCH (a:person)
+OPTIONAL MATCH (a)-[:bought]->(p:item)
+RETURN a.name AS a, p.name AS p

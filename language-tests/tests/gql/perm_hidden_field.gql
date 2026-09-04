@@ -1,0 +1,14 @@
+/**
+[env]
+imports = ["gql/_perm_hidden_field_import.surql"]
+auth = { namespace = "test", database = "test", access = "user", rid = "person:1" }
+
+[test]
+reason = "SECURITY (binding row == SELECT, FIELD level + computed): a `b` node binding produced by a MATCH hop is resolved through the SAME FieldState path as SELECT (fetch.rs::resolve_with_field_state -> table perm + compute_fields_for_value + filter_fields_by_permission). `secret` carries `PERMISSIONS FOR select WHERE id = $auth.id`, so for record user person:1 it is visible ONLY on person:1's own record and cut everywhere else (surfacing as NONE); `label` is a read-time COMPUTED field (string::uppercase(name)) that must be present in every binding. Edges out of all `a`: 1->{2,3}, 2->{1}; targets b = person:2 (bob), person:3 (carol) from a=1, and person:1 (alice) from a=2. b.secret is NONE for bob/carol (2,3 != $auth.id person:1) and 's1' for alice (own record); b.label is always the upper-cased name. Mirrors `SELECT b.name, b.secret, b.label` over those records under the same record session — a regression for field-level perm / computed-field leakage on the MATCH binding-fetch path."
+
+[[test.results]]
+value = "[{ name: 'alice', secret: 's1', label: 'ALICE' }, { name: 'bob', secret: NONE, label: 'BOB' }, { name: 'carol', secret: NONE, label: 'CAROL' }]"
+
+*/
+
+MATCH (a:person)-[:knows]->(b:person) RETURN b.name AS name, b.secret AS secret, b.label AS label ORDER BY name

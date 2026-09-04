@@ -1,0 +1,15 @@
+/**
+[test]
+reason = "Lowering rejection (V2_DESIGN R6, §8): an inline predicate inside a quantified edge may reference only that quantified edge. Here `g.since > a.age` reads the edge group variable `g` together with the node variable `a`, which the per-path traversal has no single place to evaluate, so it is rejected. (A predicate referencing only other bound variables — e.g. a node — is fine and is placed as a Filter; this rejection is specifically the group-var + other-binding combination.) No schema import: the query is rejected during lowering and never reaches execution."
+
+[test.results]
+parsing-error = '''
+A predicate inside a quantified edge may only reference that edge
+  --> [15:29]
+   |
+15 | MATCH (a:hub)-[g:link WHERE g.since > a.age]->{1,2}(b:hub) RETURN a.name AS an
+   |                             ^^^^^^^^^^^^^^^ remove the references to other variables
+'''
+*/
+
+MATCH (a:hub)-[g:link WHERE g.since > a.age]->{1,2}(b:hub) RETURN a.name AS an

@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "V2_DESIGN R7: the non-returned ORDER BY key honours DESC and the NULL/NONE sort position flips accordingly. RETURN is name only; ORDER BY n.age DESC gives A(30), B(20), then C (no age, NONE sorts last descending). Companion to order_by_non_returned.gql, which pins the ASC direction."
+
+[[test.results]]
+value = "[{ name: 'A' }, { name: 'B' }, { name: 'C' }]"
+*/
+
+MATCH (n:person) RETURN n.name AS name ORDER BY n.age DESC

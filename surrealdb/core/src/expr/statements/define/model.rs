@@ -36,6 +36,13 @@ impl DefineModelStatement {
 	) -> Result<Value> {
 		// Allowed to run?
 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Model, Base::Db)?;
+		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
+		if self.permissions.has_direct_write() {
+			bail!(Error::PermissionClauseNotReadonly {
+				kind: "model",
+				name: self.name.to_string(),
+			});
+		}
 		// Fetch the transaction
 		let txn = ctx.tx();
 		// Check if the definition exists

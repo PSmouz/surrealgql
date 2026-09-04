@@ -1,0 +1,14 @@
+/**
+[env]
+namespace = true
+database = true
+imports = ["gql/_schema.surql"]
+
+[test]
+reason = "OFFSET (synonym of SKIP) combined with LIMIT and DESC ordering over the edge rows: 2021, [2020, 2018], NONE."
+
+[[test.results]]
+value = "[{ an: 'B', since: 2020 }, { an: 'B', since: 2018 }]"
+*/
+
+MATCH (a:person)-[k:knows]->(b:person) RETURN a.name AS an, k.since AS since ORDER BY since DESC OFFSET 1 LIMIT 2
